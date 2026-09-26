@@ -1,7 +1,11 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
-use crossterm::style;
+use crate::render::braille::{BrailleGrid, DOTS_X, DOTS_Y};
+use crate::render::dither::Dither;
+use crate::render::glyph_ramp::{self, GlyphRamp};
+use crate::render::palette::Palette;
+use crossterm::style::{Attribute, Color};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -24,7 +28,123 @@ struct Point2D {
 struct Edge {
     v1: usize,
     v2: usize,
+    /// The two faces this edge is shared by.
+    ///
+    /// This is the whole of the hidden-line removal. A convex solid hides an
+    /// edge exactly when *both* of its faces point away, so one boolean per
+    /// face is enough: no depth sort between edges, no z-buffer, and no false
+    /// positives from an edge that happens to be nearer than the face behind
+    /// it. The old effect drew all twelve edges unconditionally, which is why
+    /// the far face's outline showed through the near one.
+    faces: [usize; 2],
 }
+
+/// One of the cube's six faces, as the four corners around it.
+///
+/// The order is counter-clockwise seen from outside, so the cross product of
+/// the first two spans gives the outward normal without any face having to be
+/// special-cased.
+struct Face {
+    corners: [usize; 4],
+}
+
+/// The six faces, indexed the way [`EDGES`] refers to them.
+///
+/// 0 front (z-)   1 back (z+)   2 right (x+)
+/// 3 left (x-)    4 top (y+)    5 bottom (y-)
+///
+/// A constant rather than a field on the effect. It never changes, so holding
+/// it on the effect bought nothing except two borrows per frame that the
+/// renderer then had to copy out of before it could write -- and a `Vec` of
+/// topology allocated per effect instance for sixteen bytes of content.
+const FACES: [Face; 6] = [
+    Face {
+        corners: [0, 3, 2, 1],
+    },
+    Face {
+        corners: [4, 5, 6, 7],
+    },
+    Face {
+        corners: [1, 2, 6, 5],
+    },
+    Face {
+        corners: [0, 4, 7, 3],
+    },
+    Face {
+        corners: [3, 7, 6, 2],
+    },
+    Face {
+        corners: [0, 1, 5, 4],
+    },
+];
+
+/// The twelve edges, grouped as the old effect's list was and with the two
+/// faces each is shared by.
+const EDGES: [Edge; 12] = [
+    // Front face
+    Edge {
+        v1: 0,
+        v2: 1,
+        faces: [0, 5],
+    },
+    Edge {
+        v1: 1,
+        v2: 2,
+        faces: [0, 2],
+    },
+    Edge {
+        v1: 2,
+        v2: 3,
+        faces: [0, 4],
+    },
+    Edge {
+        v1: 3,
+        v2: 0,
+        faces: [0, 3],
+    },
+    // Back face
+    Edge {
+        v1: 4,
+        v2: 5,
+        faces: [1, 5],
+    },
+    Edge {
+        v1: 5,
+        v2: 6,
+        faces: [1, 2],
+    },
+    Edge {
+        v1: 6,
+        v2: 7,
+        faces: [1, 4],
+    },
+    Edge {
+        v1: 7,
+        v2: 4,
+        faces: [1, 3],
+    },
+    // Connecting edges
+    Edge {
+        v1: 0,
+        v2: 4,
+        faces: [3, 5],
+    },
+    Edge {
+        v1: 1,
+        v2: 5,
+        faces: [2, 5],
+    },
+    Edge {
+        v1: 2,
+        v2: 6,
+        faces: [2, 4],
+    },
+    Edge {
+        v1: 3,
+        v2: 7,
+        faces: [3, 4],
+    },
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +155,23 @@ pub struct CubeOptions {
     pub rotation_speed_z: f32,
     pub distance: f32,
     pub use_braille: bool,
+    /// Fraction of the shorter half-axis the cube's bounding sphere spans.
+    ///
+    /// See [`Cube::projection_scale`]. Below 1.0 so that the extreme vertex
+    /// still lands inside the last row and column: the rasterisers address
+    /// cells by `floor`, and a vertex exactly on the boundary is a dot at
+    /// `4 * height`, which the bounds check drops.
+    pub fit: f32,
+    /// Fill the faces, or draw the wireframe alone.
+    pub filled: bool,
+    /// Mark the eight corners.
+    pub vertex_markers: bool,
+    /// Characters the *cell-resolution* face fill is drawn as, sparsest first.
+    ///
+    /// Only read when `use_braille` is off: the braille renderer expresses a
+    /// face's density in raised dots rather than in ink coverage, so it has no
+    /// ramp to draw from.
+    pub glyphs: String,
 }
 
 impl Default for CubeOptions {
@@ -45,13 +182,418 @@ impl Default for CubeOptions {
     /// that omitted a section silently zeroed it.
     fn default() -> Self {
         Self {
-            cube_size: 1.0,
+            cube_size: DEFAULT_CUBE_SIZE,
             rotation_speed_x: 0.25,
             rotation_speed_y: 0.35,
             rotation_speed_z: 0.18,
-            distance: 3.5,
+            distance: DEFAULT_DISTANCE,
             use_braille: true,
+            fit: DEFAULT_FIT,
+            filled: true,
+            vertex_markers: true,
+            glyphs: DEFAULT_GLYPHS.to_string(),
         }
+    }
+}
+
+/// The default `cube_size`, and what an unusable one falls back to.
+///
+/// Falling back rather than clamping to zero is the `terrain` precedent: both
+/// fields are user-facing, both are `f32`, and a hand-edited config can put
+/// `NaN` in either, and a `NaN` size propagates into every projected
+/// coordinate and then into `as i32`, which reads it as 0 and draws the whole
+/// cube in the top-left corner.
+const DEFAULT_CUBE_SIZE: f32 = 1.0;
+
+/// The default camera distance, and what an unusable one falls back to.
+const DEFAULT_DISTANCE: f32 = 3.5;
+
+/// How much of the camera distance the cube's own half-diagonal may occupy.
+///
+/// The perspective divides by `distance + z`, and the nearest vertex has
+/// `z = -cube_size * sqrt(3)`, so the denominator bottoms out at
+/// `distance - cube_size * sqrt(3)`. At the defaults that is 2.5. Let it
+/// approach zero and the near face blows up across the screen; let it go
+/// negative and the near vertices project *behind* the eye, the winding
+/// inverts, and a convex solid stops being convex -- every back-face test in
+/// this file inverts with it, so the effect draws inside-out rather than
+/// merely too large.
+///
+/// Clamped rather than rejected, because "as big as this camera can honestly
+/// show" is a well-defined answer to a `cube_size` that is too large, and
+/// rejecting would leave the effect blank. 0.8 leaves the near face at a
+/// quarter of the distance, which is a wide-angle enough view to read as
+/// perspective.
+const MAX_CAMERA_FILL: f32 = 0.8;
+
+/// Clamp range for `distance`.
+///
+/// Not a taste decision. `projection_scale` is `half_extent / projected_radius`,
+/// and `projected_radius` is roughly `radius / distance`, so the scale grows in
+/// proportion to `distance` and the projected coordinate is `world * scale`. At
+/// the upper bound the projected coordinate is about 4e4, comfortably inside
+/// `f32`; without a bound, a `distance` of 1e38 in a hand-edited config makes
+/// the scale `inf` and every coordinate `NaN`, which `as i32` turns into 0 --
+/// so the cube vanishes into one corner rather than merely looking wrong.
+const MIN_DISTANCE: f32 = 0.1;
+const MAX_DISTANCE: f32 = 1000.0;
+
+/// The fraction of the half-axis the cube spans by default.
+///
+/// Just under a whole half-axis, for the `floor`ing reason on
+/// [`CubeOptions::fit`]. 0.95 rather than 0.9 because the fitted value is exact
+/// and there is no reason to give up a twentieth of the terminal: the whole
+/// reason the old 0.8 fudge was replaced is that a constant which happens to
+/// fit at one size is not a fit.
+const DEFAULT_FIT: f32 = 0.95;
+
+/// Vertical compression of the projection, as a fraction of the horizontal.
+///
+/// A terminal cell is taller than it is wide -- DejaVu Sans Mono is about
+/// 1 : 1.2, the usual assumption is 1 : 2 -- so an uncorrected cube is a
+/// rhombus twice as tall as it is wide. Every sub-cell renderer in this crate
+/// assumes the same 1 : 2 and is correspondingly squashed on a real font; this
+/// is the same correction, chosen conservatively for the same reason
+/// `terrain`'s `CELL_ASPECT` is 1.2 rather than 2.
+const Y_SQUASH: f32 = 0.8;
+
+/// How close to edge-on a face may get and still be drawn.
+///
+/// A fraction of `normal . (eye - centroid)`, which for a convex face is its
+/// projected area times the product of two lengths and so is already
+/// size-independent and distance-independent. A thousandth puts the cut-off at
+/// about 0.03 degrees of tilt, which is far below any face worth drawing and
+/// far above the cancellation error in a cross product of two nearly-parallel
+/// spans.
+const EDGE_ON_EPSILON: f32 = 1.0e-3;
+
+/// The lightest a face's dots ever get, as a fraction of the cell filled.
+///
+/// A face is filled to a density set by its depth and dithered to that density,
+/// so the far face is a sparse field and the near one is solid. Not zero,
+/// because a face pointing away should recede rather than vanish: the cube is
+/// drawn against the terminal's own background, and a face at 4% density
+/// simply reads as noise rather than as a plane.
+const MIN_FACE_DENSITY: f32 = 0.22;
+
+/// The corner marker.
+///
+/// Ambiguous-width but not double-width, so one cell in a Latin-configured
+/// terminal, and it carries a colour rather than relying on bold -- see
+/// [`VERTEX_COLOUR`].
+const VERTEX_GLYPH: char = '\u{25C6}';
+
+/// The edge glyph on the cell-resolution path.
+///
+/// The braille path has no such thing: an edge there is a run of raised dots at
+/// full density, which is the same idea at that resolution.
+const ASCII_EDGE_GLYPH: char = '\u{2588}';
+
+/// The colour the corner markers are drawn in.
+///
+/// `Attribute::Bold` is the obvious way to make eight small glyphs stand out
+/// from the edge they sit on, and it is a brightening *hint* that many
+/// terminals act on -- so the markers would come out brighter on some machines
+/// than others, and the top of a depth ramp would land somewhere
+/// unpredictable. The edge ramp already ends at white, so the marker is
+/// distinguished by its shape and nothing else.
+const VERTEX_COLOUR: Color = Color::Rgb {
+    r: 255,
+    g: 255,
+    b: 255,
+};
+
+/// Face colour, from the far plane to the near one.
+///
+/// The far stop is nearly the background rather than a saturated dark version
+/// of the green. A face pointing away is the thing that should recede, and a
+/// dark *saturated* green reads as a solid slab that the near faces then have
+/// to be brighter than -- which puts a brightness step in the wrong place. The
+/// top stop is the near face and it stops short of white, because the edges are
+/// drawn from the same range and the two have to stay tellable apart.
+const FACE_RAMP: &[Color] = &[
+    Color::Rgb {
+        r: 10,
+        g: 34,
+        b: 58,
+    },
+    Color::Rgb {
+        r: 20,
+        g: 92,
+        b: 128,
+    },
+    Color::Rgb {
+        r: 46,
+        g: 190,
+        b: 168,
+    },
+    Color::Rgb {
+        r: 190,
+        g: 255,
+        b: 226,
+    },
+];
+
+/// Edge colour: the same range, lifted.
+///
+/// A separate ramp rather than a brightening multiplier applied to the face
+/// colour, because the point of an edge is to be the brightest thing on screen
+/// *wherever it is*. An edge on the far side of the cube is still the edge, and
+/// the cube has no cue other than this to say which lines are its own outline
+/// and which are the silhouette of a face.
+const EDGE_RAMP: &[Color] = &[
+    Color::Rgb {
+        r: 62,
+        g: 130,
+        b: 176,
+    },
+    Color::Rgb {
+        r: 120,
+        g: 210,
+        b: 216,
+    },
+    Color::Rgb {
+        r: 236,
+        g: 255,
+        b: 250,
+    },
+    Color::Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    },
+];
+
+/// The cell-resolution face glyphs, by default.
+///
+/// Blocks, for the reason `terrain` uses them: `░▒▓█` are *defined* as
+/// quarter, half, three-quarter and full coverage of the cell box, so their
+/// order holds by the standard rather than by taste, and it holds at any cell
+/// aspect ratio -- which a punctuation ramp does not. `SHADE` would be wrong
+/// here for the documented reason that `=` is heavier than `+`.
+const DEFAULT_GLYPHS: &str = glyph_ramp::presets::BLOCKS;
+
+/// "No depth recorded" in the per-cell depth arrays.
+///
+/// The depth is quantised into `1..=255` rather than `0..=255` so that zero is
+/// free to mean *absent*. Storing a raw `0..=255` would make the far plane
+/// indistinguishable from "nothing here", and a face exactly on the far plane
+/// does occur -- it is the face that is culled, and the cells behind it are
+/// exactly the cells that must not inherit its depth.
+const NO_DEPTH: u8 = 0;
+
+/// The half-open rectangle a frame wrote to.
+///
+/// The flush reads two palettes and does a per-cell decision, so it walks the
+/// cube's own bounding box rather than the whole terminal: at 400x200 the
+/// difference is 80,000 cells against the few thousand the cube occupies.
+#[derive(Clone, Copy)]
+struct Rect {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+}
+
+impl Rect {
+    fn empty() -> Self {
+        Self {
+            left: usize::MAX,
+            top: usize::MAX,
+            right: 0,
+            bottom: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.right <= self.left || self.bottom <= self.top
+    }
+
+    fn grow(&mut self, x: usize, y: usize) {
+        self.left = self.left.min(x);
+        self.top = self.top.min(y);
+        self.right = self.right.max(x + 1);
+        self.bottom = self.bottom.max(y + 1);
+    }
+}
+
+/// The per-cell scratch both renderers draw into.
+///
+/// One rectangle of per-cell state, and the point of it is that a corner cell
+/// is written once. The old renderer built a fresh dot map per *edge* and then
+/// `set` the whole cell, so all twelve edges wrote over each other and the last
+/// one won. Every vertex is the endpoint of three edges, so all eight corners
+/// came out as the end-stub of whichever edge happened to be drawn last, and
+/// they are the one part of a cube that reads as a cube.
+#[derive(Clone)]
+struct Field {
+    /// Raised dots from face fills.
+    faces: BrailleGrid,
+    /// Raised dots from edges, kept apart because a braille cell carries one
+    /// colour and the flush has to know which of the two reached it.
+    edges: BrailleGrid,
+    /// The nearest face over each cell, quantised to `1..=255`.
+    face_depth: Vec<u8>,
+    /// The nearest edge over each cell, quantised the same way.
+    edge_depth: Vec<u8>,
+    /// The corner marker at each cell, `NO_DEPTH` for none.
+    vertex_depth: Vec<u8>,
+    dirty: Rect,
+}
+
+impl Field {
+    fn new(width: u16, height: u16) -> Self {
+        let (w, h) = (width.max(1) as usize, height.max(1) as usize);
+        Self {
+            faces: BrailleGrid::new(w, h),
+            edges: BrailleGrid::new(w, h),
+            face_depth: vec![NO_DEPTH; w * h],
+            edge_depth: vec![NO_DEPTH; w * h],
+            vertex_depth: vec![NO_DEPTH; w * h],
+            dirty: Rect::empty(),
+        }
+    }
+
+    fn resize(&mut self, width: u16, height: u16) {
+        let (w, h) = (width.max(1) as usize, height.max(1) as usize);
+        if (w, h) == (self.faces.width(), self.faces.height()) {
+            return;
+        }
+        *self = Self::new(width, height);
+    }
+
+    /// Blanks every cell and restarts the dirty rectangle.
+    ///
+    /// Wholly rather than just the previous frame's rectangle, and that is a
+    /// deliberate trade: the alternative needs the *previous* rectangle to
+    /// survive the clear, which means the flush reads a rectangle the render
+    /// has already reset. The cost is 400 KB of memset at 400x200, sixty times
+    /// a second, which is under 20 microseconds -- and it is what the old
+    /// renderer spent its whole budget on, twelve times over, in twelve
+    /// `HashMap`s.
+    fn clear(&mut self) {
+        self.faces.clear();
+        self.edges.clear();
+        self.face_depth.fill(NO_DEPTH);
+        self.edge_depth.fill(NO_DEPTH);
+        self.vertex_depth.fill(NO_DEPTH);
+        self.dirty = Rect::empty();
+    }
+
+    #[inline]
+    fn mark_face(&mut self, x: usize, y: usize, depth: u8) {
+        let index = y * self.faces.width() + x;
+        if depth > self.face_depth[index] {
+            self.face_depth[index] = depth;
+        }
+        self.dirty.grow(x, y);
+    }
+
+    /// Records an edge crossing a cell, on the cell-resolution path.
+    ///
+    /// The braille path has no counterpart: there an edge *is* dots, and they
+    /// land in `edges`. This is here so both renderers share one `render` and
+    /// one flush, differing only in what the per-cell record means.
+    #[inline]
+    fn mark_edge_cell(&mut self, x: usize, y: usize, depth: u8) {
+        let index = y * self.faces.width() + x;
+        if depth > self.edge_depth[index] {
+            self.edge_depth[index] = depth;
+        }
+        self.dirty.grow(x, y);
+    }
+
+    #[inline]
+    fn mark_vertex(&mut self, x: usize, y: usize, depth: u8) {
+        let index = y * self.faces.width() + x;
+        // Nearest wins, so the *minimum* quantised depth, unlike the two
+        // marks above. Two corners in one cell is possible on a small
+        // terminal, and of the two the nearer one is the one in front.
+        if self.vertex_depth[index] == NO_DEPTH || depth < self.vertex_depth[index]
+        {
+            self.vertex_depth[index] = depth;
+        }
+        self.dirty.grow(x, y);
+    }
+
+    /// Raises one dot belonging to an edge.
+    #[inline]
+    fn raise_edge_dot(&mut self, dot_x: usize, dot_y: usize, depth: u8) {
+        let (cx, cy) = (dot_x / DOTS_X, dot_y / DOTS_Y);
+        if cx >= self.edges.width() || cy >= self.edges.height() {
+            return;
+        }
+        self.edges.raise_dot(dot_x, dot_y);
+        let index = cy * self.edges.width() + cx;
+        if depth > self.edge_depth[index] {
+            self.edge_depth[index] = depth;
+        }
+        self.dirty.grow(cx, cy);
+    }
+
+    /// Raises one dot belonging to a face fill.
+    #[inline]
+    fn raise_face_dot(&mut self, dot_x: usize, dot_y: usize, depth: u8) {
+        let (cx, cy) = (dot_x / DOTS_X, dot_y / DOTS_Y);
+        if cx >= self.faces.width() || cy >= self.faces.height() {
+            return;
+        }
+        self.faces.raise_dot(dot_x, dot_y);
+        let index = cy * self.faces.width() + cx;
+        if depth > self.face_depth[index] {
+            self.face_depth[index] = depth;
+        }
+        self.dirty.grow(cx, cy);
+    }
+}
+
+/// Packs a depth in `0.0..=1.0` into the `1..=255` range the field stores.
+///
+/// The shift rather than a `0` sentinel is what lets `NO_DEPTH` mean "nothing
+/// here" without also being a reachable depth. See [`NO_DEPTH`].
+#[inline]
+fn quantise(depth: f32) -> u8 {
+    let depth = if depth.is_nan() {
+        0.0
+    } else {
+        depth.clamp(0.0, 1.0)
+    };
+    1 + (depth * 254.0).round() as u8
+}
+
+/// The inverse of [`quantise`].
+#[inline]
+fn dequantise(packed: u8) -> f32 {
+    if packed == NO_DEPTH {
+        return 0.0;
+    }
+    (packed as f32 - 1.0) / 254.0
+}
+
+/// A user-facing `f32` that has to be usable, or a fallback.
+///
+/// `f32::clamp` propagates `NaN` rather than saturating it, so a `NaN` in a
+/// config file would sail through a bounds check and arrive in the projection
+/// as a `NaN` coordinate, which `as i32` reads as 0.
+#[inline]
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
+/// Builds the glyph ramp, never empty and never a character that could shear a
+/// cell-indexed grid.
+fn glyph_ramp(configured: &str) -> GlyphRamp {
+    let glyphs: Vec<char> = configured
+        .chars()
+        .filter(|glyph| {
+            !glyph.is_control() && glyph_ramp::is_ambiguous_or_narrow(*glyph)
+        })
+        .collect();
+
+    if glyphs.is_empty() {
+        GlyphRamp::from_text(DEFAULT_GLYPHS)
+    } else {
+        GlyphRamp::new(glyphs)
     }
 }
 
@@ -60,47 +602,43 @@ pub struct Cube {
     options: CubeOptions,
     canvas: Canvas,
     vertices: Vec<Point3D>,
-    edges: Vec<Edge>,
     rotation: (f32, f32, f32),
     simulation_time: Duration,
+    field: Field,
+    ramp: GlyphRamp,
+    face_palette: Palette,
+    edge_palette: Palette,
+    /// The rotated and projected vertices, held across frames.
+    ///
+    /// Eight `Point3D` and eight `Point2D` a frame is nothing, but it is two
+    /// `Vec`s the old code allocated on every one of the sixty frames a
+    /// second, and the projected copy is what the rasterisers and every test
+    /// read, so it wants to be one addressable buffer rather than a fresh
+    /// allocation.
+    rotated: Vec<Point3D>,
+    projected: Vec<Point2D>,
 }
 
 impl TerminalEffect for Cube {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        // Rotate vertices
-        let rotated_vertices = self.rotate_vertices();
-
-        // Project 3D points to 2D
-        let projected_vertices: Vec<Point2D> =
-            rotated_vertices.iter().map(|v| self.project(*v)).collect();
-
         self.canvas.clear();
-
-        // Draw the cube. The draw helpers are associated functions rather than
-        // methods so that borrowing the canvas here does not overlap a borrow of
-        // the whole effect.
-        let (edges, size, braille) =
-            (&self.edges, self.screen_size, self.options.use_braille);
-        if braille {
-            Self::draw_braille(
-                edges,
-                size,
-                &projected_vertices,
-                self.canvas.surface_mut(),
-            );
-        } else {
-            Self::draw_ascii(
-                edges,
-                size,
-                &projected_vertices,
-                self.canvas.surface_mut(),
-            );
-        }
-
-        self.canvas.commit()
+        self.render();
+        let Self {
+            canvas,
+            field,
+            options,
+            ramp,
+            face_palette,
+            edge_palette,
+            ..
+        } = self;
+        Self::flush(field, options, ramp, face_palette, edge_palette, canvas);
+        canvas.commit()
     }
 
     fn update(&mut self) {
+        // The rate the rotation was tuned against. `update_with_context` is
+        // the real one.
         self.simulation_time += Duration::from_secs_f64(1.0 / 60.0);
         self.update_rotation();
     }
@@ -113,6 +651,7 @@ impl TerminalEffect for Cube {
     fn update_size(&mut self, width: u16, height: u16) {
         self.screen_size = (width, height);
         self.canvas.resize(self.screen_size.0, self.screen_size.1);
+        self.field.resize(self.screen_size.0, self.screen_size.1);
     }
 
     fn reset(&mut self) {
@@ -131,8 +670,12 @@ impl Cube {
     pub fn new(options: CubeOptions, screen_size: (u16, u16)) -> Self {
         let canvas = Canvas::new(screen_size.0, screen_size.1);
 
-        // Define cube vertices
-        let size = options.cube_size;
+        // The vertices are built from the *clamped* size, not the configured
+        // one, so the geometry matches what the fit computation assumed. Two
+        // different sizes would still produce a cube -- just not the one the
+        // screen was fitted to, and the whole cube would be the wrong size on
+        // screen with no way to tell from the output.
+        let size = options.effective_cube_size();
         let vertices = vec![
             Point3D {
                 x: -size,
@@ -176,39 +719,38 @@ impl Cube {
             }, // 7: back top left
         ];
 
-        // Define cube edges
-        let edges = vec![
-            // Front face
-            Edge { v1: 0, v2: 1 },
-            Edge { v1: 1, v2: 2 },
-            Edge { v1: 2, v2: 3 },
-            Edge { v1: 3, v2: 0 },
-            // Back face
-            Edge { v1: 4, v2: 5 },
-            Edge { v1: 5, v2: 6 },
-            Edge { v1: 6, v2: 7 },
-            Edge { v1: 7, v2: 4 },
-            // Connecting edges
-            Edge { v1: 0, v2: 4 },
-            Edge { v1: 1, v2: 5 },
-            Edge { v1: 2, v2: 6 },
-            Edge { v1: 3, v2: 7 },
-        ];
+        // The six faces and twelve edges are `FACES` and `EDGES`, which are
+        // constants -- see there for the ordering and the adjacency.
+
+        let face_palette = Palette::new(FACE_RAMP.to_vec());
+        let edge_palette = Palette::new(EDGE_RAMP.to_vec());
 
         Self {
             screen_size,
+            rotated: vec![
+                Point3D {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0
+                };
+                vertices.len()
+            ],
+            projected: vec![Point2D { x: 0.0, y: 0.0 }; vertices.len()],
+            field: Field::new(screen_size.0, screen_size.1),
+            ramp: glyph_ramp(&options.glyphs),
+            face_palette,
+            edge_palette,
             options,
             canvas,
             vertices,
-            edges,
             rotation: (0.0, 0.0, 0.0),
             simulation_time: Duration::ZERO,
         }
     }
 
     // Rotate a point using rotation matrices
-    fn rotate_point(&self, p: Point3D) -> Point3D {
-        let (rx, ry, rz) = self.rotation;
+    fn rotate_point(rotation: (f32, f32, f32), p: Point3D) -> Point3D {
+        let (rx, ry, rz) = rotation;
 
         // X-axis rotation
         let cos_x = rx.cos();
@@ -235,27 +777,111 @@ impl Cube {
         }
     }
 
-    // Rotate all vertices
-    fn rotate_vertices(&self) -> Vec<Point3D> {
-        self.vertices
-            .iter()
-            .map(|v| self.rotate_point(*v))
-            .collect()
+    /// `cube_size`, clamped so the camera stays in front of the whole cube.
+    ///
+    /// See [`MAX_CAMERA_FILL`]. This is the only place the clamp lives, so the
+    /// vertices, the bounding radius the fit uses, and the projection all
+    /// agree on how big the cube is.
+    fn effective_cube_size(&self) -> f32 {
+        let size = finite_or(self.options.cube_size, DEFAULT_CUBE_SIZE);
+        if size <= 0.0 {
+            return DEFAULT_CUBE_SIZE;
+        }
+        let distance = self.effective_distance();
+        size.min(MAX_CAMERA_FILL * distance / 3.0f32.sqrt())
+    }
+
+    /// `distance`, clamped to a range the projection survives.
+    ///
+    /// See [`MIN_DISTANCE`] and [`MAX_DISTANCE`].
+    fn effective_distance(&self) -> f32 {
+        let distance = finite_or(self.options.distance, DEFAULT_DISTANCE);
+        if distance <= 0.0 {
+            return DEFAULT_DISTANCE;
+        }
+        distance.clamp(MIN_DISTANCE, MAX_DISTANCE)
+    }
+
+    /// The cube's circumradius: every vertex is `sqrt(3)` half-diagonals out.
+    fn bounding_radius(&self) -> f32 {
+        self.effective_cube_size() * 3.0f32.sqrt()
+    }
+
+    /// How far the bounding sphere can reach on screen, per unit of scale.
+    ///
+    /// A point at radius `r` from the origin, in the plane containing the view
+    /// axis, is drawn at `r * sin(theta) / (distance + r * cos(theta))`.
+    /// Differentiating that over the ball of radius `R` and setting the
+    /// derivative to zero gives `cos(theta) = -R / distance` and a maximum of
+    /// `R / sqrt(distance^2 - R^2)`.
+    ///
+    /// The bound is *reached* rather than approached, which is the part worth
+    /// checking before trusting it: the eight vertices are at `sqrt(3)` times
+    /// the half-side, so rotating the cube sweeps each of them around a circle
+    /// of radius `R`, and every angle on that circle is attained.
+    fn projected_radius(radius: f32, distance: f32) -> f32 {
+        let inside = (distance * distance - radius * radius).max(0.0);
+        if inside <= 0.0 {
+            return 0.0;
+        }
+        radius / inside.sqrt()
+    }
+
+    /// The projection scale, in cell units, that fits the cube to the screen.
+    ///
+    /// Derived, where the old code multiplied the shorter terminal dimension by
+    /// a hard-coded `0.8` and hoped. That number is not a fit: the cube's
+    /// worst-case projected radius is 0.57 of a half-axis per unit of scale, so
+    /// `0.8 * 0.8` happened to leave the default `cube_size` on screen at the
+    /// sizes it was tried at -- and clipped off the top and bottom everywhere
+    /// else. `cube_size` is a public config field, and `1.4` is enough to push
+    /// a vertex past the last row at 80x24, which is where this was measured
+    /// from. There is no value of a constant that fixes it, because the right
+    /// constant is a function of the terminal's aspect ratio.
+    fn projection_scale(&self) -> f32 {
+        let radius = self.bounding_radius();
+        let distance = self.effective_distance();
+        let unit_x = Self::projected_radius(radius, distance);
+        if unit_x <= 0.0 {
+            return 0.0;
+        }
+        let unit_y = unit_x * Y_SQUASH;
+
+        let half_width = self.screen_size.0 as f32 * 0.5;
+        let half_height = self.screen_size.1 as f32 * 0.5;
+        if half_width <= 0.0 || half_height <= 0.0 {
+            return 0.0;
+        }
+
+        // Whichever axis runs out first sets the scale, so the cube is as large
+        // as this terminal can honestly show rather than as large as a constant
+        // says. A wide short terminal is limited by its height and a narrow
+        // tall one by its width, and neither case is special-cased.
+        //
+        // A non-positive `fit` falls back rather than being honoured, the same
+        // as a non-positive `cube_size`. Clamping it to a small positive
+        // number would draw a cube four cells across, which is a broken effect
+        // that looks like a rendering failure; and "how much of the screen" is
+        // not a question with a useful answer of zero.
+        let fit = finite_or(self.options.fit, DEFAULT_FIT);
+        let fit = if fit <= 0.0 {
+            DEFAULT_FIT
+        } else {
+            fit.min(1.0)
+        };
+        (half_width / unit_x).min(half_height / unit_y) * fit
     }
 
     // Project a 3D point to 2D screen coordinates
-    fn project(&self, p: Point3D) -> Point2D {
-        let distance = self.options.distance;
+    fn project(p: Point3D, scale: f32, size: (u16, u16), distance: f32) -> Point2D {
         let z_factor = 1.0 / (distance + p.z);
 
         // Calculate screen coordinates
-        let width = self.screen_size.0 as f32;
-        let height = self.screen_size.1 as f32;
+        let width = size.0 as f32;
+        let height = size.1 as f32;
 
-        let scale_factor = width.min(height) * 0.8;
-
-        let screen_x = width / 2.0 + p.x * z_factor * scale_factor;
-        let screen_y = height / 2.0 + p.y * z_factor * scale_factor * 0.8;
+        let screen_x = width / 2.0 + p.x * z_factor * scale;
+        let screen_y = height / 2.0 + p.y * z_factor * scale * Y_SQUASH;
 
         Point2D {
             x: screen_x,
@@ -263,119 +889,278 @@ impl Cube {
         }
     }
 
-    // Draw the cube using ASCII characters
-    fn draw_ascii(
-        edges: &[Edge],
-        size: (u16, u16),
-        projected: &[Point2D],
-        buffer: &mut Buffer,
-    ) {
-        // Draw edges
-        for edge in edges {
-            Self::draw_line(
-                size,
-                projected[edge.v1].x,
-                projected[edge.v1].y,
-                projected[edge.v2].x,
-                projected[edge.v2].y,
-                buffer,
-            );
+    /// The depth range the ramp is normalised against: the far and near ends
+    /// of the *visible faces' own planes*.
+    ///
+    /// See the note in [`render`](Self::render) for why not the vertex range.
+    ///
+    /// The degenerate case is a cube viewed exactly down one of its axes, where
+    /// one face is visible and there is no depth ordering left to express. A
+    /// zero-width range would divide by zero, so the fallback is a nominal
+    /// width of two circumradii placed so the visible plane sits at the *top* of
+    /// it, which draws that face solid and bright.
+    ///
+    /// Top rather than middle, and that is a measured decision rather than a
+    /// tidy one. Centred on the plane puts the lone face at `t = 0.5`, so it
+    /// is drawn at 61% dot density -- and a face-on cube then comes out as a
+    /// 61% checkerboard, which is the one rotation at which the viewer can see
+    /// that the texture is dithering rather than shading anything. The single
+    /// visible face is the nearest thing on screen, so drawing it as the
+    /// nearest thing is both the honest reading and the readable one.
+    fn face_depth_range(&self, visible: &[bool; FACES.len()]) -> (f32, f32) {
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        for (index, face) in FACES.iter().enumerate() {
+            if !visible[index] {
+                continue;
+            }
+            let z = self.face_centroid_z(face);
+            if z.is_finite() {
+                low = low.min(z);
+                high = high.max(z);
+            }
         }
+
+        let span = high - low;
+        let floor = 1.0e-4 * self.effective_cube_size().max(1.0e-3);
+        if low.is_finite() && span > floor {
+            return (low, high);
+        }
+
+        let near = if low.is_finite() { low } else { 0.0 };
+        let width = 2.0 * self.bounding_radius().max(1.0e-3);
+        (near, near + width)
     }
 
-    // Draw the cube using braille patterns
-    fn draw_braille(
-        edges: &[Edge],
-        size: (u16, u16),
-        projected: &[Point2D],
-        buffer: &mut Buffer,
-    ) {
-        // Draw edges with braille
-        for edge in edges {
-            Self::draw_braille_line(
-                size,
-                projected[edge.v1].x,
-                projected[edge.v1].y,
-                projected[edge.v2].x,
-                projected[edge.v2].y,
-                buffer,
-            );
+    /// How deep a rotated `z` sits, as `0.0` at the far end of the range and
+    /// `1.0` at the near one.
+    #[inline]
+    fn depth_of(&self, z: f32, range: (f32, f32)) -> f32 {
+        if !z.is_finite() {
+            return 0.0;
         }
+        let span = range.1 - range.0;
+        let span = if span > 0.0 { span } else { 1.0 };
+        ((range.1 - z) / span).clamp(0.0, 1.0)
     }
 
-    // Draw a line using ASCII characters
-    fn draw_line(
-        size: (u16, u16),
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        buffer: &mut Buffer,
-    ) {
-        let mut x0 = x0 as i32;
-        let mut y0 = y0 as i32;
-        let x1 = x1 as i32;
-        let y1 = y1 as i32;
+    /// Whether a face is turned towards the viewer.
+    ///
+    /// The cross product of the first two spans is the face's outward normal,
+    /// because [`FACES`] lists every face's corners counter-clockwise seen from
+    /// outside -- verified for all six by hand, and pinned by
+    /// `the_face_winding_is_outward_at_every_corner` below.
+    ///
+    /// A convex face is visible exactly when the eye is on its *outer* side, so
+    /// the test is `normal . (eye - centroid) > 0`. The eye is at
+    /// `(0, 0, -distance)`, not at the origin: the projection is
+    /// `1 / (distance + z)`, so a point's distance from the eye runs from
+    /// `distance` at `z = 0` towards zero as `z` goes negative, and the
+    /// vanishing point is `-z`. Using the origin instead makes the test
+    /// `normal . centroid < 0`, which is *also* a correct visibility test for
+    /// an orthographic camera and differs from the perspective one exactly
+    /// where it matters here: it keeps faces that the eye is behind.
+    ///
+    /// Three-dimensional rather than a projected winding sign, because of the
+    /// degenerate case. A face exactly edge-on has a cross product of
+    /// numerically zero, and the *sign* of zero is cancellation noise, so a
+    /// sign test makes the face flicker in and out of existence as the cube
+    /// turns. Hence the epsilon, scaled by the two vectors' lengths so it means
+    /// the same thing at any cube size or camera distance.
+    fn face_is_front_facing(&self, face: &Face) -> bool {
+        let c = &self.rotated;
+        let (a, b, d, e) = (
+            c[face.corners[0]],
+            c[face.corners[1]],
+            c[face.corners[2]],
+            c[face.corners[3]],
+        );
+        let u = Point3D {
+            x: b.x - a.x,
+            y: b.y - a.y,
+            z: b.z - a.z,
+        };
+        let v = Point3D {
+            x: d.x - a.x,
+            y: d.y - a.y,
+            z: d.z - a.z,
+        };
+        let normal = Point3D {
+            x: u.y * v.z - u.z * v.y,
+            y: u.z * v.x - u.x * v.z,
+            z: u.x * v.y - u.y * v.x,
+        };
+        let centroid = Point3D {
+            x: (a.x + b.x + d.x + e.x) * 0.25,
+            y: (a.y + b.y + d.y + e.y) * 0.25,
+            z: (a.z + b.z + d.z + e.z) * 0.25,
+        };
+        let to_eye = Point3D {
+            x: -centroid.x,
+            y: -centroid.y,
+            z: -self.effective_distance() - centroid.z,
+        };
+        let dot = normal.x * to_eye.x + normal.y * to_eye.y + normal.z * to_eye.z;
+        let scale = Self::length(&normal) * Self::length(&to_eye);
 
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
+        dot > scale * EDGE_ON_EPSILON
+    }
 
-        let width = size.0 as i32;
-        let height = size.1 as i32;
+    fn length(p: &Point3D) -> f32 {
+        (p.x * p.x + p.y * p.y + p.z * p.z).sqrt()
+    }
 
-        loop {
-            if x0 >= 0 && x0 < width && y0 >= 0 && y0 < height {
-                buffer.set(
-                    x0 as usize,
-                    y0 as usize,
-                    Cell::new('█', style::Color::Green, style::Attribute::Bold),
-                );
+    /// The horizontal span of a projected convex quad at one scanline.
+    ///
+    /// `None` when the row misses it. A convex quad meets any horizontal line
+    /// in at most one segment, so bracketing it with the quad's edge crossings
+    /// is exact -- and doing it per row rather than per dot is the difference
+    /// between four divisions per row and four per dot, which at 400x200 is
+    /// the difference between about 600k tests a frame and two and a half
+    /// million.
+    fn row_span(quad: &[Point2D; 4], y: f32) -> Option<(f32, f32)> {
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        let mut crossings = 0;
+        for index in 0..4 {
+            let a = quad[index];
+            let b = quad[(index + 1) % 4];
+            // Half-open on the upper end, so a vertex exactly on the row counts
+            // once rather than twice and a horizontal edge never appears to
+            // cross it at all.
+            if (a.y <= y) == (b.y <= y) {
+                continue;
             }
-
-            if x0 == x1 && y0 == y1 {
-                break;
+            let t = (y - a.y) / (b.y - a.y);
+            let x = a.x + t * (b.x - a.x);
+            if x < low {
+                low = x;
             }
+            if x > high {
+                high = x;
+            }
+            crossings += 1;
+        }
+        if crossings < 2 {
+            return None;
+        }
+        Some((low, high))
+    }
 
-            let e2 = 2 * err;
-            if e2 >= dy {
-                if x0 == x1 {
-                    break;
+    /// Fills a projected quad with dots, at a density set by its depth.
+    ///
+    /// The density is dithered rather than thresholded, which is what lets a
+    /// face carry a gradient at all: one colour per cell means the *density*
+    /// is the only continuous quantity available, and a hard threshold would
+    /// put a visible edge between a face and its neighbour one step away.
+    ///
+    /// Dots are OR-ed into the shared field rather than written over it, and
+    /// the depth is combined with a maximum. Together those two are the whole
+    /// reason a filled cube comes out as one solid with visible planes rather
+    /// than as whichever face was drawn last: the three visible faces are
+    /// disjoint in depth, and the nearest one both wins the cell's colour and
+    /// contributes the most dots.
+    fn fill_face_dots(&mut self, quad: [Point2D; 4], depth: u8) {
+        let density =
+            MIN_FACE_DENSITY + (1.0 - MIN_FACE_DENSITY) * dequantise(depth);
+
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for p in &quad {
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+
+        let dot_width = self.field.faces.dot_width() as i32;
+        let dot_height = self.field.faces.dot_height() as i32;
+        // A dot at integer `n` is drawn over roughly `n - 0.5 .. n + 0.5`, so
+        // the dot lattice samples at `n + 0.5` and a dot is inside the quad
+        // when `n + 0.5` divided by the dots-per-cell lands inside it. Getting
+        // this wrong is the same class of mistake as confusing cell and dot
+        // coordinates anywhere else in this crate, and it fails quietly: the
+        // fill is drawn, just clipped to a fraction of the face near the
+        // top-left corner.
+        let first_y = ((min_y * DOTS_Y as f32 - 0.5).ceil() as i32).max(0);
+        let last_y =
+            ((max_y * DOTS_Y as f32 - 0.5).floor() as i32).min(dot_height - 1);
+
+        for dot_y in first_y..=last_y {
+            let y = (dot_y as f32 + 0.5) / DOTS_Y as f32;
+            let Some((low, high)) = Self::row_span(&quad, y) else {
+                continue;
+            };
+            let first_x = ((low * DOTS_X as f32 - 0.5).ceil() as i32).max(0);
+            let last_x =
+                ((high * DOTS_X as f32 - 0.5).floor() as i32).min(dot_width - 1);
+            for dot_x in first_x..=last_x {
+                let dither = Dither::Bayer4.at(dot_x as usize, dot_y as usize);
+                if density > dither {
+                    self.field.raise_face_dot(
+                        dot_x as usize,
+                        dot_y as usize,
+                        depth,
+                    );
                 }
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                if y0 == y1 {
-                    break;
-                }
-                err += dx;
-                y0 += sy;
             }
         }
     }
 
-    // Draw a line using braille patterns for higher resolution
-    fn draw_braille_line(
-        size: (u16, u16),
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        buffer: &mut Buffer,
-    ) {
+    /// Marks the cells a projected quad covers, at cell resolution.
+    ///
+    /// The `use_braille = false` path's face fill, and it dithers at *cell*
+    /// granularity rather than not at all. Without the dither the ramp glyph
+    /// alone is the only carrier of depth, and a five-step ramp between `░` and
+    /// `█` gives a near face as one solid block of `█` and a far face as
+    /// nothing at all -- two tones, no gradient, and a cube that reads as a
+    /// black blob at some rotations. With it, a far face is a sparse field of
+    /// `░` and a near one is dense `█`, and the two-tone field has a gradient
+    /// across it that the glyph ramp alone could not express.
+    fn fill_face_cells(&mut self, quad: [Point2D; 4], depth: u8) {
+        let density =
+            MIN_FACE_DENSITY + (1.0 - MIN_FACE_DENSITY) * dequantise(depth);
+        let width = self.field.faces.width() as i32;
+        let height = self.field.faces.height() as i32;
+
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for p in &quad {
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+        let first_y = ((min_y - 0.5).ceil() as i32).max(0);
+        let last_y = ((max_y - 0.5).floor() as i32).min(height - 1);
+
+        for cell_y in first_y..=last_y {
+            let y = cell_y as f32 + 0.5;
+            let Some((low, high)) = Self::row_span(&quad, y) else {
+                continue;
+            };
+            let first_x = ((low - 0.5).ceil() as i32).max(0);
+            let last_x = ((high - 0.5).floor() as i32).min(width - 1);
+            for cell_x in first_x..=last_x {
+                if density > Dither::Bayer4.at(cell_x as usize, cell_y as usize) {
+                    self.field
+                        .mark_face(cell_x as usize, cell_y as usize, depth);
+                }
+            }
+        }
+    }
+
+    /// Rasterises a line between two projected points, in dot space.
+    ///
+    /// A plain Bresenham, as before. What changed is that every dot goes into
+    /// the one shared field, so a line crossing another line keeps both, and a
+    /// line arriving at a corner adds to what is already there.
+    fn draw_edge_dots(&mut self, from: Point2D, to: Point2D, depth: u8) {
         // Scale to braille resolution (2x4 dots per cell)
-        let x0 = x0 * 2.0;
-        let y0 = y0 * 4.0;
-        let x1 = x1 * 2.0;
-        let y1 = y1 * 4.0;
-
-        let mut x0 = x0 as i32;
-        let mut y0 = y0 as i32;
-        let x1 = x1 as i32;
-        let y1 = y1 as i32;
+        let mut x0 = (from.x * DOTS_X as f32) as i32;
+        let mut y0 = (from.y * DOTS_Y as f32) as i32;
+        let x1 = (to.x * DOTS_X as f32) as i32;
+        let y1 = (to.y * DOTS_Y as f32) as i32;
 
         let dx = (x1 - x0).abs();
         let sx = if x0 < x1 { 1 } else { -1 };
@@ -383,29 +1168,9 @@ impl Cube {
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
 
-        // Map from braille resolution to terminal cells
-        let width = (size.0 as i32) * 2;
-        let height = (size.1 as i32) * 4;
-
-        // Braille dot tracking
-        let mut braille_map: std::collections::HashMap<(i32, i32), u8> =
-            std::collections::HashMap::new();
-
         loop {
-            if x0 >= 0 && x0 < width && y0 >= 0 && y0 < height {
-                // Calculate which terminal cell this braille dot belongs to
-                let cell_x = x0 / 2;
-                let cell_y = y0 / 4;
-
-                // Calculate which dot within the braille pattern (0-7)
-                let dot_x = x0 % 2;
-                let dot_y = y0 % 4;
-                let dot_index = dot_y * 2 + dot_x;
-
-                // Set the corresponding bit in our braille map
-                let key = (cell_x, cell_y);
-                let dots = braille_map.entry(key).or_insert(0);
-                *dots |= 1 << dot_index;
+            if x0 >= 0 && y0 >= 0 {
+                self.field.raise_edge_dot(x0 as usize, y0 as usize, depth);
             }
 
             if x0 == x1 && y0 == y1 {
@@ -428,24 +1193,1389 @@ impl Cube {
                 y0 += sy;
             }
         }
+    }
 
-        // Convert our braille map to characters and set them in the buffer
-        for ((x, y), dots) in braille_map {
-            if x >= 0 && x < size.0 as i32 && y >= 0 && y < size.1 as i32 {
-                // The Unicode braille patterns start at U+2800
-                // Each bit set in our dots variable corresponds to a raised dot
-                let braille_char =
-                    std::char::from_u32(0x2800 + dots as u32).unwrap_or('?');
+    /// Rasterises a line between two projected points, at cell resolution.
+    fn draw_edge_cells(&mut self, from: Point2D, to: Point2D, depth: u8) {
+        let width = self.field.faces.width() as i32;
+        let height = self.field.faces.height() as i32;
 
-                buffer.set(
-                    x as usize,
-                    y as usize,
+        let mut x0 = from.x as i32;
+        let mut y0 = from.y as i32;
+        let x1 = to.x as i32;
+        let y1 = to.y as i32;
+
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            if x0 >= 0 && x0 < width && y0 >= 0 && y0 < height {
+                self.field.mark_edge_cell(x0 as usize, y0 as usize, depth);
+            }
+
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+
+            let e2 = 2 * err;
+            if e2 >= dy {
+                if x0 == x1 {
+                    break;
+                }
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                if y0 == y1 {
+                    break;
+                }
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    /// Draws one frame into the field.
+    fn render(&mut self) {
+        self.field.clear();
+
+        // Read the frame's scalars out first. Every draw helper takes
+        // `&mut self` for the field, so holding a borrow of `self.vertices` or
+        // `self.rotated` across a call is a conflict, and copying eight
+        // `f32`s is the cheapest way out of one.
+        let scale = self.projection_scale();
+        let size = self.screen_size;
+        let distance = self.effective_distance();
+        let rotation = self.rotation;
+        let braille = self.options.use_braille;
+        let filled = self.options.filled;
+        let markers = self.options.vertex_markers;
+
+        for index in 0..self.vertices.len() {
+            self.rotated[index] =
+                Self::rotate_point(rotation, self.vertices[index]);
+        }
+        for index in 0..self.rotated.len() {
+            self.projected[index] =
+                Self::project(self.rotated[index], scale, size, distance);
+        }
+
+        // Which faces are turned towards the viewer, decided before anything is
+        // drawn because three later steps need it: the hidden-line rule, the
+        // depth range the ramp is normalised against, and the corner markers.
+        //
+        // No sort. Painter's algorithm would order the visible faces by depth
+        // and let each overwrite the last, which needs the faces to be
+        // disjoint; they are, but so is a maximum on depth, and a maximum does
+        // not care what order the faces arrive in -- which matters here because
+        // the braille path cannot overwrite at all. A braille cell is one
+        // glyph, so its dots only OR together, and OR is commutative. What makes
+        // the order of drawing irrelevant is the same thing that makes the
+        // result correct: only the front-facing faces contribute.
+        let mut visible = [false; FACES.len()];
+        for (index, face) in FACES.iter().enumerate() {
+            visible[index] = self.face_is_front_facing(face);
+        }
+        let range = self.face_depth_range(&visible);
+
+        // One depth per face, and the whole depth model hangs off it. An edge
+        // takes the depth of the *nearest* face it bounds rather than the mean
+        // of its own endpoints, and a corner marker the depth of the nearest
+        // face meeting there.
+        //
+        // That is a deliberate departure from "shade by `z`", and it is what
+        // makes the cue legible. An edge runs from one vertex to another, and
+        // the two are at very different `z` -- a cube seen face-on has an edge
+        // from the nearest vertex to the farthest, so the mean of its endpoints
+        // is dead centre and the edge is drawn as though it were halfway back
+        // into the cube. The edge does not *belong* to a depth; it belongs to
+        // the surfaces that meet along it, and there are only two of them.
+        //
+        // Normalising over the visible faces' planes is the other half of it.
+        // Over the whole vertex range the three visible faces never separate:
+        // a face is visible only when its outward normal has `n.z <
+        // -size / distance`, which for the defaults is `n.z < -0.29`, so a
+        // face's centroid is never nearer than `z = -0.29 * size` against a
+        // nearest vertex at `-1.73 * size`. The whole visible cube lives in the
+        // near 42% of the ramp and the dark end of every stop is dead on
+        // screen. Over the faces' own planes, three visible faces land at 0, a
+        // half and 1 -- the full ramp, at every rotation.
+        let mut face_depth = [NO_DEPTH; FACES.len()];
+        for (index, face) in FACES.iter().enumerate() {
+            if !visible[index] {
+                continue;
+            }
+            face_depth[index] =
+                quantise(self.depth_of(self.face_centroid_z(face), range));
+        }
+
+        for (index, face) in FACES.iter().enumerate() {
+            if !visible[index] || !filled {
+                continue;
+            }
+            let corners = face.corners;
+            let quad = [
+                self.projected[corners[0]],
+                self.projected[corners[1]],
+                self.projected[corners[2]],
+                self.projected[corners[3]],
+            ];
+            if braille {
+                self.fill_face_dots(quad, face_depth[index]);
+            } else {
+                self.fill_face_cells(quad, face_depth[index]);
+            }
+        }
+
+        // Edges, and only the ones with a front-facing face. See [`Edge::faces`].
+        //
+        // Collected first so the loop below is free to mutate the field.
+        let drawn: Vec<(Point2D, Point2D, u8)> = EDGES
+            .iter()
+            .map(|edge| {
+                let mut depth = NO_DEPTH;
+                for face in edge.faces {
+                    depth = depth.max(face_depth[face]);
+                }
+                (edge, depth)
+            })
+            .filter(|(_, depth)| *depth != NO_DEPTH)
+            .map(|(edge, depth)| {
+                (self.projected[edge.v1], self.projected[edge.v2], depth)
+            })
+            .collect();
+        for (from, to, depth) in drawn {
+            if braille {
+                self.draw_edge_dots(from, to, depth);
+            } else {
+                self.draw_edge_cells(from, to, depth);
+            }
+        }
+
+        if !markers {
+            return;
+        }
+        let width = self.field.faces.width();
+        let height = self.field.faces.height();
+        for index in 0..self.projected.len() {
+            // A corner is marked only if something at it was drawn. All three
+            // faces meeting at a vertex can be culled -- that is what happens
+            // to the four far corners of a cube seen face-on -- and marking a
+            // corner that is behind the solid would put four white diamonds in
+            // the middle of the near face, which is the opposite of the point
+            // of a marker.
+            let mut depth = NO_DEPTH;
+            for edge in EDGES.iter() {
+                if edge.v1 != index && edge.v2 != index {
+                    continue;
+                }
+                for face in edge.faces {
+                    depth = depth.max(face_depth[face]);
+                }
+            }
+            if depth == NO_DEPTH {
+                continue;
+            }
+
+            let point = self.projected[index];
+            let (dot_x, dot_y) = (
+                (point.x * DOTS_X as f32) as i32,
+                (point.y * DOTS_Y as f32) as i32,
+            );
+            if dot_x < 0 || dot_y < 0 {
+                continue;
+            }
+            let (cell_x, cell_y) =
+                (dot_x as usize / DOTS_X, dot_y as usize / DOTS_Y);
+            if cell_x >= width || cell_y >= height {
+                continue;
+            }
+            self.field.mark_vertex(cell_x, cell_y, depth);
+        }
+    }
+
+    /// The rotated `z` of a face's centroid.
+    fn face_centroid_z(&self, face: &Face) -> f32 {
+        face.corners.iter().map(|c| self.rotated[*c].z).sum::<f32>() * 0.25
+    }
+
+    /// Writes the field out as cells.
+    ///
+    /// An associated function rather than a method because it reads five of the
+    /// struct's fields and writes the sixth, and a `&mut self` would be one
+    /// borrow chain that has to be split anyway.
+    fn flush(
+        field: &Field,
+        options: &CubeOptions,
+        ramp: &GlyphRamp,
+        face_palette: &Palette,
+        edge_palette: &Palette,
+        canvas: &mut Canvas,
+    ) {
+        if field.dirty.is_empty() {
+            return;
+        }
+        let rect = field.dirty;
+        let width = field.faces.width();
+        let (canvas_width, canvas_height) = (canvas.width(), canvas.height());
+        let surface = canvas.surface_mut();
+
+        for y in rect.top..rect.bottom.min(canvas_height) {
+            for x in rect.left..rect.right.min(canvas_width) {
+                let index = y * width + x;
+
+                // The marker first. It overwrites the cell rather than adding
+                // to it, which is the point: `◆` has to be a solid diamond to
+                // read as a corner, and a braille pattern with a diamond in the
+                // middle of it reads as a smudge. What is lost is the nearest
+                // ring of dots around the corner, which the three edges
+                // meeting there immediately redraw in the neighbouring cells.
+                if field.vertex_depth[index] != NO_DEPTH {
+                    surface.set(
+                        x,
+                        y,
+                        Cell::new(VERTEX_GLYPH, VERTEX_COLOUR, Attribute::Reset),
+                    );
+                    continue;
+                }
+
+                if options.use_braille {
+                    let edge_bits = field.edges.cell_bits(x, y);
+                    let bits = field.faces.cell_bits(x, y) | edge_bits;
+                    if bits == 0 {
+                        continue;
+                    }
+                    let (depth, palette) = if edge_bits != 0 {
+                        (field.edge_depth[index], edge_palette)
+                    } else {
+                        (field.face_depth[index], face_palette)
+                    };
+                    let Some(symbol) = char::from_u32(0x2800 + bits as u32) else {
+                        continue;
+                    };
+                    // `Attribute::Reset`, not `Attribute::Bold`. Every cell was
+                    // bold before, and bold on a truecolor foreground is a
+                    // rendering hint that many terminals act on by brightening
+                    // the colour -- which corrupts a ramp whose entire job is
+                    // precise brightness. The cube had one colour and so had no
+                    // ramp to spoil, which is exactly why the bug stayed
+                    // invisible until the ramp arrived.
+                    surface.set(
+                        x,
+                        y,
+                        Cell::new(
+                            symbol,
+                            palette.sample(dequantise(depth)),
+                            Attribute::Reset,
+                        ),
+                    );
+                    continue;
+                }
+
+                let (symbol, depth, palette) =
+                    if field.edge_depth[index] != NO_DEPTH {
+                        (ASCII_EDGE_GLYPH, field.edge_depth[index], edge_palette)
+                    } else if field.face_depth[index] != NO_DEPTH {
+                        (
+                            ramp.sample(dequantise(field.face_depth[index])),
+                            field.face_depth[index],
+                            face_palette,
+                        )
+                    } else {
+                        continue;
+                    };
+                surface.set(
+                    x,
+                    y,
                     Cell::new(
-                        braille_char,
-                        style::Color::Green,
-                        style::Attribute::Bold,
+                        symbol,
+                        palette.sample(dequantise(depth)),
+                        Attribute::Reset,
                     ),
                 );
+            }
+        }
+    }
+}
+
+impl CubeOptions {
+    /// [`Cube::effective_cube_size`], as a method on the options, so
+    /// `Cube::new` can ask without an instance to hand.
+    fn effective_cube_size(&self) -> f32 {
+        let size = finite_or(self.cube_size, DEFAULT_CUBE_SIZE);
+        if size <= 0.0 {
+            return DEFAULT_CUBE_SIZE;
+        }
+        let distance = finite_or(self.distance, DEFAULT_DISTANCE);
+        if !distance.is_finite() || distance <= 0.0 {
+            return size;
+        }
+        size.min(
+            MAX_CAMERA_FILL * distance.clamp(MIN_DISTANCE, MAX_DISTANCE)
+                / 3.0f32.sqrt(),
+        )
+    }
+}
+
+impl Cube {
+    /// The projected position of a vertex, at the current rotation and scale.
+    ///
+    /// The same two steps `render` performs, wrapped so the tests do not have
+    /// to thread the scale and the camera distance through every assertion --
+    /// and so a test cannot quietly use a *different* scale from the one the
+    /// frame was drawn with, which would make every geometry assertion here a
+    /// measurement of the test rather than of the effect.
+    #[cfg(test)]
+    fn project_vertex(&self, vertex: Point3D) -> Point2D {
+        Self::project(
+            Self::rotate_point(self.rotation, vertex),
+            self.projection_scale(),
+            self.screen_size,
+            self.effective_distance(),
+        )
+    }
+
+    /// `(depth, relative luminance)` for every cell the last frame wrote that
+    /// came from a face or an edge.
+    ///
+    /// Corner markers are deliberately left out. They are drawn in one
+    /// constant colour, so including them makes the extreme depths of any frame
+    /// read as the same luminance and the measurement stops being about the
+    /// ramp -- the extremes are *always* markers, since a marker takes the
+    /// depth of the nearest face meeting at its corner, which is by definition
+    /// the extreme. `the_corner_markers_are_white` covers them separately.
+    ///
+    /// The measure the depth shading has to move, and it is a *pairing* rather
+    /// than two separate counts. A frame with a dozen distinct colours proves
+    /// nothing about whether they are ordered by distance, and counting
+    /// colours is exactly the assertion that would have passed against any
+    /// confetti -- it is the pairing that says the ramp is doing a job.
+    #[cfg(test)]
+    fn depth_and_luminance(&self) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        if self.field.dirty.is_empty() {
+            return out;
+        }
+        let rect = self.field.dirty;
+        let width = self.field.faces.width();
+
+        for y in rect.top..rect.bottom {
+            for x in rect.left..rect.right {
+                let index = y * width + x;
+                if self.field.vertex_depth[index] != NO_DEPTH {
+                    continue;
+                }
+                if self.options.use_braille {
+                    if self.field.edges.cell_bits(x, y) == 0
+                        && self.field.faces.cell_bits(x, y) == 0
+                    {
+                        continue;
+                    }
+                    let from_edge = self.field.edges.cell_bits(x, y) != 0;
+                    let (depth, palette) = if from_edge {
+                        (self.field.edge_depth[index], &self.edge_palette)
+                    } else {
+                        (self.field.face_depth[index], &self.face_palette)
+                    };
+                    out.push((
+                        dequantise(depth),
+                        Self::luminance(palette.sample(dequantise(depth))),
+                    ));
+                } else if self.field.edge_depth[index] != NO_DEPTH {
+                    out.push((
+                        dequantise(self.field.edge_depth[index]),
+                        Self::luminance(
+                            self.edge_palette
+                                .sample(dequantise(self.field.edge_depth[index])),
+                        ),
+                    ));
+                } else if self.field.face_depth[index] != NO_DEPTH {
+                    let depth = dequantise(self.field.face_depth[index]);
+                    out.push((
+                        depth,
+                        Self::luminance(self.face_palette.sample(depth)),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Rec. 601 luminance, 0 to 255.
+    #[cfg(test)]
+    fn luminance(colour: Color) -> f32 {
+        match colour {
+            Color::Rgb { r, g, b } => {
+                0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+            }
+            _ => 0.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A rotation at which all six faces are turned away from edge-on.
+    ///
+    /// Most of the tests here want a generic rotation, because at one of the
+    /// special ones the cube is face-on or edge-on and half the geometry
+    /// degenerates. Axis-aligned rotations are the measure-zero case that the
+    /// epsilon in `face_is_front_facing` exists for, so they are not evidence of
+    /// anything.
+    const GENERIC: (f32, f32, f32) = (0.41, 0.73, 0.19);
+
+    fn placed(cube_size: f32, size: (u16, u16)) -> Cube {
+        let options = CubeOptions {
+            cube_size,
+            ..Default::default()
+        };
+        Cube::new(options, size)
+    }
+
+    /// Runs one frame at a rotation, returning the first frame's full diff.
+    fn frame(
+        cube: &mut Cube,
+        rotation: (f32, f32, f32),
+    ) -> Vec<(usize, usize, Cell)> {
+        cube.rotation = rotation;
+        cube.get_diff()
+    }
+
+    /// The dot pattern of each cell a first-frame diff contains.
+    fn dot_patterns(
+        diff: &[(usize, usize, Cell)],
+    ) -> std::collections::HashMap<(usize, usize), u8> {
+        diff.iter()
+            .filter(|(_, _, cell)| cell.symbol != ' ')
+            .map(|(x, y, cell)| {
+                let bits = (cell.symbol as u32).saturating_sub(0x2800) as u8;
+                ((*x, *y), bits)
+            })
+            .collect()
+    }
+
+    /// The dots one edge raises, computed independently of the renderer.
+    ///
+    /// A reference rather than a call into the field, because the property
+    /// under test *is* that the field is the union of the edges: reading the
+    /// answer out of the field and comparing it with itself would pass against
+    /// any implementation, including the one that overwrites corners.
+    fn edge_dots(
+        projected: &[Point2D],
+        edge: &Edge,
+        size: (u16, u16),
+    ) -> HashSet<(i32, i32, u8)> {
+        let mut x0 = (projected[edge.v1].x * DOTS_X as f32) as i32;
+        let mut y0 = (projected[edge.v1].y * DOTS_Y as f32) as i32;
+        let x1 = (projected[edge.v2].x * DOTS_X as f32) as i32;
+        let y1 = (projected[edge.v2].y * DOTS_Y as f32) as i32;
+
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        let width = size.0 as i32 * DOTS_X as i32;
+        let height = size.1 as i32 * DOTS_Y as i32;
+        let mut out = HashSet::new();
+        loop {
+            if x0 >= 0 && x0 < width && y0 >= 0 && y0 < height {
+                out.insert((
+                    x0 / DOTS_X as i32,
+                    y0 / DOTS_Y as i32,
+                    1u8 << ((y0 as usize % DOTS_Y) * DOTS_X
+                        + (x0 as usize % DOTS_X)),
+                ));
+            }
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                if x0 == x1 {
+                    break;
+                }
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                if y0 == y1 {
+                    break;
+                }
+                err += dx;
+                y0 += sy;
+            }
+        }
+        out
+    }
+
+    /// The cell a projected point falls in, in the renderer's own arithmetic.
+    fn cell_of(point: Point2D) -> (usize, usize) {
+        let dot_x = (point.x * DOTS_X as f32) as i32;
+        let dot_y = (point.y * DOTS_Y as f32) as i32;
+        (
+            dot_x.max(0) as usize / DOTS_X,
+            dot_y.max(0) as usize / DOTS_Y,
+        )
+    }
+
+    /// The corners have to carry the dots of *every visible* edge that meets
+    /// there.
+    ///
+    /// The old renderer built a fresh dot map per edge and then `set` the whole
+    /// cell, so a corner cell -- the endpoint of three edges -- was written
+    /// three times and only the last write survived. All eight corners came out
+    /// as the end-stub of whichever edge was drawn last, which is why a solid
+    /// read as a flat wireframe: the one part of a cube that says "cube" was
+    /// being thrown away, once per corner, sixty times a second.
+    ///
+    /// The reference is computed here rather than read out of the field, so
+    /// this is a statement about the geometry and not a tautology.
+    ///
+    /// Only the *visible* incident edges. A cube hides one corner from any
+    /// viewpoint and the three edges at that corner are all behind the solid,
+    /// so a reference over all twelve would demand dots that hidden-line
+    /// removal is supposed to have suppressed -- and the two properties are
+    /// asserted separately, which is the only way neither can hide behind the
+    /// other.
+    ///
+    /// `vertex_markers` and `filled` are both off, and necessarily so. The
+    /// marker deliberately occupies the corner cell and the face fill adds its
+    /// own dots to it, so in the default configuration there is nothing in a
+    /// corner cell but the marker to inspect.
+    #[test]
+    fn every_corner_carries_the_union_of_its_edges() {
+        let options = CubeOptions {
+            vertex_markers: false,
+            filled: false,
+            ..Default::default()
+        };
+        let mut cube = Cube::new(options, (200, 50));
+        let diff = frame(&mut cube, GENERIC);
+        let drawn = dot_patterns(&diff);
+
+        // The projection the renderer used, at the scale it chose.
+        let projected: Vec<Point2D> = cube
+            .vertices
+            .iter()
+            .map(|v| cube.project_vertex(*v))
+            .collect();
+        let faces: Vec<bool> = FACES
+            .iter()
+            .map(|face| cube.face_is_front_facing(face))
+            .collect();
+        let edge_is_drawn =
+            |edge: &Edge| faces[edge.faces[0]] || faces[edge.faces[1]];
+
+        let mut corners_checked = 0;
+        let mut full_junctions = 0;
+        for vertex in 0..projected.len() {
+            let cell = cell_of(projected[vertex]);
+            let incident: Vec<&Edge> = EDGES
+                .iter()
+                .filter(|edge| edge.v1 == vertex || edge.v2 == vertex)
+                .filter(|edge| edge_is_drawn(edge))
+                .collect();
+            if incident.is_empty() {
+                continue;
+            }
+            if incident.len() == 3 {
+                full_junctions += 1;
+            }
+            if incident.len() < 2 {
+                // A corner where only one edge is visible has nothing to merge,
+                // so the union is that one edge and the test below would be a
+                // tautology. It happens: the two corners either side of a
+                // silhouette can each have one visible edge.
+                continue;
+            }
+
+            let mut union = 0u8;
+            let mut per_edge = Vec::new();
+            for edge in &incident {
+                let mut bits = 0u8;
+                for (cx, cy, bit) in edge_dots(&projected, edge, cube.screen_size) {
+                    if (cx, cy) == (cell.0 as i32, cell.1 as i32) {
+                        bits |= bit;
+                    }
+                }
+                per_edge.push(bits);
+                union |= bits;
+            }
+
+            if union == 0 {
+                // The corner is off screen at this rotation. Not a failure of
+                // the merge, and the fit test covers the fit.
+                continue;
+            }
+            if !per_edge
+                .iter()
+                .any(|bits| bits.count_ones() < union.count_ones())
+            {
+                // The visible edges happen to raise the same dots in this cell,
+                // so there is nothing here for an overwrite to lose. Happens at
+                // a silhouette corner, where two edges leave within a couple of
+                // dots of each other.
+                continue;
+            }
+            let got = drawn.get(&cell).copied().unwrap_or(0);
+            // A superset rather than an equality: a fourth line can cross a
+            // corner cell without meeting at the corner -- one of the far edges
+            // passes through the middle of the frame at a generic rotation --
+            // and those dots are legitimately there too. What must hold is that
+            // nothing from the incident edges was *lost*, which is exactly what
+            // the whole-cell overwrite broke.
+            assert_eq!(
+                got & union,
+                union,
+                "vertex {vertex} at {cell:?}: its {} visible edges raise \
+                 {union:#010b} into the cell and the cell was drawn {got:#010b}, \
+                 so {:#010b} was overwritten away",
+                incident.len(),
+                union & !got
+            );
+            corners_checked += 1;
+        }
+        assert!(
+            corners_checked >= 6,
+            "only {corners_checked} visible corners were on screen, so the merge \
+             is barely tested"
+        );
+        assert!(
+            full_junctions >= 1,
+            "no visible corner had all three of its edges drawn, so the three-way \
+             junction this effect is about is never tested"
+        );
+    }
+
+    /// The cube is fitted to the terminal, so no part of it is ever off screen.
+    ///
+    /// The old scale was `min(width, height) * 0.8`, a constant with nothing to
+    /// do with the cube or the terminal's shape. At the default `cube_size`
+    /// that happened to leave the cube inside 80x24 and 200x50 -- the fudge was
+    /// comfortable there -- which is exactly why it survived. `cube_size` is a
+    /// public config field and 1.4 is enough to push a vertex past the last
+    /// row at 80x24, at which point the rasterisers' bounds check silently
+    /// drops the overflow and the cube loses its top and bottom corners.
+    ///
+    /// Measured from that case, not asserted from theory: at cube_size 1.4 and
+    /// 80x24 the worst-case projected radius is 1.03 of the half-height against
+    /// the 0.80 the old constant produced, and the first vertex goes off screen
+    /// around t = 0.44 seconds of rotation.
+    #[test]
+    fn the_projection_is_fitted_to_the_screen() {
+        for size in [
+            (80u16, 24u16),
+            (200, 50),
+            (12, 6),
+            (6, 40),
+            (400, 200),
+            (3, 3),
+            (1, 1),
+        ] {
+            for cube_size in [1.0f32, 1.4, 1.8, 2.5, 8.0] {
+                let mut cube = placed(cube_size, size);
+                for step in 0..90 {
+                    let t = step as f32 * 0.11;
+                    cube.rotation = (t * 0.25, t * 0.35, t * 0.18);
+                    for (index, vertex) in cube.vertices.iter().enumerate() {
+                        let p = cube.project_vertex(*vertex);
+                        assert!(
+                            p.x >= 0.0
+                                && p.y >= 0.0
+                                && p.x < size.0 as f32
+                                && p.y < size.1 as f32,
+                            "{}x{} at cube_size {cube_size} put vertex {index} at \
+                             ({:.2}, {:.2}), off screen, at t = {t:.2}",
+                            size.0,
+                            size.1,
+                            p.x,
+                            p.y
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// And it is a *fit* rather than a fudge: the cube uses the terminal.
+    ///
+    /// The measure is the vertical extent of the projected cube as a fraction
+    /// of the half-height, which is the limiting axis at every wide terminal.
+    /// The old `0.8 * 0.8` put it at 0.73, which is a cube floating in the
+    /// middle of the screen with a fifth of it unused top and bottom. The old
+    /// code's 0.73 was measured, not guessed, and the fitted value is 0.95 by
+    /// construction -- so the threshold sits between them and is about the fit
+    /// rather than about any particular constant.
+    #[test]
+    fn the_cube_fills_the_limiting_half_axis() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200)] {
+            let mut cube = placed(1.0, size);
+            let half_height = size.1 as f32 * 0.5;
+            let mut extent = 0.0f32;
+            for step in 0..300 {
+                let t = step as f32 * 0.021;
+                cube.rotation = (t, t * 1.4, t * 0.7);
+                for vertex in cube.vertices.iter() {
+                    let p = cube.project_vertex(*vertex);
+                    extent = extent.max((p.y - half_height).abs());
+                }
+            }
+            let fraction = extent / half_height;
+            assert!(
+                fraction > 0.90,
+                "{}x{}: the cube reaches only {:.0}% of the way to the top and \
+                 bottom of the screen, against 73% for the old fixed 0.8",
+                size.0,
+                size.1,
+                fraction * 100.0
+            );
+        }
+    }
+
+    /// Nearer geometry is brighter than farther geometry, measured on
+    /// luminance.
+    ///
+    /// The single highest-impact change available to this effect, and the one
+    /// whose absence is why it read as flat: a single `Color::Green` carries no
+    /// depth cue at all, and foreshortening cannot supply one for a shape that
+    /// is symmetric in all three axes.
+    ///
+    /// Measured as a *pairing* -- depth against luminance for the same cell --
+    /// rather than as a count of distinct colours. A frame with a dozen
+    /// distinct colours proves nothing about whether they are ordered by
+    /// distance, and a count is exactly the assertion that would have passed
+    /// against any confetti.
+    ///
+    /// Swept rather than measured at one rotation, and the sweep is not
+    /// decoration. At a rotation where the cube happens to be edge-on, all three
+    /// visible faces are at nearly the same depth and a two-band test is
+    /// measuring nothing: at (0.41, 0.73, 0.19) the three face depths come out
+    /// 1.00, 0.96 and 0.00, with 319 of 322 drawn cells in the top decile. That
+    /// is geometrically honest -- those two faces really are the same distance
+    /// from the eye and really are near-mirror images across the view axis --
+    /// but it means any single-rotation threshold is a threshold on the
+    /// rotation. Aggregating over a sweep is the only version of this that
+    /// measures the ramp rather than the cube's pose.
+    #[test]
+    fn nearer_geometry_is_brighter_than_farther_geometry() {
+        let mut near = Vec::new();
+        let mut far = Vec::new();
+        let mut widest_spread = 0.0f32;
+        let mut widest_contrast = 0.0f32;
+        let mut measured = 0usize;
+
+        for step in 0..150 {
+            let t = step as f32 * 0.041;
+            let mut cube = placed(1.0, (80, 24));
+            frame(&mut cube, (t, t * 1.4, t * 0.7));
+
+            let pairs = cube.depth_and_luminance();
+            measured += pairs.len();
+            for (depth, luminance) in &pairs {
+                if *depth >= 0.8 {
+                    near.push(*luminance);
+                } else if *depth <= 0.2 {
+                    far.push(*luminance);
+                }
+            }
+            if pairs.is_empty() {
+                continue;
+            }
+
+            // The frame with the widest depth spread is the one where the ramp
+            // has the most to say, so that is where its contrast is read.
+            let lo = pairs.iter().map(|(d, _)| *d).fold(1.0f32, f32::min);
+            let hi = pairs.iter().map(|(d, _)| *d).fold(0.0f32, f32::max);
+            if hi - lo <= widest_spread {
+                continue;
+            }
+            let at = |target: f32| {
+                pairs
+                    .iter()
+                    .filter(|(d, _)| (*d - target).abs() < 0.05)
+                    .map(|(_, l)| *l)
+                    .next()
+                    .unwrap_or(f32::NAN)
+            };
+            let contrast = at(hi) - at(lo);
+            if contrast.is_finite() {
+                widest_spread = hi - lo;
+                widest_contrast = contrast;
+            }
+        }
+
+        assert!(
+            measured > 20_000,
+            "the sweep only produced {measured} cells to measure"
+        );
+        let mean =
+            |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        assert!(
+            near.len() > 200 && far.len() > 200,
+            "the sweep produced {} near cells and {} far cells, so the ramp is \
+             not being exercised across its range",
+            near.len(),
+            far.len()
+        );
+        let (near_mean, far_mean) = (mean(&near), mean(&far));
+        assert!(
+            near_mean > far_mean + 40.0,
+            "cells in the nearest fifth average {near_mean:.1} and cells in the \
+             furthest average {far_mean:.1}, so distance does not order the \
+             brightness",
+        );
+
+        // And at least one frame has to use the whole ramp, or the means above
+        // are being carried by a rare rotation rather than by the shading.
+        assert!(
+            widest_spread > 0.8,
+            "the widest depth spread in the sweep was {widest_spread:.2}, so the \
+             ramp is never used end to end"
+        );
+        assert!(
+            widest_contrast > 40.0,
+            "at the frame with the widest spread the two ends of the ramp differ \
+             by {widest_contrast:.1} in luminance, so the ramp is not steep \
+             enough to read"
+        );
+    }
+
+    /// A face-on rotation fills the near face instead of outlining it.
+    ///
+    /// Turned so the cube is square to the viewer, the near face's square is
+    /// the whole silhouette and the far face is entirely inside it. The old
+    /// effect drew only the twelve edges, so the interior of the silhouette was
+    /// whatever the *hidden* far face's outline happened to leave there: 240
+    /// raised dots at 200x50, all of them back-face line. A filled face is
+    /// thousands, because the whole area carries dots at the near face's
+    /// density.
+    #[test]
+    fn a_face_on_rotation_fills_the_near_face() {
+        let size = (200u16, 50u16);
+        let mut cube = placed(1.0, size);
+        let diff = frame(&mut cube, (0.0, 0.0, 0.0));
+        let drawn = dot_patterns(&diff);
+
+        // The near face is z = -cube_size, and the projection draws the
+        // smaller z larger, so its square is the silhouette.
+        let corner = cube.project_vertex(cube.vertices[0]);
+        let half_x = (size.0 as f32 / 2.0 - corner.x).abs();
+        let half_y = (size.1 as f32 / 2.0 - corner.y).abs();
+
+        let mut interior_dots = 0usize;
+        for ((x, y), bits) in &drawn {
+            let dx = (*x as f32 + 0.5 - size.0 as f32 / 2.0).abs();
+            let dy = (*y as f32 + 0.5 - size.1 as f32 / 2.0).abs();
+            if dx < half_x - 1.5 && dy < half_y - 1.5 {
+                interior_dots += bits.count_ones() as usize;
+            }
+        }
+        assert!(
+            interior_dots > 1000,
+            "only {interior_dots} dots inside the near face at a face-on \
+             rotation, against 240 for the unfilled wireframe, so the face is \
+             not filled"
+        );
+    }
+
+    /// The drawn edge ink is exactly the union of the *visible* edges' dots.
+    ///
+    /// Stated as an exact equality rather than as "no hidden edge drew
+    /// anything", because the looser form is not testable. A hidden edge
+    /// projects across cells that a visible edge also crosses -- at a face-on
+    /// rotation, the edge from the near bottom-left corner to the back
+    /// bottom-left corner runs along the front face's own bottom edge -- so
+    /// those cells do carry edge ink, and the assertion would have to carve out
+    /// exceptions until it tested nothing. Equality has no exceptions: the
+    /// field must be precisely the visible edges' union, which is one assertion
+    /// covering over-drawing (the old bug) and under-drawing (the other way to
+    /// get hidden-line removal wrong) at once.
+    ///
+    /// The reference sets come from `edge_dots`, computed here.
+    #[test]
+    fn the_drawn_edge_ink_is_exactly_the_visible_edges_union() {
+        for rotation in [(0.0f32, 0.0f32, 0.0f32), GENERIC, (0.41, 0.9, 0.55)] {
+            let mut cube = placed(1.0, (200, 50));
+            frame(&mut cube, rotation);
+
+            let faces: Vec<bool> = FACES
+                .iter()
+                .map(|face| cube.face_is_front_facing(face))
+                .collect();
+            let projected: Vec<Point2D> = cube
+                .vertices
+                .iter()
+                .map(|v| cube.project_vertex(*v))
+                .collect();
+
+            // What the union of the visible edges should be, per cell.
+            let mut expected: std::collections::HashMap<(usize, usize), u8> =
+                std::collections::HashMap::new();
+            let mut visible_edges = 0;
+            for edge in EDGES.iter() {
+                if !faces[edge.faces[0]] && !faces[edge.faces[1]] {
+                    continue;
+                }
+                visible_edges += 1;
+                for (cx, cy, bit) in edge_dots(&projected, edge, cube.screen_size) {
+                    if cx < 0 || cy < 0 {
+                        continue;
+                    }
+                    *expected.entry((cx as usize, cy as usize)).or_insert(0) |= bit;
+                }
+            }
+            assert!(
+                (4..=12).contains(&visible_edges),
+                "only {visible_edges} of the twelve edges are visible at {rotation:?}, which cannot be a cube"
+            );
+
+            let mut inked = 0;
+            for y in 0..cube.field.edges.height() {
+                for x in 0..cube.field.edges.width() {
+                    let got = cube.field.edges.cell_bits(x, y);
+                    let want = expected.get(&(x, y)).copied().unwrap_or(0);
+                    if got != want {
+                        let what = if got & !want == 0 {
+                            "an edge that should be hidden is showing through the solid"
+                        } else {
+                            "dots from a visible edge were lost"
+                        };
+                        panic!(
+                            "cell ({x}, {y}) at {rotation:?} has edge pattern {got:#010b}, the visible edges put {want:#010b} there -- {what}"
+                        );
+                    }
+                    inked += usize::from(got != 0);
+                }
+            }
+            assert!(
+                inked > 100,
+                "at {rotation:?} only {inked} cells carry edge ink"
+            );
+        }
+    }
+
+    /// A face-on cube shows one face, and that face's four edges.
+    ///
+    /// The rotation with the most to hide: the far face is entirely behind the
+    /// near one, and the old effect drew all twelve edges unconditionally --
+    /// which is where the 240 dots in `a_face_on_rotation_fills_the_near_face`
+    /// came from. They were the *back* face's outline showing through the front
+    /// one. Hidden-line removal was not a missing refinement, it was absent.
+    ///
+    /// Asserted on which faces and edges the rule calls visible rather than on
+    /// pixels, so it tests the rule and not one rotation's output.
+    #[test]
+    fn a_face_on_rotation_hides_the_far_face_and_its_edges() {
+        let mut cube = placed(1.0, (200, 50));
+        frame(&mut cube, (0.0, 0.0, 0.0));
+
+        let faces: Vec<bool> = FACES
+            .iter()
+            .map(|face| cube.face_is_front_facing(face))
+            .collect();
+        assert_eq!(
+            faces.iter().filter(|f| **f).count(),
+            1,
+            "a cube viewed down one of its axes shows exactly one face, but {} were treated as front-facing",
+            faces.iter().filter(|f| **f).count()
+        );
+        assert!(faces[0], "and it is the near one, not a far face");
+
+        let visible = EDGES
+            .iter()
+            .filter(|edge| faces[edge.faces[0]] || faces[edge.faces[1]])
+            .count();
+        assert_eq!(visible, 4, "a single visible face has four edges");
+    }
+
+    /// The corner markers are one flat colour, and it is white.
+    ///
+    /// Separate from `nearer_geometry_is_brighter_than_farther_geometry` because
+    /// it is a different claim. The markers are deliberately not depth-shaded,
+    /// and `Attribute::Bold` is the obvious way to make eight small glyphs stand
+    /// out from the edge they sit on -- it is a brightening *hint* that many
+    /// terminals act on, so the markers would come out brighter on some
+    /// machines than others and the top of a depth ramp would land somewhere
+    /// unpredictable. A colour is the part that can be pinned.
+    #[test]
+    fn the_corner_markers_are_white() {
+        let mut cube = placed(1.0, (80, 24));
+        let diff = frame(&mut cube, GENERIC);
+        let mut markers = 0;
+        for (x, y, cell) in diff {
+            if cell.symbol != VERTEX_GLYPH {
+                continue;
+            }
+            assert_eq!(
+                cell.color, VERTEX_COLOUR,
+                "the marker at ({x}, {y}) is {cell:?} rather than the flat marker colour"
+            );
+            markers += 1;
+        }
+        assert_eq!(markers, 7, "a cube hides exactly one corner from any view");
+    }
+
+    /// Only the corners that are actually visible are marked.
+    ///
+    /// Marking a corner behind the solid is worse than not marking it: the far
+    /// corners of a cube seen face-on project into the *middle* of the near
+    /// face, so a diamond appears in the middle of a flat plane and reads as a
+    /// hole rather than as a vertex.
+    ///
+    /// Seven of eight at a generic rotation is the right answer, not eight --
+    /// a solid cube hides exactly one corner from any viewpoint, which is the
+    /// count a photograph of one agrees with. The expected set is computed from
+    /// the same back-face test the renderer uses, so this asserts the *rule*
+    /// rather than a hard-coded seven, and it is checked at a face-on rotation
+    /// too, where a naive implementation marks all eight.
+    #[test]
+    fn only_the_visible_corners_are_marked() {
+        for size in [(80u16, 24u16), (200, 50), (120, 40)] {
+            for rotation in [GENERIC, (0.41, 0.9, 0.55), (0.0, 0.0, 0.0)] {
+                let mut cube = placed(1.0, size);
+                let diff = frame(&mut cube, rotation);
+                let by_cell: std::collections::HashMap<(usize, usize), Cell> =
+                    diff.iter().map(|(x, y, cell)| ((*x, *y), *cell)).collect();
+
+                let visible: Vec<bool> = FACES
+                    .iter()
+                    .map(|face| cube.face_is_front_facing(face))
+                    .collect();
+                let expected: Vec<bool> = (0..cube.vertices.len())
+                    .map(|vertex| {
+                        EDGES.iter().any(|edge| {
+                            (edge.v1 == vertex || edge.v2 == vertex)
+                                && (visible[edge.faces[0]]
+                                    || visible[edge.faces[1]])
+                        })
+                    })
+                    .collect();
+                // Between four and seven: a cube shows seven corners from a
+                // general viewpoint and four when it is edge-on, so anything
+                // outside that band is a degenerate fixture rather than a
+                // result. The per-vertex assertions below are the real ones.
+                let visible_corners = expected.iter().filter(|v| **v).count();
+                assert!(
+                    (4..=7).contains(&visible_corners),
+                    "{}x{} at {rotation:?}: {visible_corners} corners are visible, \
+                     which is not a cube",
+                    size.0,
+                    size.1
+                );
+
+                for (vertex, corner) in cube.vertices.iter().enumerate() {
+                    let cell = cell_of(cube.project_vertex(*corner));
+                    let symbol =
+                        by_cell.get(&cell).map(|c| c.symbol).unwrap_or(' ');
+                    if expected[vertex] {
+                        assert_eq!(
+                            symbol, VERTEX_GLYPH,
+                            "{}x{} at {rotation:?}: visible vertex {vertex} at \
+                             {cell:?} drew {symbol:?}",
+                            size.0, size.1
+                        );
+                    } else {
+                        assert_ne!(
+                            symbol, VERTEX_GLYPH,
+                            "{}x{} at {rotation:?}: hidden vertex {vertex} at \
+                             {cell:?} was marked, so a diamond is showing through \
+                             the solid",
+                            size.0, size.1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bold on a truecolor foreground is a brightening hint on many terminals,
+    /// and a brightness ramp is exactly what it corrupts.
+    ///
+    /// This effect had `Attribute::Bold` on every cell and no ramp to spoil it,
+    /// so the combination was invisible -- which is the argument for removing
+    /// it *before* the ramp, not after.
+    #[test]
+    fn no_cell_is_bold() {
+        for braille in [true, false] {
+            let options = CubeOptions {
+                use_braille: braille,
+                ..Default::default()
+            };
+            let mut cube = Cube::new(options, (80, 24));
+            for (index, rotation) in
+                [GENERIC, (1.1, 0.3, 0.9)].into_iter().enumerate()
+            {
+                let diff = frame(&mut cube, rotation);
+                assert!(
+                    !diff.is_empty(),
+                    "braille={braille} step {index} drew nothing"
+                );
+                for (x, y, cell) in diff {
+                    assert_eq!(
+                        cell.attr,
+                        Attribute::Reset,
+                        "braille={braille}: cell ({x}, {y}) is bold, which \
+                         brightens the ramp into white on many terminals"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every glyph the cube can put in a cell has to be one cell wide.
+    ///
+    /// A double-width character in a cell-indexed grid shears every coordinate
+    /// after it, and the vertex markers are new art: the right glyph with the
+    /// wrong width would shift all eight corners rather than merely look odd.
+    #[test]
+    fn every_glyph_the_cube_can_draw_is_one_cell_wide() {
+        for glyph in [VERTEX_GLYPH, ASCII_EDGE_GLYPH].into_iter().chain(
+            (1u8..=255)
+                .map(|bits| char::from_u32(0x2800 + bits as u32).unwrap_or('?')),
+        ) {
+            assert!(
+                glyph_ramp::is_ambiguous_or_narrow(glyph)
+                    // The braille block is East_Asian_Width = Narrow, so it is
+                    // single-width everywhere and the shared predicate does not
+                    // cover it.
+                    || ('\u{2800}'..='\u{28FF}').contains(&glyph),
+                "{glyph:?} (U+{:04X}) could shear a cell-indexed grid",
+                glyph as u32
+            );
+        }
+    }
+
+    /// A config file can put anything in a float field, and every one of them
+    /// has to leave a drawable cube rather than a blank screen or a `NaN`
+    /// coordinate.
+    ///
+    /// `as i32` on a `NaN` is 0, so a `NaN` that reaches the projection does
+    /// not error -- it quietly stacks every vertex into the top-left cell.
+
+    #[test]
+    fn a_degenerate_option_falls_back_rather_than_drawing_nothing() {
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for field in ["cube_size", "distance", "fit"] {
+                let options = match field {
+                    "cube_size" => CubeOptions {
+                        cube_size: bad,
+                        ..Default::default()
+                    },
+                    "distance" => CubeOptions {
+                        distance: bad,
+                        ..Default::default()
+                    },
+                    _ => CubeOptions {
+                        fit: bad,
+                        ..Default::default()
+                    },
+                };
+                let mut cube = Cube::new(options, (80, 24));
+                let diff = frame(&mut cube, GENERIC);
+
+                assert!(
+                    diff.len() > 100,
+                    "{field} = {bad} drew only {} cells, so the cube is not there",
+                    diff.len()
+                );
+                for (x, y, cell) in &diff {
+                    assert!(
+                        *x < 80 && *y < 24,
+                        "{field} = {bad} produced a cell at ({x}, {y}), which is \
+                         off screen"
+                    );
+                    assert!(
+                        cell.symbol.is_ascii()
+                            || ('\u{2500}'..='\u{2BFF}').contains(&cell.symbol),
+                        "{field} = {bad} produced {cell:?} at ({x}, {y}), which is \
+                         not a glyph this effect can draw"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `cube_size` that would put the camera inside the cube is clamped, not
+    /// honoured.
+    ///
+    /// The perspective divides by `distance + z` and the nearest vertex is at
+    /// `z = -size * sqrt(3)`, so past `distance / sqrt(3)` the denominator
+    /// changes sign: the near vertices project behind the eye, and every
+    /// back-face test in this file inverts with them, so the effect draws the
+    /// cube inside out rather than merely too large. The clamp is the reason
+    /// `cube_size = 8.0` in the fit test above is a valid configuration.
+    #[test]
+    fn a_cube_too_large_for_its_camera_is_clamped() {
+        let size = DEFAULT_CUBE_SIZE;
+        assert_eq!(CubeOptions::default().effective_cube_size(), size);
+
+        for requested in [1.5f32, 2.0, 3.0, 100.0] {
+            let options = CubeOptions {
+                cube_size: requested,
+                ..Default::default()
+            };
+            let effective = options.effective_cube_size();
+            let limit = MAX_CAMERA_FILL * DEFAULT_DISTANCE / 3.0f32.sqrt();
+            assert!(
+                effective <= limit,
+                "cube_size {requested} stayed at {effective}, past the \
+                 {limit} the camera cannot see it from"
+            );
+
+            let mut cube = Cube::new(options, (80, 24));
+            let diff = frame(&mut cube, GENERIC);
+            assert!(!diff.is_empty(), "cube_size {requested} drew nothing");
+        }
+    }
+
+    /// `--print-config` writes every key to disk, so a generated config is
+    /// pinned to whatever the defaults were the day it was generated and every
+    /// future knob arrives as "a key the user's file does not have". That is
+    /// the normal case, not the exotic one.
+    #[test]
+    fn the_new_keys_round_trip_through_toml() {
+        let options: CubeOptions =
+            toml::from_str("fit = 0.8\nfilled = false\nglyphs = \" .:oO@\"\n")
+                .expect("three keys parse");
+        assert_eq!(options.fit, 0.8);
+        assert!(!options.filled);
+        assert_eq!(options.glyphs, " .:oO@");
+        assert_eq!(
+            options.cube_size,
+            CubeOptions::default().cube_size,
+            "three keys in the section silently reset the others"
+        );
+
+        let serialised = toml::to_string(&options).expect("the section serialises");
+        for key in [
+            "cube_size",
+            "rotation_speed_x",
+            "distance",
+            "use_braille",
+            "fit",
+            "filled",
+            "vertex_markers",
+            "glyphs",
+        ] {
+            assert!(
+                serialised.contains(key),
+                "{key} is missing from the serialised form, so --print-config \
+                 would not write it: {serialised}"
+            );
+        }
+    }
+
+    /// A ramp a user's config has emptied out degrades to the documented
+    /// default rather than to `SHADE`, which is the one preset here that is
+    /// documented as not monotonic in ink.
+    #[test]
+    fn an_unusable_glyph_config_falls_back_to_the_default_ramp() {
+        for configured in ["", "\u{7}\u{1}", "\u{4E2D}"] {
+            let ramp = glyph_ramp(configured);
+            assert_eq!(
+                ramp.glyphs(),
+                DEFAULT_GLYPHS.chars().collect::<Vec<char>>(),
+                "{configured:?} did not fall back to the documented default"
+            );
+        }
+        assert_eq!(DEFAULT_GLYPHS, glyph_ramp::presets::BLOCKS);
+    }
+
+    /// The rotation defaults are a contract with the rest of the crate, so this
+    /// pins them from inside as well as from `tests/runtime_and_ascii.rs`.
+    #[test]
+    fn the_rotation_defaults_are_unchanged() {
+        let options = CubeOptions::default();
+        assert_eq!(options.rotation_speed_x, 0.25);
+        assert_eq!(options.rotation_speed_y, 0.35);
+        assert_eq!(options.rotation_speed_z, 0.18);
+        assert_eq!(options.distance, DEFAULT_DISTANCE);
+        assert!(options.use_braille);
+        assert!(options.filled);
+        assert!(options.vertex_markers);
+    }
+
+    /// The wireframe alone has to still be a wireframe, since `filled` is a
+    /// config field and a user can turn it off.
+    #[test]
+    fn the_wireframe_alone_draws_edges_and_nothing_else() {
+        let options = CubeOptions {
+            filled: false,
+            ..Default::default()
+        };
+        let mut cube = Cube::new(options, (200, 50));
+        let diff = frame(&mut cube, GENERIC);
+        assert!(!diff.is_empty());
+
+        // No face was filled, so every drawn dot is edge ink.
+        let width = cube.field.faces.width();
+        for y in 0..cube.field.faces.height() {
+            for x in 0..width {
+                let index = y * width + x;
+                assert_eq!(
+                    cube.field.face_depth[index], NO_DEPTH,
+                    "cell ({x}, {y}) was filled by a face with filled = false"
+                );
+            }
+        }
+
+        // And it is still a wireframe rather than a handful of dots: the twelve
+        // edges of a cube covering a fitted 200x50 are thousands of dots.
+        let dots: u32 = diff
+            .iter()
+            .map(|(_, _, cell)| (cell.symbol as u32).saturating_sub(0x2800))
+            .map(|bits| bits.count_ones())
+            .sum();
+        assert!(
+            dots > 250,
+            "the wireframe drew only {dots} dots, which is not twelve edges"
+        );
+    }
+
+    /// Both renderers draw at every size, and neither of them indexes outside
+    /// its own surface.
+    ///
+    /// `Buffer::set` only debug-asserts its bounds, so in a release build an
+    /// out-of-range write corrupts memory rather than failing. The draw
+    /// helpers address the canvas through `Canvas::set`, which drops those, but
+    /// the cell arithmetic underneath is exactly the part that has to be right.
+    #[test]
+    fn both_renderers_survive_every_size() {
+        for braille in [true, false] {
+            for (width, height) in [
+                (1u16, 1u16),
+                (2, 3),
+                (6, 6),
+                (12, 6),
+                (6, 12),
+                (80, 24),
+                (200, 50),
+                (400, 200),
+            ] {
+                let options = CubeOptions {
+                    use_braille: braille,
+                    ..Default::default()
+                };
+                let mut cube = Cube::new(options, (width, height));
+                for step in 0..24 {
+                    let t = step as f32 * 0.13;
+                    let diff = frame(&mut cube, (t, t * 1.7, t * 0.6));
+                    for (x, y, _) in &diff {
+                        assert!(
+                            *x < width as usize && *y < height as usize,
+                            "braille={braille} at {width}x{height} step {step} \
+                             produced a cell at ({x}, {y})"
+                        );
+                    }
+                }
             }
         }
     }
