@@ -1,13 +1,21 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::TerminalEffect;
 use crossterm::style;
-use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlankOptions {}
 
+impl Default for BlankOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {}
+    }
+}
 #[allow(dead_code)]
 pub struct Blank {
     screen_size: (u16, u16),

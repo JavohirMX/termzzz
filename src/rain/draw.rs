@@ -50,17 +50,17 @@ pub fn pick_color(
 
 #[cfg(test)]
 mod tests {
-    use crate::rain::digital_rain::{DigitalRain, DigitalRainOptionsBuilder};
+    use crate::rain::digital_rain::{DigitalRain, DigitalRainOptions};
 
     // use crossterm::terminal;
     // use std::io::{self, Write};
 
     fn get_default_rain() -> DigitalRain {
-        let rain_options = DigitalRainOptionsBuilder::default()
-            .drops_range((10, 20))
-            .speed_range((2, 15))
-            .build()
-            .unwrap();
+        let rain_options = DigitalRainOptions {
+            drops_range: (10, 20),
+            speed_range: (2, 15),
+            ..Default::default()
+        };
         DigitalRain::new(rain_options, (30, 30))
     }
 

@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
@@ -16,21 +15,32 @@ const PALETTE: [(u8, u8, u8); 6] = [
 
 const DT: f64 = 1.0 / 60.0;
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DvdOptions {
     /// Logo to bounce around the screen. Use `\n` for multi-line logos.
-    #[builder(default = "String::from(\"DVD\")")]
     pub logo: String,
     /// Base bounce speed in cells per second.
-    #[builder(default = "9.0")]
     pub speed: f32,
     /// Change the logo color when the logo lands in a screen corner.
-    #[builder(default = "true")]
     pub corner_color_change: bool,
     /// Start the logo from a corner instead of the middle.
-    #[builder(default = "true")]
     pub start_in_corner: bool,
+}
+
+impl Default for DvdOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            logo: String::from("DVD"),
+            speed: 9.0,
+            corner_color_change: true,
+            start_in_corner: true,
+        }
+    }
 }
 
 pub struct Dvd {
@@ -215,13 +225,12 @@ impl DefaultOptions for Dvd {
     type Options = DvdOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        DvdOptionsBuilder::default()
-            .logo(String::from("DVD"))
-            .speed(9.0_f32)
-            .corner_color_change(true)
-            .start_in_corner(true)
-            .build()
-            .unwrap()
+        DvdOptions {
+            logo: String::from("DVD"),
+            speed: 9.0,
+            corner_color_change: true,
+            start_in_corner: true,
+        }
     }
 }
 
@@ -231,11 +240,11 @@ mod tests {
     use std::time::Duration;
 
     fn options() -> DvdOptions {
-        DvdOptionsBuilder::default()
-            .logo(String::from("DVD"))
-            .start_in_corner(false)
-            .build()
-            .unwrap()
+        DvdOptions {
+            logo: String::from("DVD"),
+            start_in_corner: false,
+            ..Default::default()
+        }
     }
 
     #[test]

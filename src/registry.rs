@@ -20,7 +20,9 @@ use crate::terrain::Terrain;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(into = "String", try_from = "String")]
 pub enum EffectId {
     Matrix,
@@ -40,83 +42,199 @@ pub enum EffectId {
     Terrain,
 }
 
+/// Everything the CLI needs to know about an effect, in one place.
+///
+/// This table is the single source of truth. It used to be five separate
+/// hand-maintained lists -- the `ALL` array, `as_str`, `description`,
+/// `default_duration` and `needs_mouse` -- and forgetting to update the `ALL`
+/// array was the dangerous one: the effect still compiled, but became invisible
+/// to `--help`, to argument parsing and to playlists, with nothing to say so.
+///
+/// Adding an effect is now one entry here. A variant with no entry is caught by
+/// `every_effect_id_has_a_spec_entry`.
+pub struct EffectSpec {
+    pub id: EffectId,
+    /// Name accepted on the command line and in the config file.
+    pub name: &'static str,
+    /// One line shown in `--help`.
+    pub description: &'static str,
+    /// Seconds this effect runs for in a playlist that does not say.
+    pub default_duration: f32,
+    /// Whether the effect reads the mouse and so needs capture enabled.
+    pub needs_mouse: bool,
+    /// Key of this effect's section in the config file.
+    pub config_section: &'static str,
+}
+
+pub static EFFECT_SPECS: &[EffectSpec] = &[
+    EffectSpec {
+        id: EffectId::Matrix,
+        name: "matrix",
+        description: "Matrix digital rain",
+        default_duration: 15.0,
+        needs_mouse: false,
+        config_section: "matrix",
+    },
+    EffectSpec {
+        id: EffectId::Life,
+        name: "life",
+        description: "Conway's Game of Life",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "life",
+    },
+    EffectSpec {
+        id: EffectId::Maze,
+        name: "maze",
+        description: "Maze generation",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "maze",
+    },
+    EffectSpec {
+        id: EffectId::Boids,
+        name: "boids",
+        description: "Boids flocking simulation",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "boids",
+    },
+    EffectSpec {
+        id: EffectId::Blank,
+        name: "blank",
+        description: "Blank screen",
+        default_duration: 2.0,
+        needs_mouse: false,
+        config_section: "blank",
+    },
+    EffectSpec {
+        id: EffectId::Cube,
+        name: "cube",
+        description: "3D cube rotation",
+        default_duration: 18.0,
+        needs_mouse: false,
+        config_section: "cube",
+    },
+    EffectSpec {
+        id: EffectId::Crab,
+        name: "crab",
+        description: "ASCII crab animation",
+        default_duration: 15.0,
+        needs_mouse: false,
+        config_section: "crab",
+    },
+    EffectSpec {
+        id: EffectId::Donut,
+        name: "donut",
+        description: "3D donut rotation",
+        default_duration: 18.0,
+        needs_mouse: false,
+        config_section: "donut",
+    },
+    EffectSpec {
+        id: EffectId::Dvd,
+        name: "dvd",
+        description: "Bouncing DVD logo",
+        default_duration: 12.0,
+        needs_mouse: false,
+        config_section: "dvd",
+    },
+    EffectSpec {
+        id: EffectId::Pipes,
+        name: "pipes",
+        description: "Pipe maze animation",
+        default_duration: 15.0,
+        needs_mouse: false,
+        config_section: "pipes",
+    },
+    EffectSpec {
+        id: EffectId::Plasma,
+        name: "plasma",
+        description: "Plasma color wave effect",
+        default_duration: 15.0,
+        needs_mouse: false,
+        config_section: "plasma",
+    },
+    EffectSpec {
+        id: EffectId::Fire,
+        name: "fire",
+        description: "Fire simulation",
+        default_duration: 12.0,
+        needs_mouse: false,
+        config_section: "fire",
+    },
+    EffectSpec {
+        id: EffectId::Constellation,
+        name: "constellation",
+        description: "Drifting stars and dotted connections",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "constellation",
+    },
+    EffectSpec {
+        id: EffectId::Ascii,
+        name: "ascii",
+        description: "Interactive generative ASCII field",
+        default_duration: 20.0,
+        needs_mouse: true,
+        config_section: "ascii",
+    },
+    EffectSpec {
+        id: EffectId::Terrain,
+        name: "terrain",
+        description: "Terrain generation",
+        default_duration: 4.0,
+        needs_mouse: false,
+        config_section: "terrain",
+    },
+];
+
 impl EffectId {
-    pub const ALL: &'static [Self] = &[
-        Self::Matrix,
-        Self::Life,
-        Self::Maze,
-        Self::Boids,
-        Self::Blank,
-        Self::Cube,
-        Self::Crab,
-        Self::Donut,
-        Self::Dvd,
-        Self::Pipes,
-        Self::Plasma,
-        Self::Fire,
-        Self::Constellation,
-        Self::Ascii,
-        Self::Terrain,
-    ];
+    /// Every registered effect, in the order they appear in `--help` and in a
+    /// playlist that does not choose.
+    pub fn all() -> impl Iterator<Item = EffectId> {
+        EFFECT_SPECS.iter().map(|spec| spec.id)
+    }
+
+    pub fn len() -> usize {
+        EFFECT_SPECS.len()
+    }
+
+    pub fn is_empty() -> bool {
+        EFFECT_SPECS.is_empty()
+    }
+
+    /// The spec for this effect.
+    ///
+    /// Panics if a variant has no entry, which is a programming error rather
+    /// than a user error. `every_effect_id_has_a_spec_entry` turns that panic
+    /// into a test failure.
+    pub fn spec(self) -> &'static EffectSpec {
+        EFFECT_SPECS
+            .iter()
+            .find(|spec| spec.id == self)
+            .unwrap_or_else(|| panic!("{self:?} has no entry in EFFECT_SPECS"))
+    }
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Matrix => "matrix",
-            Self::Life => "life",
-            Self::Maze => "maze",
-            Self::Boids => "boids",
-            Self::Blank => "blank",
-            Self::Cube => "cube",
-            Self::Crab => "crab",
-            Self::Donut => "donut",
-            Self::Dvd => "dvd",
-            Self::Pipes => "pipes",
-            Self::Plasma => "plasma",
-            Self::Fire => "fire",
-            Self::Constellation => "constellation",
-            Self::Ascii => "ascii",
-            Self::Terrain => "terrain",
-        }
+        self.spec().name
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Matrix => "Matrix digital rain",
-            Self::Life => "Conway's Game of Life",
-            Self::Maze => "Maze generation",
-            Self::Boids => "Boids flocking simulation",
-            Self::Blank => "Blank screen",
-            Self::Cube => "3D cube rotation",
-            Self::Crab => "ASCII crab animation",
-            Self::Donut => "3D donut rotation",
-            Self::Dvd => "Bouncing DVD logo",
-            Self::Pipes => "Pipe maze animation",
-            Self::Plasma => "Plasma effect",
-            Self::Fire => "Fire simulation",
-            Self::Constellation => "Drifting stars and dotted connections",
-            Self::Ascii => "Interactive generative ASCII field",
-            Self::Terrain => "Terrain generation",
-        }
+        self.spec().description
     }
 
     pub fn default_duration(self) -> f32 {
-        match self {
-            Self::Blank => 2.0,
-            Self::Terrain => 4.0,
-            Self::Fire => 12.0,
-            Self::Matrix | Self::Crab | Self::Pipes | Self::Plasma => 15.0,
-            Self::Donut | Self::Cube => 18.0,
-            Self::Dvd => 12.0,
-            Self::Maze
-            | Self::Life
-            | Self::Boids
-            | Self::Constellation
-            | Self::Ascii => 20.0,
-        }
+        self.spec().default_duration
     }
 
     pub fn needs_mouse(self) -> bool {
-        matches!(self, Self::Ascii)
+        self.spec().needs_mouse
+    }
+
+    /// Key of this effect's section in the config file.
+    pub fn config_section(self) -> &'static str {
+        self.spec().config_section
     }
 }
 
@@ -137,14 +255,12 @@ impl TryFrom<String> for EffectId {
 impl FromStr for EffectId {
     type Err = String;
 
-    /// The error is the rejected name, so callers can phrase their own context
-    /// without duplicating the "unknown effect" wording.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::ALL
+        EFFECT_SPECS
             .iter()
-            .copied()
-            .find(|id| id.as_str() == value)
-            .ok_or_else(|| value.to_string())
+            .find(|spec| spec.name == value)
+            .map(|spec| spec.id)
+            .ok_or_else(|| format!("Unknown effect: {value}"))
     }
 }
 
@@ -246,147 +362,210 @@ impl AnyEffect {
     }
 }
 
-impl TerminalEffect for AnyEffect {
-    fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        match self {
-            Self::Matrix(effect) => effect.get_diff(),
-            Self::Life(effect) => effect.get_diff(),
-            Self::Maze(effect) => effect.get_diff(),
-            Self::Boids(effect) => effect.get_diff(),
-            Self::Blank(effect) => effect.get_diff(),
-            Self::Cube(effect) => effect.get_diff(),
-            Self::Crab(effect) => effect.get_diff(),
-            Self::Donut(effect) => effect.get_diff(),
-            Self::Dvd(effect) => effect.get_diff(),
-            Self::Pipes(effect) => effect.get_diff(),
-            Self::Plasma(effect) => effect.get_diff(),
-            Self::Fire(effect) => effect.get_diff(),
-            Self::Constellation(effect) => effect.get_diff(),
-            Self::Ascii(effect) => effect.get_diff(),
-            Self::Terrain(effect) => effect.get_diff(),
+/// Forwards every `TerminalEffect` method to the wrapped effect.
+///
+/// The six forwarding methods used to be written out by hand, sixteen arms
+/// each, which is ninety-six near-identical lines. The variant list below is the
+/// only thing that has to be maintained.
+///
+/// Forgetting a variant is a compile error rather than a silent gap: the
+/// `match` inside each method stops being exhaustive, and `AnyEffect` is used as
+/// a `TerminalEffect` everywhere.
+macro_rules! impl_terminal_effect_for_any {
+    ($($variant:ident),+ $(,)?) => {
+        impl TerminalEffect for AnyEffect {
+            fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
+                match self {
+                    $(Self::$variant(effect) => effect.get_diff(),)+
+                }
+            }
+
+            fn update(&mut self) {
+                match self {
+                    $(Self::$variant(effect) => effect.update(),)+
+                }
+            }
+
+            fn update_size(&mut self, width: u16, height: u16) {
+                match self {
+                    $(Self::$variant(effect) => effect.update_size(width, height),)+
+                }
+            }
+
+            fn reset(&mut self) {
+                match self {
+                    $(Self::$variant(effect) => effect.reset(),)+
+                }
+            }
+
+            fn handle_input(&mut self, event: &InputEvent) {
+                match self {
+                    $(Self::$variant(effect) => effect.handle_input(event),)+
+                }
+            }
+
+            fn get_diff_with_context(
+                &mut self,
+                context: &FrameContext,
+            ) -> Vec<(usize, usize, Cell)> {
+                match self {
+                    $(Self::$variant(effect) => effect.get_diff_with_context(context),)+
+                }
+            }
+
+            fn update_with_context(&mut self, context: &FrameContext) {
+                match self {
+                    $(Self::$variant(effect) => effect.update_with_context(context),)+
+                }
+            }
+        }
+    };
+}
+
+impl_terminal_effect_for_any!(
+    Matrix,
+    Life,
+    Maze,
+    Boids,
+    Blank,
+    Cube,
+    Crab,
+    Donut,
+    Dvd,
+    Pipes,
+    Plasma,
+    Fire,
+    Constellation,
+    Ascii,
+    Terrain,
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Every effect id, written out.
+    ///
+    /// This is the one place a new effect has to be added twice, and that is
+    /// deliberate: it is a change detector. Adding an effect without adding it
+    /// here fails the build's test run rather than passing quietly.
+    const KNOWN_IDS: &[EffectId] = &[
+        EffectId::Matrix,
+        EffectId::Life,
+        EffectId::Maze,
+        EffectId::Boids,
+        EffectId::Blank,
+        EffectId::Cube,
+        EffectId::Crab,
+        EffectId::Donut,
+        EffectId::Dvd,
+        EffectId::Pipes,
+        EffectId::Plasma,
+        EffectId::Fire,
+        EffectId::Constellation,
+        EffectId::Ascii,
+        EffectId::Terrain,
+    ];
+
+    #[test]
+    fn every_effect_id_has_a_spec_entry() {
+        // A variant with no entry would panic at runtime, and in the meantime be
+        // invisible to `--help`, to argument parsing and to playlists.
+        for id in KNOWN_IDS {
+            let spec = id.spec();
+            assert_eq!(spec.id, *id);
+        }
+        assert_eq!(
+            EFFECT_SPECS.len(),
+            KNOWN_IDS.len(),
+            "EFFECT_SPECS has {} entries but there are {} effect ids",
+            EFFECT_SPECS.len(),
+            KNOWN_IDS.len()
+        );
+    }
+
+    #[test]
+    fn the_table_lists_each_effect_exactly_once() {
+        let mut seen = HashSet::new();
+        for spec in EFFECT_SPECS {
+            assert!(
+                seen.insert(spec.id),
+                "{} appears twice in EFFECT_SPECS",
+                spec.id.as_str()
+            );
         }
     }
 
-    fn update(&mut self) {
-        match self {
-            Self::Matrix(effect) => effect.update(),
-            Self::Life(effect) => effect.update(),
-            Self::Maze(effect) => effect.update(),
-            Self::Boids(effect) => effect.update(),
-            Self::Blank(effect) => effect.update(),
-            Self::Cube(effect) => effect.update(),
-            Self::Crab(effect) => effect.update(),
-            Self::Donut(effect) => effect.update(),
-            Self::Dvd(effect) => effect.update(),
-            Self::Pipes(effect) => effect.update(),
-            Self::Plasma(effect) => effect.update(),
-            Self::Fire(effect) => effect.update(),
-            Self::Constellation(effect) => effect.update(),
-            Self::Ascii(effect) => effect.update(),
-            Self::Terrain(effect) => effect.update(),
+    #[test]
+    fn names_and_sections_are_unique_and_well_formed() {
+        let mut names = HashSet::new();
+        let mut sections = HashSet::new();
+
+        for spec in EFFECT_SPECS {
+            assert!(
+                names.insert(spec.name),
+                "two effects share the name {:?}",
+                spec.name
+            );
+            assert!(
+                sections.insert(spec.config_section),
+                "two effects share the config section {:?}",
+                spec.config_section
+            );
+            assert!(
+                spec.name.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{:?} is not a plain lowercase name",
+                spec.name
+            );
+            assert_eq!(
+                spec.config_section, spec.name,
+                "{} should use its own name as its config section",
+                spec.name
+            );
         }
     }
 
-    fn update_size(&mut self, width: u16, height: u16) {
-        match self {
-            Self::Matrix(effect) => effect.update_size(width, height),
-            Self::Life(effect) => effect.update_size(width, height),
-            Self::Maze(effect) => effect.update_size(width, height),
-            Self::Boids(effect) => effect.update_size(width, height),
-            Self::Blank(effect) => effect.update_size(width, height),
-            Self::Cube(effect) => effect.update_size(width, height),
-            Self::Crab(effect) => effect.update_size(width, height),
-            Self::Donut(effect) => effect.update_size(width, height),
-            Self::Dvd(effect) => effect.update_size(width, height),
-            Self::Pipes(effect) => effect.update_size(width, height),
-            Self::Plasma(effect) => effect.update_size(width, height),
-            Self::Fire(effect) => effect.update_size(width, height),
-            Self::Constellation(effect) => effect.update_size(width, height),
-            Self::Ascii(effect) => effect.update_size(width, height),
-            Self::Terrain(effect) => effect.update_size(width, height),
+    #[test]
+    fn every_effect_has_usable_metadata() {
+        for spec in EFFECT_SPECS {
+            assert!(
+                !spec.description.trim().is_empty(),
+                "{} has an empty description, which would render a blank help line",
+                spec.name
+            );
+            assert!(
+                spec.default_duration.is_finite() && spec.default_duration > 0.0,
+                "{} has a non-positive playlist duration ({})",
+                spec.name,
+                spec.default_duration
+            );
         }
     }
 
-    fn reset(&mut self) {
-        match self {
-            Self::Matrix(effect) => effect.reset(),
-            Self::Life(effect) => effect.reset(),
-            Self::Maze(effect) => effect.reset(),
-            Self::Boids(effect) => effect.reset(),
-            Self::Blank(effect) => effect.reset(),
-            Self::Cube(effect) => effect.reset(),
-            Self::Crab(effect) => effect.reset(),
-            Self::Donut(effect) => effect.reset(),
-            Self::Dvd(effect) => effect.reset(),
-            Self::Pipes(effect) => effect.reset(),
-            Self::Plasma(effect) => effect.reset(),
-            Self::Fire(effect) => effect.reset(),
-            Self::Constellation(effect) => effect.reset(),
-            Self::Ascii(effect) => effect.reset(),
-            Self::Terrain(effect) => effect.reset(),
+    #[test]
+    fn names_round_trip_through_parsing() {
+        for spec in EFFECT_SPECS {
+            let parsed: EffectId = spec.name.parse().expect("parses");
+            assert_eq!(parsed, spec.id, "{} did not round-trip", spec.name);
+            assert_eq!(parsed.as_str(), spec.name);
         }
     }
 
-    fn handle_input(&mut self, event: &InputEvent) {
-        match self {
-            Self::Matrix(effect) => effect.handle_input(event),
-            Self::Life(effect) => effect.handle_input(event),
-            Self::Maze(effect) => effect.handle_input(event),
-            Self::Boids(effect) => effect.handle_input(event),
-            Self::Blank(effect) => effect.handle_input(event),
-            Self::Cube(effect) => effect.handle_input(event),
-            Self::Crab(effect) => effect.handle_input(event),
-            Self::Donut(effect) => effect.handle_input(event),
-            Self::Dvd(effect) => effect.handle_input(event),
-            Self::Pipes(effect) => effect.handle_input(event),
-            Self::Plasma(effect) => effect.handle_input(event),
-            Self::Fire(effect) => effect.handle_input(event),
-            Self::Constellation(effect) => effect.handle_input(event),
-            Self::Ascii(effect) => effect.handle_input(event),
-            Self::Terrain(effect) => effect.handle_input(event),
-        }
+    #[test]
+    fn unknown_names_are_rejected() {
+        assert!("not-an-effect".parse::<EffectId>().is_err());
+        assert!("".parse::<EffectId>().is_err());
+        // A near miss must not resolve.
+        assert!("Matrix".parse::<EffectId>().is_err());
+        assert!("dvd ".parse::<EffectId>().is_err());
     }
 
-    fn get_diff_with_context(
-        &mut self,
-        context: &FrameContext,
-    ) -> Vec<(usize, usize, Cell)> {
-        match self {
-            Self::Matrix(effect) => effect.get_diff_with_context(context),
-            Self::Life(effect) => effect.get_diff_with_context(context),
-            Self::Maze(effect) => effect.get_diff_with_context(context),
-            Self::Boids(effect) => effect.get_diff_with_context(context),
-            Self::Blank(effect) => effect.get_diff_with_context(context),
-            Self::Cube(effect) => effect.get_diff_with_context(context),
-            Self::Crab(effect) => effect.get_diff_with_context(context),
-            Self::Donut(effect) => effect.get_diff_with_context(context),
-            Self::Dvd(effect) => effect.get_diff_with_context(context),
-            Self::Pipes(effect) => effect.get_diff_with_context(context),
-            Self::Plasma(effect) => effect.get_diff_with_context(context),
-            Self::Fire(effect) => effect.get_diff_with_context(context),
-            Self::Constellation(effect) => effect.get_diff_with_context(context),
-            Self::Ascii(effect) => effect.get_diff_with_context(context),
-            Self::Terrain(effect) => effect.get_diff_with_context(context),
-        }
-    }
-
-    fn update_with_context(&mut self, context: &FrameContext) {
-        match self {
-            Self::Matrix(effect) => effect.update_with_context(context),
-            Self::Life(effect) => effect.update_with_context(context),
-            Self::Maze(effect) => effect.update_with_context(context),
-            Self::Boids(effect) => effect.update_with_context(context),
-            Self::Blank(effect) => effect.update_with_context(context),
-            Self::Cube(effect) => effect.update_with_context(context),
-            Self::Crab(effect) => effect.update_with_context(context),
-            Self::Donut(effect) => effect.update_with_context(context),
-            Self::Dvd(effect) => effect.update_with_context(context),
-            Self::Pipes(effect) => effect.update_with_context(context),
-            Self::Plasma(effect) => effect.update_with_context(context),
-            Self::Fire(effect) => effect.update_with_context(context),
-            Self::Constellation(effect) => effect.update_with_context(context),
-            Self::Ascii(effect) => effect.update_with_context(context),
-            Self::Terrain(effect) => effect.update_with_context(context),
+    #[test]
+    fn the_conversion_into_a_string_uses_the_registered_name() {
+        for spec in EFFECT_SPECS {
+            assert_eq!(String::from(spec.id), spec.name);
+            assert_eq!(EffectId::try_from(spec.name.to_string()), Ok(spec.id));
         }
     }
 }

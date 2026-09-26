@@ -25,6 +25,7 @@
 //! | `playlist` | Timed playlist with blank-wipe transitions |
 //! | `rain`   | Matrix-style digital rain                |
 //! | `runtime`| Runtime input and frame context          |
+//! | `session`| Terminal setup, teardown and panic safety |
 //! | `terrain`| Terrain generation — scrolling landscape |
 
 pub mod ascii;
@@ -49,4 +50,5 @@ pub mod playlist;
 pub mod rain;
 pub mod registry;
 pub mod runtime;
+pub mod session;
 pub mod terrain;

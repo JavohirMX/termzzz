@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -25,19 +24,30 @@ static LINE_CHARS: LazyLock<Vec<Vec<char>>> = LazyLock::new(|| {
     ]
 });
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipesOptions {
-    #[builder(default = "0.2")]
     pub turn_probability: f64,
-    #[builder(default = "2")]
     pub line_type: usize,
-    #[builder(default = "3")]
     pub num_lines: usize,
-    #[builder(default = "0.3")]
     pub pipe_type_change: f64,
-    #[builder(default = "0.9")]
     pub cleanup_factor: f64,
+}
+
+impl Default for PipesOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            turn_probability: 0.2,
+            line_type: 2,
+            num_lines: 3,
+            pipe_type_change: 0.3,
+            cleanup_factor: 0.9,
+        }
+    }
 }
 
 pub struct Pipe {
@@ -417,12 +427,12 @@ impl DefaultOptions for Pipes {
     type Options = PipesOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        PipesOptionsBuilder::default()
-            .turn_probability(0.2)
-            .line_type(2usize)
-            .num_lines(5usize)
-            .cleanup_factor(0.9)
-            .build()
-            .unwrap()
+        PipesOptions {
+            turn_probability: 0.2,
+            line_type: 2,
+            num_lines: 5,
+            cleanup_factor: 0.9,
+            ..Default::default()
+        }
     }
 }

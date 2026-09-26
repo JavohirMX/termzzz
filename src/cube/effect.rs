@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -26,21 +25,32 @@ struct Edge {
     v2: usize,
 }
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CubeOptions {
-    #[builder(default = "1.0")]
     pub cube_size: f32,
-    #[builder(default = "0.25")]
     pub rotation_speed_x: f32,
-    #[builder(default = "0.35")]
     pub rotation_speed_y: f32,
-    #[builder(default = "0.18")]
     pub rotation_speed_z: f32,
-    #[builder(default = "3.5")]
     pub distance: f32,
-    #[builder(default = "true")]
     pub use_braille: bool,
+}
+
+impl Default for CubeOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            cube_size: 1.0,
+            rotation_speed_x: 0.25,
+            rotation_speed_y: 0.35,
+            rotation_speed_z: 0.18,
+            distance: 3.5,
+            use_braille: true,
+        }
+    }
 }
 
 pub struct Cube {
@@ -422,14 +432,13 @@ impl DefaultOptions for Cube {
     type Options = CubeOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        CubeOptionsBuilder::default()
-            .cube_size(1.0)
-            .rotation_speed_x(0.6)
-            .rotation_speed_y(0.8)
-            .rotation_speed_z(0.4)
-            .distance(3.5)
-            .use_braille(true)
-            .build()
-            .unwrap()
+        CubeOptions {
+            cube_size: 1.0,
+            rotation_speed_x: 0.6,
+            rotation_speed_y: 0.8,
+            rotation_speed_z: 0.4,
+            distance: 3.5,
+            use_braille: true,
+        }
     }
 }

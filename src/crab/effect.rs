@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -65,24 +64,35 @@ struct CrabEntity {
     frame_height: usize,  // Cached frame height
 }
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrabOptions {
-    #[builder(default = "5")]
     #[serde(skip)]
     pub crab_count: u16,
 
-    #[builder(default = "0.2")]
     pub animation_speed: f32,
 
-    #[builder(default = "0.05")]
     pub clap_chance: f32, // Random chance for special animation
 
-    #[builder(default = "3.0")]
     pub movement_speed: f32,
 
-    #[builder(default = "1.0")]
     pub crab_coeff: f32,
+}
+
+impl Default for CrabOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            crab_count: 5,
+            animation_speed: 0.2,
+            clap_chance: 0.05,
+            movement_speed: 3.0,
+            crab_coeff: 1.0,
+        }
+    }
 }
 
 pub struct Crab {
@@ -444,13 +454,13 @@ impl DefaultOptions for Crab {
         let screen_area = width as f32 * height as f32;
         let crab_count = (screen_area / 800.0).clamp(3.0, 15.0) as u16;
 
-        CrabOptionsBuilder::default()
-            .crab_count(crab_count)
-            .animation_speed(0.2)
-            .movement_speed(5.0)
-            .clap_chance(0.05)
-            .build()
-            .unwrap()
+        CrabOptions {
+            crab_count,
+            animation_speed: 0.2,
+            movement_speed: 5.0,
+            clap_chance: 0.05,
+            ..Default::default()
+        }
     }
 }
 
@@ -460,11 +470,11 @@ mod tests {
 
     #[test]
     fn resize_recomputes_crab_count() {
-        let options = CrabOptionsBuilder::default()
-            .crab_count(10u16)
-            .crab_coeff(1.0f32)
-            .build()
-            .unwrap();
+        let options = CrabOptions {
+            crab_count: 10,
+            crab_coeff: 1.0,
+            ..Default::default()
+        };
         let mut crab = Crab::new(options, (80, 40));
 
         crab.update_size(10, 10);
@@ -475,10 +485,10 @@ mod tests {
 
     #[test]
     fn new_terminates_at_minimum_size() {
-        let options = CrabOptionsBuilder::default()
-            .crab_count(3u16)
-            .build()
-            .unwrap();
+        let options = CrabOptions {
+            crab_count: 3,
+            ..Default::default()
+        };
 
         let _ = Crab::new(options, (6, 6));
     }

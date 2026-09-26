@@ -71,8 +71,10 @@ impl RainDrop {
         drop_id: usize,
         rng: &mut rand::prelude::ThreadRng,
     ) -> Self {
-        // pick random first character
-        let style: RainDropStyle = rand::random();
+        // Drawn from the generator we were handed, not from the ambient thread
+        // RNG. Using `rand::random()` here meant a caller seeding `rng` to get a
+        // reproducible drop still got a random style.
+        let style: RainDropStyle = rng.random();
         let fx: u16 = rng.random_range(0..screen_size.0);
         let fy: f32 = rng.random_range(0..screen_size.1 / 4) as f32;
         let max_length: usize =
@@ -144,7 +146,7 @@ impl RainDrop {
     ) {
         self.body.clear();
         self.body.insert(0, *CHARACTERS.choose(rng).unwrap());
-        self.style = rand::random();
+        self.style = rng.random();
         self.fy = 0.0;
         self.fx = rng.random_range(0..screen_size.0);
         self.speed =
@@ -210,7 +212,7 @@ impl RainDrop {
         }
 
         // new fy coordinate
-        let fy = self.fy + (self.speed as f32 * dt.as_millis() as f32) / 1000.0;
+        let fy = self.fy + self.speed as f32 * dt.as_secs_f32();
 
         // calculate head and tail y coordinate
         let head_y = fy.round() as u16;
@@ -246,14 +248,14 @@ impl RainDrop {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::digital_rain::DigitalRainOptionsBuilder, *};
+    use super::{super::digital_rain::DigitalRainOptions, *};
 
     fn get_sane_options() -> DigitalRainOptions {
-        DigitalRainOptionsBuilder::default()
-            .drops_range((20, 30))
-            .speed_range((10, 20))
-            .build()
-            .unwrap()
+        DigitalRainOptions {
+            drops_range: (20, 30),
+            speed_range: (10, 20),
+            ..Default::default()
+        }
     }
 
     #[test]

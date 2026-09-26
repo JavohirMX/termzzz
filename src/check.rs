@@ -1,6 +1,7 @@
 use crate::common::TerminalEffect;
 use crate::error::Result;
 use crate::runtime::{FrameContext, InputState};
+use crate::session::TerminalSession;
 use crossterm::{
     cursor,
     event::{self, Event},
@@ -8,57 +9,8 @@ use crossterm::{
     style::Stylize,
     terminal::{self, Clear, ClearType},
 };
-use std::io::{self, Write};
+use std::io::Write;
 use std::time::Duration;
-
-struct CheckTerminal {
-    stdout: io::Stdout,
-    active: bool,
-}
-
-impl CheckTerminal {
-    fn new() -> io::Result<Self> {
-        let mut stdout = io::stdout();
-        terminal::enable_raw_mode()?;
-        if let Err(error) = execute!(
-            stdout,
-            terminal::EnterAlternateScreen,
-            cursor::Hide,
-            terminal::Clear(terminal::ClearType::All)
-        ) {
-            let _ = execute!(
-                stdout,
-                cursor::Show,
-                terminal::Clear(terminal::ClearType::All),
-                terminal::LeaveAlternateScreen,
-            );
-            let _ = terminal::disable_raw_mode();
-            return Err(error);
-        }
-        Ok(Self {
-            stdout,
-            active: true,
-        })
-    }
-
-    fn stdout(&mut self) -> &mut io::Stdout {
-        &mut self.stdout
-    }
-}
-
-impl Drop for CheckTerminal {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = execute!(
-                self.stdout,
-                cursor::Show,
-                terminal::Clear(terminal::ClearType::All),
-                terminal::LeaveAlternateScreen,
-            );
-            let _ = terminal::disable_raw_mode();
-        }
-    }
-}
 
 /// Runs a terminal screensaver effect for a limited number of frames to validate its functionality.
 ///
@@ -75,7 +27,7 @@ impl Drop for CheckTerminal {
 ///
 /// # Example
 /// ```ignore
-/// let options = DigitalRainOptionsBuilder::default()
+/// let options = Default::default()
 ///     .screen_size((80, 40))
 ///     .build()?;
 /// let mut effect = DigitalRain::new(options);
@@ -86,7 +38,7 @@ pub fn test_effect<T: TerminalEffect>(
     frames: usize,
     speed: f32,
 ) -> Result<()> {
-    let mut terminal = CheckTerminal::new()?;
+    let mut session = TerminalSession::enter()?;
     let size = crate::common::normalize_effect_size(terminal::size()?);
     let mut input = InputState::default();
     input.set_size(size);
@@ -96,12 +48,12 @@ pub fn test_effect<T: TerminalEffect>(
     for frame in 1..=frames {
         let context =
             FrameContext::new(size, frame as u64, delta, delta, input.clone());
-        execute!(terminal.stdout(), Clear(ClearType::All))?;
+        execute!(session.stdout(), Clear(ClearType::All))?;
         let diff = effect.get_diff_with_context(&context);
 
         for (x, y, cell) in diff {
             execute!(
-                terminal.stdout(),
+                session.stdout(),
                 cursor::MoveTo(x as u16, y as u16),
                 crossterm::style::PrintStyledContent(
                     cell.symbol.with(cell.color).attribute(cell.attr)
@@ -110,11 +62,11 @@ pub fn test_effect<T: TerminalEffect>(
         }
 
         execute!(
-            terminal.stdout(),
+            session.stdout(),
             cursor::MoveTo(0, 0),
             crossterm::style::Print(format!("Frame: {}", frame))
         )?;
-        terminal.stdout().flush()?;
+        session.stdout().flush()?;
         effect.update_with_context(&context);
     }
 

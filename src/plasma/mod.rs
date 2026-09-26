@@ -1,3 +1,3 @@
 mod effect;
 #[allow(unused)]
-pub use effect::{Plasma, PlasmaOptions, PlasmaOptionsBuilder};
+pub use effect::{Plasma, PlasmaOptions};

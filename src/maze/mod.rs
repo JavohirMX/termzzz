@@ -1,2 +1,2 @@
 pub mod effect;
-pub use effect::{Maze, MazeOptions, MazeOptionsBuilder};
+pub use effect::{Maze, MazeOptions};

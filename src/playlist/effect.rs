@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::registry::{AnyEffect, EffectId};
 use crate::runtime::{FrameContext, InputEvent, InputState};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -17,18 +16,29 @@ pub struct PlaylistEntry {
     pub duration: Option<f32>,
 }
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaylistOptions {
     /// Effects to play, in order. Empty means every registered effect.
-    #[builder(default)]
     pub effects: Vec<PlaylistEntry>,
     /// Play entries in a random order, reshuffling once every effect has run.
-    #[builder(default = "false")]
     pub shuffle: bool,
     /// Seconds of blank wipe between effects.
-    #[builder(default = "0.6")]
     pub transition: f32,
+}
+
+impl Default for PlaylistOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            effects: Default::default(),
+            shuffle: false,
+            transition: 0.6,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -156,10 +166,9 @@ impl Playlist {
             .collect();
 
         if slots.is_empty() {
-            slots = EffectId::ALL
-                .iter()
+            slots = EffectId::all()
                 .map(|id| Slot {
-                    id: *id,
+                    id,
                     duration: id.default_duration(),
                 })
                 .collect();
@@ -241,14 +250,24 @@ impl Playlist {
             self.bag = bag;
         }
 
-        let next = self.bag.remove(0);
-        if next == self.order[self.position] && self.bag.len() < self.order.len() {
-            self.bag.push(self.order[self.position]);
-            self.bag.shuffle(&mut rand::rng());
-            let alternative = self.bag.remove(0);
-            return alternative;
+        let current = self.order[self.position];
+
+        // Keep drawing until something other than the effect we are on comes
+        // up, so a shuffled playlist never shows the same effect twice running.
+        // This used to retry exactly once, which still returned the current
+        // effect one time in fourteen, and the test that checks this failed
+        // about that often.
+        for _ in 0..=self.bag.len() {
+            let next = self.bag.remove(0);
+            if next != current {
+                return next;
+            }
+            self.bag.push(next);
         }
-        next
+
+        // Only reachable if the bag holds nothing but the current effect, which
+        // a bag holding every index once cannot do unless there is only one.
+        self.bag.remove(0)
     }
 
     /// Applies the effect delta to the accumulated frame, masks it for the
@@ -315,20 +334,17 @@ mod tests {
         transition: f32,
         shuffle: bool,
     ) -> Playlist {
-        let options = PlaylistOptionsBuilder::default()
-            .effects(
-                entries
-                    .iter()
-                    .map(|(effect, duration)| PlaylistEntry {
-                        effect: (*effect).to_string(),
-                        duration: *duration,
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .transition(transition)
-            .shuffle(shuffle)
-            .build()
-            .unwrap();
+        let options = PlaylistOptions {
+            effects: entries
+                .iter()
+                .map(|(effect, duration)| PlaylistEntry {
+                    effect: (*effect).to_string(),
+                    duration: *duration,
+                })
+                .collect(),
+            transition,
+            shuffle,
+        };
         Playlist::new(options, Config::default(), (40, 12))
     }
 
@@ -346,13 +362,13 @@ mod tests {
     fn empty_playlist_plays_every_effect() {
         let playlist =
             Playlist::new(PlaylistOptions::default(), Config::default(), (40, 12));
-        assert_eq!(playlist.slots.len(), EffectId::ALL.len());
+        assert_eq!(playlist.slots.len(), EffectId::len());
     }
 
     #[test]
     fn unknown_effects_fall_back_to_every_effect() {
         let playlist = playlist_with(&[("nope", None)], 0.6, false);
-        assert_eq!(playlist.slots.len(), EffectId::ALL.len());
+        assert_eq!(playlist.slots.len(), EffectId::len());
     }
 
     #[test]
@@ -470,18 +486,18 @@ mod tests {
     #[test]
     fn shuffle_visits_every_effect_in_a_round() {
         let mut playlist = Playlist::new(
-            PlaylistOptionsBuilder::default()
-                .shuffle(true)
-                .transition(0.1_f32)
-                .build()
-                .unwrap(),
+            PlaylistOptions {
+                shuffle: true,
+                transition: 0.1,
+                ..Default::default()
+            },
             Config::default(),
             (40, 12),
         );
 
         let mut seen: Vec<EffectId> = vec![playlist.current_id()];
         let mut guard = 0;
-        while seen.len() < EffectId::ALL.len() && guard < 10_000 {
+        while seen.len() < EffectId::len() && guard < 10_000 {
             guard += 1;
             playlist.advance(1.0);
             let id = playlist.current_id();
@@ -490,7 +506,7 @@ mod tests {
             }
         }
 
-        assert_eq!(seen.len(), EffectId::ALL.len());
+        assert_eq!(seen.len(), EffectId::len());
     }
 
     #[test]
@@ -519,19 +535,19 @@ mod tests {
     #[test]
     fn shuffle_bag_empties_only_after_a_full_round() {
         let mut playlist = Playlist::new(
-            PlaylistOptionsBuilder::default()
-                .shuffle(true)
-                .build()
-                .unwrap(),
+            PlaylistOptions {
+                shuffle: true,
+                ..Default::default()
+            },
             Config::default(),
             (40, 12),
         );
 
-        for index in 0..EffectId::ALL.len() {
+        for index in 0..EffectId::len() {
             playlist.position = index;
             playlist.bag.clear();
             let next = playlist.next_index();
-            assert!(next != index || EffectId::ALL.len() == 1);
+            assert!(next != index || EffectId::len() == 1);
         }
     }
 

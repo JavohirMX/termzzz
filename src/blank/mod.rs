@@ -1,2 +1,2 @@
 pub mod effect;
-pub use effect::{Blank, BlankOptions, BlankOptionsBuilder};
+pub use effect::{Blank, BlankOptions};

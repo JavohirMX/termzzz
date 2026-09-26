@@ -3,23 +3,16 @@ use crate::buffer::{Buffer, Cell};
 use crate::common::TerminalEffect;
 use crate::runtime::{FrameContext, InputEvent, Key, KeyPhase, PointerPhase};
 use crossterm::style::Color;
-use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::TAU;
 
-#[derive(Builder, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-#[builder(public, setter(into))]
 pub struct AsciiFieldOptions {
-    #[builder(default = "42")]
     pub seed: u64,
-    #[builder(default = "1.0")]
     pub time_scale: f32,
-    #[builder(default = "0.7")]
     pub pointer_strength: f32,
-    #[builder(default = "0.2")]
     pub brush_radius: f32,
-    #[builder(default = "String::from(\" .:-=+*#%@\")")]
     pub glyphs: String,
 }
 

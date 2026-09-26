@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -52,12 +51,28 @@ static PALETTE: LazyLock<Vec<u8>> = LazyLock::new(|| {
 });
 const MAXTABLE: usize = 256 * 5;
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FireOptions {
-    #[builder(default = "true")]
     pub use_colors: bool,
 }
+
+impl Default for FireOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self { use_colors: true }
+    }
+}
+
+/// One combustion iteration is modelled as taking a fixed slice of wall clock.
+/// Real elapsed time is accumulated and spent in whole quanta, so the fire
+/// burns at the same rate on any refresh rate and honours the speed keys.
+const STEP_QUANTUM: f32 = 1.0 / 60.0;
+/// Upper bound on catch-up work per frame, so a long stall cannot lock up.
+const MAX_STEPS_PER_FRAME: usize = 4;
 
 pub struct Fire {
     pub screen_size: (u16, u16),
@@ -69,6 +84,8 @@ pub struct Fire {
     loop_counter: i32,        // Animation loop counter
     sloop_counter: i32,       // Secondary loop counter
     height_counter: u32,      // Height counter for fire growth
+    step_accumulator: f32,    // Elapsed time not yet spent on a combustion step
+    rng: rand::prelude::ThreadRng,
 }
 
 impl TerminalEffect for Fire {
@@ -80,17 +97,11 @@ impl TerminalEffect for Fire {
     }
 
     fn update(&mut self) {
-        self.height_counter += 1;
-        self.loop_counter -= 1;
+        self.advance(STEP_QUANTUM as f64);
+    }
 
-        if self.loop_counter < 0 {
-            self.loop_counter = rand::rng().random_range(0..3);
-            self.sloop_counter += 1;
-        }
-
-        self.generate_fire_base();
-
-        self.propagate_fire();
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        self.advance(context.delta.as_secs_f64());
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -153,12 +164,42 @@ impl Fire {
             loop_counter: 0,
             sloop_counter: 0,
             height_counter: 0,
+            step_accumulator: 0.0,
+            rng: rand::rng(),
         };
 
         // Generate the intensity table
         fire.generate_intensity_table();
 
         fire
+    }
+
+    /// Spends elapsed time on whole combustion steps.
+    fn advance(&mut self, delta: f64) {
+        self.step_accumulator += delta as f32;
+        let mut steps = 0;
+        while self.step_accumulator >= STEP_QUANTUM && steps < MAX_STEPS_PER_FRAME {
+            self.step_accumulator -= STEP_QUANTUM;
+            self.combust();
+            steps += 1;
+        }
+        if steps == MAX_STEPS_PER_FRAME {
+            self.step_accumulator = 0.0;
+        }
+    }
+
+    /// A single combustion iteration.
+    fn combust(&mut self) {
+        self.height_counter += 1;
+        self.loop_counter -= 1;
+
+        if self.loop_counter < 0 {
+            self.loop_counter = self.rng.random_range(0..3);
+            self.sloop_counter += 1;
+        }
+
+        self.generate_fire_base();
+        self.propagate_fire();
     }
 
     fn generate_intensity_table(&mut self) {
@@ -213,7 +254,9 @@ impl Fire {
     }
 
     fn generate_fire_base(&mut self) {
-        let mut rng = rand::rng();
+        // Reuse the effect's own generator rather than constructing a fresh
+        // thread-local one on every combustion step.
+        let rng = &mut self.rng;
         let width = self.screen_size.0 as usize * 2;
         let height = self.screen_size.1 as usize * 2;
 
@@ -315,9 +358,6 @@ impl DefaultOptions for Fire {
     type Options = FireOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        FireOptionsBuilder::default()
-            .use_colors(true)
-            .build()
-            .unwrap()
+        FireOptions { use_colors: true }
     }
 }

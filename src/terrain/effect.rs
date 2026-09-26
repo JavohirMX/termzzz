@@ -2,20 +2,30 @@ use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crate::terrain::noise::PerlinNoise;
 use crossterm::style;
-use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerrainOptions {
-    #[builder(default = "42")]
     pub seed: u32,
-    #[builder(default = "0.02")]
     pub scale: f64,
-    #[builder(default = "4")]
     pub octaves: i32,
-    #[builder(default = "0.5")]
     pub persistence: f64,
+}
+
+impl Default for TerrainOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            seed: 42,
+            scale: 0.02,
+            octaves: 4,
+            persistence: 0.5,
+        }
+    }
 }
 
 pub struct Terrain {
@@ -57,6 +67,9 @@ impl TerminalEffect for Terrain {
     fn reset(&mut self) {
         self.buffer =
             Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        // The noise is seeded, so it has to be rebuilt too. Leaving the old one
+        // in place meant a reset reused the previous terrain's landscape.
+        self.noise = PerlinNoise::new(self.options.seed);
         self.generated = false;
     }
 }
@@ -136,12 +149,11 @@ impl DefaultOptions for Terrain {
     type Options = TerrainOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        TerrainOptionsBuilder::default()
-            .seed(42u32)
-            .scale(0.02)
-            .octaves(4)
-            .persistence(0.5)
-            .build()
-            .unwrap()
+        TerrainOptions {
+            seed: 42,
+            scale: 0.02,
+            octaves: 4,
+            persistence: 0.5,
+        }
     }
 }

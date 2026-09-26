@@ -1,2 +1,2 @@
 pub mod effect;
-pub use effect::{Dvd, DvdOptions, DvdOptionsBuilder};
+pub use effect::{Dvd, DvdOptions};

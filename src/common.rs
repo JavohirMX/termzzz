@@ -89,6 +89,60 @@ pub trait TerminalEffect {
     }
 }
 
+/// Writes changed cells to the terminal.
+///
+/// Cells outside `size` are skipped: a diff is compared against the previous
+/// frame, and an effect that has not yet caught up with a resize can report
+/// coordinates derived from the old dimensions.
+///
+/// Two things keep the output small. A cursor move is only emitted when the cell
+/// is not the one immediately after the previous one, so a run of cells along a
+/// row costs one move rather than one per cell. And a styled glyph is only
+/// emitted when the style actually changes, so a run of identically coloured
+/// cells costs a bare glyph. Without this, repainting a full screen costs a
+/// cursor move and a colour change per cell, which measured at over a megabyte
+/// of escape sequences per frame for the plasma effect on a 400x200 terminal.
+///
+/// This is a free function rather than an inline loop so the output path can be
+/// measured and tested without running a whole frame loop.
+pub fn write_cells<W: Write>(
+    out: &mut W,
+    size: (u16, u16),
+    cells: &[(usize, usize, Cell)],
+) -> Result<()> {
+    let (max_x, max_y) = (size.0 as usize, size.1 as usize);
+
+    // Where the terminal cursor sits once everything written so far has been
+    // drawn, and the style it is currently in.
+    let mut cursor: Option<(u16, u16)> = None;
+    let mut active: Option<(style::Color, style::Attribute)> = None;
+
+    for &(x, y, cell) in cells {
+        if x >= max_x || y >= max_y {
+            continue;
+        }
+        let column = x as u16;
+        let row = y as u16;
+
+        if cursor != Some((column, row)) {
+            out.queue(cursor::MoveTo(column, row))?;
+        }
+
+        if active == Some((cell.color, cell.attr)) {
+            out.queue(style::Print(cell.symbol))?;
+        } else {
+            out.queue(style::PrintStyledContent(
+                cell.symbol.with(cell.color).attribute(cell.attr),
+            ))?;
+            active = Some((cell.color, cell.attr));
+        }
+
+        cursor = Some((column + 1, row));
+    }
+
+    Ok(())
+}
+
 pub fn process_input<TE>(effect: &mut TE) -> Result<bool>
 where
     TE: TerminalEffect,
@@ -224,16 +278,8 @@ where
         }
 
         let context = FrameContext::new(size, frame, elapsed, delta, input.clone());
-        let queue = effect.get_diff_with_context(&context);
-        for (x, y, cell) in queue {
-            if x >= size.0 as usize || y >= size.1 as usize {
-                continue;
-            }
-            buffered_stdout.queue(cursor::MoveTo(x as u16, y as u16))?;
-            buffered_stdout.queue(style::PrintStyledContent(
-                cell.symbol.with(cell.color).attribute(cell.attr),
-            ))?;
-        }
+        let diff = effect.get_diff_with_context(&context);
+        write_cells(&mut buffered_stdout, size, &diff)?;
         buffered_stdout.flush()?;
 
         if (speed - 1.0).abs() < f32::EPSILON {
@@ -328,5 +374,158 @@ fn is_quit_event(event: &InputEvent) -> bool {
                 && matches!(key, Key::Char('q') | Key::Escape | Key::CtrlC)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::style::Color;
+
+    fn cell(symbol: char) -> Cell {
+        Cell::new(symbol, Color::Red, style::Attribute::Bold)
+    }
+
+    /// Counts cursor moves, which are the CSI sequences ending in `H`.
+    ///
+    /// Counting every escape byte is not useful here: crossterm emits three of
+    /// them per styled glyph (colour, attribute, reset), so the number being
+    /// asserted has to be the cursor moves specifically.
+    fn count_moves(out: &str) -> usize {
+        out.split("\u{1b}[").filter(|seq| seq.contains('H')).count()
+    }
+
+    fn encoded(size: (u16, u16), cells: &[(usize, usize, Cell)]) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        write_cells(&mut out, size, cells).expect("writing to a Vec cannot fail");
+        String::from_utf8(out).expect("crossterm emits utf8")
+    }
+
+    #[test]
+    fn writes_nothing_for_an_empty_diff() {
+        assert_eq!(encoded((10, 10), &[]), "");
+    }
+
+    #[test]
+    fn encodes_a_cursor_move_and_the_styled_glyph() {
+        let out = encoded((10, 10), &[(3, 4, cell('x'))]);
+        assert!(
+            out.contains("\u{1b}[5;4H"),
+            "expected a move to row 5 column 4, got {out:?}"
+        );
+        assert!(out.contains('x'), "expected the glyph, got {out:?}");
+    }
+
+    #[test]
+    fn drops_cells_outside_the_terminal() {
+        // A diff produced against a stale previous frame can report coordinates
+        // from the old size. Those must not reach the terminal.
+        let cells = [
+            (0usize, 0usize, cell('a')),
+            (99, 0, cell('b')),
+            (0, 99, cell('c')),
+        ];
+        let out = encoded((10, 10), &cells);
+
+        assert!(out.contains('a'), "the in-bounds cell was dropped");
+        assert!(!out.contains('b'), "a cell past the right edge was written");
+        assert!(
+            !out.contains('c'),
+            "a cell past the bottom edge was written"
+        );
+    }
+
+    #[test]
+    fn the_last_row_and_column_are_inside_the_terminal() {
+        // Off-by-one guard: index 9 of a 10-wide terminal is the last column,
+        // not out of bounds.
+        let cells = [(9usize, 9usize, cell('z'))];
+        let out = encoded((10, 10), &cells);
+
+        assert!(
+            out.contains('z'),
+            "the last cell was treated as out of bounds"
+        );
+    }
+
+    #[test]
+    fn encodes_every_cell_in_a_dense_diff() {
+        let cells: Vec<(usize, usize, Cell)> =
+            (0..100).map(|i| (i % 10, i / 10, cell('#'))).collect();
+        let out = encoded((10, 10), &cells);
+
+        assert_eq!(out.matches('#').count(), 100);
+    }
+
+    #[test]
+    fn a_full_screen_diff_stays_within_budget() {
+        // The output path is the one place that talks to the terminal, so its
+        // volume is worth pinning. A full repaint used to cost a cursor move and
+        // a colour change per cell, which measured at over a megabyte per frame
+        // for a 200x50 screen.
+        let cells: Vec<(usize, usize, Cell)> = (0..200 * 50)
+            .map(|i| (i % 200, i / 200, cell('#')))
+            .collect();
+        let out = encoded((200, 50), &cells);
+
+        assert_eq!(out.matches('#').count(), 200 * 50);
+        assert!(
+            out.len() < 200 * 50 * 2,
+            "a full-screen repaint of uniformly styled cells encoded to {} bytes, \
+             which is more than the two bytes per glyph it needs",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn a_row_of_adjacent_cells_costs_one_cursor_move() {
+        let cells: Vec<(usize, usize, Cell)> =
+            (0..10).map(|x| (x, 0, cell('#'))).collect();
+        let out = encoded((20, 5), &cells);
+
+        assert_eq!(
+            count_moves(&out),
+            1,
+            "expected a single cursor move for ten adjacent cells, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_gap_in_a_row_forces_a_new_cursor_move() {
+        let cells = [(0usize, 0usize, cell('#')), (5, 0, cell('#'))];
+        let out = encoded((20, 5), &cells);
+
+        assert_eq!(
+            count_moves(&out),
+            2,
+            "expected a cursor move per cell across the gap, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_to_the_next_row_forces_a_new_cursor_move() {
+        // The last column of a row is not followed by the first column of the
+        // next one, even though the x coordinate appears to continue.
+        let cells = [(4usize, 0usize, cell('#')), (0, 1, cell('#'))];
+        let out = encoded((5, 5), &cells);
+
+        assert_eq!(
+            count_moves(&out),
+            2,
+            "expected a cursor move per row, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_style_change_is_emitted_even_mid_row() {
+        let plain = Cell::new('#', Color::Red, style::Attribute::Bold);
+        let other = Cell::new('#', Color::Blue, style::Attribute::Bold);
+        let cells = [(0usize, 0usize, plain), (1, 0, other), (2, 0, plain)];
+        let out = encoded((10, 5), &cells);
+
+        // Still a single cursor move: only the style changed, not the position.
+        assert_eq!(count_moves(&out), 1, "got {out:?}");
+        // But every cell re-states its colour, because it alternates.
+        assert_eq!(out.matches('#').count(), 3, "got {out:?}");
     }
 }

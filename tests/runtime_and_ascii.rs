@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use termzzz::ascii::{AsciiField, AsciiFieldOptionsBuilder, GlyphPalette};
+use termzzz::ascii::{AsciiField, AsciiFieldOptions, GlyphPalette};
 use termzzz::buffer::Cell;
 use termzzz::common::{TerminalEffect, TickClock, run_loop_with_source_and_size};
 use termzzz::config::Config;
@@ -78,10 +78,10 @@ fn input_state_bounds_held_keys_per_frame() {
 
 #[test]
 fn ascii_field_is_deterministic_and_bounds_safe() {
-    let options = AsciiFieldOptionsBuilder::default()
-        .seed(42u64)
-        .build()
-        .unwrap();
+    let options = AsciiFieldOptions {
+        seed: 42,
+        ..Default::default()
+    };
     let mut first = AsciiField::new(options.clone(), (20, 10));
     let mut second = AsciiField::new(options, (20, 10));
 
@@ -95,10 +95,10 @@ fn ascii_field_is_deterministic_and_bounds_safe() {
 
 #[test]
 fn ascii_field_accepts_interactive_input() {
-    let options = AsciiFieldOptionsBuilder::default()
-        .seed(7u64)
-        .build()
-        .unwrap();
+    let options = AsciiFieldOptions {
+        seed: 7,
+        ..Default::default()
+    };
     let mut field = AsciiField::new(options, (20, 10));
 
     field.handle_input(&InputEvent::Pointer {
@@ -113,10 +113,10 @@ fn ascii_field_accepts_interactive_input() {
 
 #[test]
 fn ascii_field_reseeds_on_r() {
-    let options = AsciiFieldOptionsBuilder::default()
-        .seed(9u64)
-        .build()
-        .unwrap();
+    let options = AsciiFieldOptions {
+        seed: 9,
+        ..Default::default()
+    };
     let mut field = AsciiField::new(options, (20, 10));
 
     let first = field.get_diff();
@@ -344,8 +344,21 @@ fn unknown_effect_reports_the_name_exactly_once() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("Unknown screen saver: notaneffect"));
-    assert!(!stdout.contains("Unknown screen saver: Unknown effect"));
+    // The rejected name appears once, and the message is not doubled up by the
+    // caller prefixing a parse error that already explains itself.
+    assert!(
+        stdout.contains("Unknown effect: notaneffect"),
+        "got {stdout}"
+    );
+    assert_eq!(
+        stdout.matches("notaneffect").count(),
+        1,
+        "the rejected name was reported more than once: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Unknown screen saver: Unknown effect"),
+        "the parse error was prefixed again: {stdout}"
+    );
 }
 
 #[test]
@@ -386,34 +399,34 @@ fn check_mode_rejects_unknown_effects() {
 fn registry_builds_every_effect() {
     let config = Config::default();
 
-    for id in EffectId::ALL {
-        let mut effect = AnyEffect::build(*id, &config, (20, 10));
-        assert_eq!(effect.id(), *id);
+    for id in EffectId::all() {
+        let mut effect = AnyEffect::build(id, &config, (20, 10));
+        assert_eq!(effect.id(), id);
         let _ = effect.get_diff();
     }
 }
 
 #[test]
 fn registry_ids_round_trip_through_strings() {
-    for id in EffectId::ALL {
+    for id in EffectId::all() {
         let text = id.as_str();
-        assert_eq!(text.parse::<EffectId>().unwrap(), *id);
+        assert_eq!(text.parse::<EffectId>().unwrap(), id);
     }
     assert!("nope".parse::<EffectId>().is_err());
 }
 
 #[test]
-fn unknown_effect_errors_carry_only_the_rejected_name() {
+fn unknown_effect_errors_name_the_rejected_value() {
     let error = "nope".parse::<EffectId>().unwrap_err();
 
-    assert_eq!(error, "nope");
+    assert_eq!(error, "Unknown effect: nope");
 }
 
 #[test]
 fn dvd_is_registered_with_a_distinct_name() {
     let dvd = EffectId::Dvd.as_str();
     assert_eq!(dvd, "dvd");
-    assert!(EffectId::ALL.contains(&EffectId::Dvd));
+    assert!(EffectId::all().any(|id| id == EffectId::Dvd));
     assert!(!EffectId::Dvd.needs_mouse());
     assert!(EffectId::Ascii.needs_mouse());
 }

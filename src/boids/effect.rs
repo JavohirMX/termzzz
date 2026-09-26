@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
@@ -35,52 +34,63 @@ struct Boid {
     color: style::Color,  // Color based on velocity/state
 }
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoidsOptions {
-    #[builder(default)]
     #[serde(skip)]
     pub screen_size: (u16, u16),
-    #[builder(default = "100")]
     #[serde(skip)]
     pub boid_count: u16,
 
-    #[builder(default = "1.0")]
     pub boid_coeff: f32,
 
     // Separation parameters
-    #[builder(default = "1.5")]
     separation_weight: f32,
-    #[builder(default = "3.0")]
     separation_distance: f32,
 
     // Alignment parameters
-    #[builder(default = "2.0")]
     alignment_weight: f32,
-    #[builder(default = "15.0")]
     alignment_distance: f32,
 
     // Cohesion parameters
-    #[builder(default = "1.5")]
     cohesion_weight: f32,
-    #[builder(default = "15.0")]
     cohesion_distance: f32,
 
     // Additional parameters
-    #[builder(default = "2.0")]
-    drive_factor: f32, // Helps maintain momentum
-    #[builder(default = "1.2")]
-    swirl_factor: f32, // Adds some rotation to movement
-    #[builder(default = "1.8")]
+    drive_factor: f32,  // Helps maintain momentum
+    swirl_factor: f32,  // Adds some rotation to movement
     border_factor: f32, // How strongly to avoid borders
 
-    #[builder(default = "0.6")]
     max_speed: f32,
-    #[builder(default = "0.08")]
     min_speed: f32,
 
-    #[builder(default)]
     charset: BoidCharset,
+}
+
+impl Default for BoidsOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            screen_size: Default::default(),
+            boid_count: 100,
+            boid_coeff: 1.0,
+            separation_weight: 1.5,
+            separation_distance: 3.0,
+            alignment_weight: 2.0,
+            alignment_distance: 15.0,
+            cohesion_weight: 1.5,
+            cohesion_distance: 15.0,
+            drive_factor: 2.0,
+            swirl_factor: 1.2,
+            border_factor: 1.8,
+            max_speed: 0.6,
+            min_speed: 0.08,
+            charset: BoidCharset::default(),
+        }
+    }
 }
 
 pub struct Boids {
@@ -448,13 +458,15 @@ impl DefaultOptions for Boids {
     type Options = BoidsOptions;
 
     fn default_options(width: u16, height: u16) -> Self::Options {
-        let boid_count = ((width * height) as f32 * 0.5) as u16; // About 1% of screen space
+        // Widened before multiplying: `width * height` as `u16` wraps past
+        // 256x256. The comment was also wrong by 50x, so it is corrected here.
+        let boid_count = (width as f32 * height as f32 * 0.5) as u16; // About 50% of screen space
 
-        BoidsOptionsBuilder::default()
-            .screen_size((width, height))
-            .boid_count(boid_count.clamp(50, 300))
-            .build()
-            .unwrap()
+        BoidsOptions {
+            screen_size: (width, height),
+            boid_count: boid_count.clamp(50, 300),
+            ..Default::default()
+        }
     }
 }
 
@@ -464,12 +476,12 @@ mod tests {
 
     #[test]
     fn resize_recomputes_boid_count() {
-        let options = BoidsOptionsBuilder::default()
-            .screen_size((80u16, 40u16))
-            .boid_count(10u16)
-            .boid_coeff(1.0f32)
-            .build()
-            .unwrap();
+        let options = BoidsOptions {
+            screen_size: (80, 40),
+            boid_count: 10,
+            boid_coeff: 1.0,
+            ..Default::default()
+        };
         let mut boids = Boids::new(options);
 
         boids.update_size(10, 10);

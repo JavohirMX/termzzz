@@ -12,7 +12,6 @@ homepage = "https://github.com/JavohirMX/termzzz"
 
 [dependencies]
 crossterm = "0.29"
-derive_builder = "0.20"
 directories = "6.0"
 env_logger = "0.11"
 log = "0.4"
@@ -25,15 +24,24 @@ toml = "1"
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3.27"
+# Already a runtime dependency; integration tests need it declared here too.
+toml = "1"
 
 [[bench]]
 name = "rain_benchmarks"
 harness = false
 
-# optimized to size
+[[bench]]
+name = "effect_benchmarks"
+harness = false
+
+# Optimized for speed. This is a real-time renderer: every effect does per-cell
+# trigonometry 60 times a second, and `opt-level = "s"` suppresses the inlining
+# and unrolling that work depends on. Size is not the constraint here, so this
+# trades a little binary size for frame rate.
 [profile.release]
 panic = "abort"
 strip = true  # Automatically strip symbols from the binary.
-opt-level = "s"  # Optimize for size.
+opt-level = 3
 lto = true  # enable link time optimization
 codegen-units = 1

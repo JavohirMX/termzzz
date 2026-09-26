@@ -1,19 +1,29 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlasmaOptions {
-    #[builder(default = "0.5")]
     pub time_scale: f64,
-    #[builder(default = "1.0")]
     pub spatial_scale: f64,
-    #[builder(default = "20.0")]
     pub color_speed: f64,
+}
+
+impl Default for PlasmaOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            time_scale: 0.5,
+            spatial_scale: 1.0,
+            color_speed: 20.0,
+        }
+    }
 }
 
 pub struct Plasma {
@@ -39,8 +49,11 @@ impl TerminalEffect for Plasma {
     }
 
     fn update(&mut self) {
-        // Advance the time for the animation
-        self.time += self.options.time_scale * 0.1;
+        self.advance(1.0 / 60.0);
+    }
+
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        self.advance(context.delta.as_secs_f32());
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -56,6 +69,12 @@ impl TerminalEffect for Plasma {
 }
 
 impl Plasma {
+    /// Advances the field clock by the elapsed time. The old code added a fixed
+    /// 0.1 per call, which tied the animation to the refresh rate.
+    fn advance(&mut self, delta: f32) {
+        self.time += self.options.time_scale * delta as f64;
+    }
+
     pub fn new(options: PlasmaOptions, screen_size: (u16, u16)) -> Self {
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
         let time = 0.0;
@@ -162,11 +181,10 @@ impl DefaultOptions for Plasma {
     type Options = PlasmaOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        PlasmaOptionsBuilder::default()
-            .time_scale(1.0)
-            .spatial_scale(1.0)
-            .color_speed(150.0)
-            .build()
-            .unwrap()
+        PlasmaOptions {
+            time_scale: 1.0,
+            spatial_scale: 1.0,
+            color_speed: 150.0,
+        }
     }
 }

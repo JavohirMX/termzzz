@@ -80,20 +80,25 @@ impl Buffer {
         (i % self.width, i / self.width)
     }
 
-    // Return x, y and Cell
-    pub fn diff(&self, other: &Buffer) -> Vec<(usize, usize, Cell)> {
-        let prev_buffer = &self.buffer;
-        let next_buffer = &other.buffer;
+    /// Returns the cells of `next` that differ from `self`.
+    ///
+    /// `self` is the previously shown frame and `next` is the frame being
+    /// produced. Coordinates are derived from `next`, because that is the
+    /// buffer whose layout the caller is about to write to the terminal. Doing
+    /// it the other way round means a `self` left over from before a resize
+    /// reports coordinates derived from the old width, which sends cells off
+    /// the edge of the screen.
+    ///
+    /// Only the overlapping prefix is compared, so buffers of differing sizes
+    /// degrade to a partial diff rather than a panic.
+    pub fn diff(&self, next: &Buffer) -> Vec<(usize, usize, Cell)> {
+        let mut updates: Vec<(usize, usize, Cell)> = Vec::new();
+        let overlap = self.buffer.len().min(next.buffer.len());
 
-        let mut updates: Vec<(usize, usize, Cell)> = vec![];
-
-        for (i, (curr, prev)) in
-            next_buffer.iter().zip(prev_buffer.iter()).enumerate()
-        {
-            if curr != prev {
-                let (x, y) = self.pos_of(i);
-                debug_assert!(x < self.width && y < self.height);
-                updates.push((x, y, next_buffer[i]));
+        for i in 0..overlap {
+            if next.buffer[i] != self.buffer[i] {
+                let (x, y) = next.pos_of(i);
+                updates.push((x, y, next.buffer[i]));
             }
         }
 

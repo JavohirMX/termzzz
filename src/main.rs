@@ -1,5 +1,5 @@
-use crossterm::{self, cursor, execute, terminal};
-use std::{io, process};
+use crossterm::terminal;
+use std::process;
 
 use termzzz::{
     check, common,
@@ -7,6 +7,7 @@ use termzzz::{
     error,
     playlist::{Playlist, PlaylistEntry},
     registry::{AnyEffect, EffectId},
+    session::{TerminalSession, install_panic_hook},
 };
 
 #[derive(Debug)]
@@ -21,66 +22,12 @@ struct AppArgs {
     transition: Option<f32>,
 }
 
-/// Guard to drop out alternate screen in case of errors
-struct TerminalGuard {
-    stdout: io::Stdout,
-    mouse_capture: bool,
-}
-
-impl TerminalGuard {
-    fn new() -> Result<Self, io::Error> {
-        let mut stdout = io::stdout();
-        terminal::enable_raw_mode()?;
-        if let Err(error) = execute!(
-            stdout,
-            terminal::EnterAlternateScreen,
-            cursor::Hide,
-            terminal::Clear(terminal::ClearType::All)
-        ) {
-            let _ = execute!(
-                stdout,
-                cursor::Show,
-                terminal::Clear(terminal::ClearType::All),
-                terminal::LeaveAlternateScreen,
-            );
-            let _ = terminal::disable_raw_mode();
-            return Err(error);
-        }
-
-        Ok(Self {
-            stdout,
-            mouse_capture: false,
-        })
-    }
-
-    // Get mutable access to the stdout
-    fn get_stdout(&mut self) -> &mut io::Stdout {
-        &mut self.stdout
-    }
-
-    fn enable_mouse(&mut self) -> io::Result<()> {
-        self.mouse_capture = true;
-        execute!(self.stdout, crossterm::event::EnableMouseCapture)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if self.mouse_capture {
-            let _ = execute!(self.stdout, crossterm::event::DisableMouseCapture);
-        }
-        let _ = execute!(
-            self.stdout,
-            cursor::Show,
-            terminal::Clear(terminal::ClearType::All),
-            terminal::LeaveAlternateScreen,
-        );
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
 fn main() -> Result<(), error::TermzzzError> {
     env_logger::init();
+    // Installed before any session exists. With `panic = "abort"` the usual
+    // `Drop`-based restore never runs, so a panic would otherwise leave the
+    // terminal in raw mode on the alternate screen with no way out.
+    install_panic_hook();
 
     let args = match parse_args() {
         Ok(v) => v,
@@ -133,17 +80,17 @@ fn main() -> Result<(), error::TermzzzError> {
             .any(|id| id.needs_mouse());
 
         let fps = {
-            let mut guard = TerminalGuard::new()?;
+            let mut session = TerminalSession::enter()?;
             let (width, height) = common::normalize_effect_size(terminal::size()?);
             let mut effect =
                 Playlist::new(options, config.clone(), (width, height));
 
-            if needs_mouse && let Err(error) = guard.enable_mouse() {
+            if needs_mouse && let Err(error) = session.enable_mouse() {
                 eprintln!("Mouse capture unavailable: {}", error);
             }
 
             common::run_loop_with_options(
-                guard.get_stdout(),
+                session.stdout(),
                 &mut effect,
                 None,
                 common::RuntimeOptions::new(speed),
@@ -157,26 +104,29 @@ fn main() -> Result<(), error::TermzzzError> {
 
     let effect_id = match args.screen_saver.parse::<EffectId>() {
         Ok(effect_id) => effect_id,
-        Err(name) => {
-            println!("Unknown screen saver: {name}");
+        Err(error) => {
+            // The parse error already names the problem and the rejected value,
+            // so it is printed on its own rather than behind another prefix,
+            // which would read "Unknown screen saver: Unknown effect: foo".
+            println!("{error}");
             print_help();
             return Ok(());
         }
     };
 
     let fps = {
-        let mut guard = TerminalGuard::new()?;
+        let mut session = TerminalSession::enter()?;
         let (width, height) = common::normalize_effect_size(terminal::size()?);
         let mut effect = AnyEffect::build(effect_id, &config, (width, height));
 
         if effect_id.needs_mouse()
-            && let Err(error) = guard.enable_mouse()
+            && let Err(error) = session.enable_mouse()
         {
             eprintln!("Mouse capture unavailable: {}", error);
         }
 
         common::run_loop_with_options(
-            guard.get_stdout(),
+            session.stdout(),
             &mut effect,
             None,
             common::RuntimeOptions::new(speed),
@@ -325,7 +275,7 @@ fn print_help() {
     println!("    termzzz [EFFECT] [OPTIONS]");
     println!();
     println!("EFFECTS:");
-    for effect in EffectId::ALL {
+    for effect in EffectId::all() {
         println!("    {:<14}{}", effect.as_str(), effect.description());
     }
     println!();

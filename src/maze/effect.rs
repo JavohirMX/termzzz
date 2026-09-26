@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::{RngExt, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,10 +26,19 @@ static CHARACTERS: LazyLock<Vec<char>> = LazyLock::new(|| {
     v
 });
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MazeOptions {}
 
+impl Default for MazeOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {}
+    }
+}
 pub struct Maze {
     pub screen_size: (u16, u16),
     options: MazeOptions,
@@ -126,28 +134,32 @@ impl TerminalEffect for Maze {
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
-        self.screen_size = (width, height);
+        self.screen_size = (width.max(1), height.max(1));
+        let (width, height) =
+            (self.screen_size.0 as usize, self.screen_size.1 as usize);
+
+        // Both buffers are full-screen, so both have to follow the new size or
+        // the carved path coordinates no longer fit. `reset` rebuilds them
+        // anyway, but `update_size` is a public entry point and has to leave a
+        // renderable effect behind on its own.
+        self.buffer = Buffer::new(width, height);
+        self.initial_walls = Buffer::new(width, height);
+        fill_initial_walls(&mut self.initial_walls);
+        self.paths.retain(|(x, y)| *x < width && *y < height);
     }
 
     fn reset(&mut self) {
-        let mut new_effect = Self::new(self.options.clone(), self.screen_size);
-        fill_initial_walls(&mut new_effect.initial_walls);
-        new_effect.maze_complete = false;
-        new_effect.paths.clear();
-        new_effect.stack.clear();
-        new_effect.rng = rand::rng();
-
-        let start_x = new_effect.rng.random_range(0..self.screen_size.0);
-        let start_y = new_effect.rng.random_range(0..self.screen_size.1);
-        new_effect
-            .stack
-            .push_back((start_x as isize, start_y as isize));
-        *self = new_effect;
+        // `Self::new` already picks a start cell, generates the wall texture and
+        // seeds the stack. Calling `fill_initial_walls` again here, and then
+        // replacing the generator it just built, threw away a full random fill
+        // for nothing.
+        *self = Self::new(self.options.clone(), self.screen_size);
     }
 }
 
 impl Maze {
     pub fn new(options: MazeOptions, screen_size: (u16, u16)) -> Self {
+        let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
         let mut rng = rand::rng();
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
 
@@ -207,7 +219,7 @@ impl DefaultOptions for Maze {
     type Options = MazeOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        MazeOptionsBuilder::default().build().unwrap()
+        MazeOptions::default()
     }
 }
 
@@ -217,7 +229,7 @@ mod tests {
 
     #[test]
     fn check_initial_state() {
-        let options = MazeOptionsBuilder::default().build().unwrap();
+        let options = MazeOptions::default();
         let maze = Maze::new(options, (3, 3));
 
         // buffer correctly initialized
@@ -238,7 +250,7 @@ mod tests {
 
     #[test]
     fn check_flow() {
-        let options = MazeOptionsBuilder::default().build().unwrap();
+        let options = MazeOptions::default();
         let mut maze = Maze::new(options, (5, 5));
         maze.update();
         let diff = maze.get_diff();

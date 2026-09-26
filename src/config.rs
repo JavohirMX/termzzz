@@ -1,21 +1,21 @@
 use crate::{
-    ascii::{AsciiFieldOptions, AsciiFieldOptionsBuilder},
-    blank::{BlankOptions, BlankOptionsBuilder},
-    boids::{BoidsOptions, BoidsOptionsBuilder},
-    constellation::{ConstellationOptions, ConstellationOptionsBuilder},
-    crab::{CrabOptions, CrabOptionsBuilder},
-    cube::{CubeOptions, CubeOptionsBuilder},
-    donut::{DonutOptions, DonutOptionsBuilder},
-    dvd::{DvdOptions, DvdOptionsBuilder},
+    ascii::AsciiFieldOptions,
+    blank::BlankOptions,
+    boids::BoidsOptions,
+    constellation::ConstellationOptions,
+    crab::CrabOptions,
+    cube::CubeOptions,
+    donut::DonutOptions,
+    dvd::DvdOptions,
     error::{ConfigError, Result, TermzzzError},
-    fire::{FireOptions, FireOptionsBuilder},
-    life::{ConwayLifeOptions, ConwayLifeOptionsBuilder},
-    maze::{MazeOptions, MazeOptionsBuilder},
-    pipes::{PipesOptions, PipesOptionsBuilder},
-    plasma::{PlasmaOptions, PlasmaOptionsBuilder},
-    playlist::{PlaylistOptions, PlaylistOptionsBuilder},
-    rain::digital_rain::{DigitalRainOptions, DigitalRainOptionsBuilder},
-    terrain::{TerrainOptions, TerrainOptionsBuilder},
+    fire::FireOptions,
+    life::ConwayLifeOptions,
+    maze::MazeOptions,
+    pipes::PipesOptions,
+    plasma::PlasmaOptions,
+    playlist::PlaylistOptions,
+    rain::digital_rain::DigitalRainOptions,
+    terrain::TerrainOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -54,41 +54,33 @@ impl Default for GlobalOptions {
     }
 }
 
+/// Every effect's tunables.
+///
+/// The container-level `#[serde(default)]` is load-bearing. It makes a missing
+/// section inherit from [`Config::default`], which is built from each effect's
+/// option defaults. A *field*-level `#[serde(default)]` would instead fall back
+/// to that field type's derived `Default`, and those disagree with the real
+/// defaults, so a partial user config would silently zero out every section the
+/// user did not mention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
-    #[serde(default)]
     pub global: GlobalOptions,
-    #[serde(default)]
     pub matrix: DigitalRainOptions,
-    #[serde(default)]
     pub life: ConwayLifeOptions,
-    #[serde(default)]
     pub maze: MazeOptions,
-    #[serde(default)]
     pub boids: BoidsOptions,
-    #[serde(default)]
     pub ascii: AsciiFieldOptions,
-    #[serde(default)]
     pub blank: BlankOptions,
-    #[serde(default)]
     pub cube: CubeOptions,
-    #[serde(default)]
     pub crab: CrabOptions,
-    #[serde(default)]
     pub donut: DonutOptions,
-    #[serde(default)]
     pub dvd: DvdOptions,
-    #[serde(default)]
     pub pipes: PipesOptions,
-    #[serde(default)]
     pub plasma: PlasmaOptions,
-    #[serde(default)]
     pub fire: FireOptions,
-    #[serde(default)]
     pub terrain: TerrainOptions,
-    #[serde(default)]
     pub constellation: ConstellationOptions,
-    #[serde(default)]
     pub playlist: PlaylistOptions,
 }
 
@@ -224,28 +216,29 @@ impl Config {
 }
 
 impl Default for Config {
+    /// Every section's own `Default` is now the single source of truth, so this
+    /// is just the field-by-field assembly. It used to spell out sixteen builder
+    /// calls, which meant the defaults lived in two places per struct: the
+    /// builder, and the derived `Default` that serde actually used.
     fn default() -> Self {
-        Config {
+        Self {
             global: GlobalOptions::default(),
-            matrix: DigitalRainOptionsBuilder::default().build().unwrap(),
-            life: ConwayLifeOptionsBuilder::default().build().unwrap(),
-            maze: MazeOptionsBuilder::default().build().unwrap(),
-            boids: BoidsOptionsBuilder::default().build().unwrap(),
-            ascii: AsciiFieldOptionsBuilder::default().build().unwrap(),
-            blank: BlankOptionsBuilder::default().build().unwrap(),
-            cube: CubeOptionsBuilder::default().build().unwrap(),
-            crab: CrabOptionsBuilder::default().build().unwrap(),
-            donut: DonutOptionsBuilder::default().build().unwrap(),
-            dvd: DvdOptionsBuilder::default().build().unwrap(),
-            pipes: PipesOptionsBuilder::default().build().unwrap(),
-            plasma: PlasmaOptionsBuilder::default().build().unwrap(),
-            fire: FireOptionsBuilder::default().build().unwrap(),
-            terrain: TerrainOptionsBuilder::default().build().unwrap(),
-            constellation: ConstellationOptionsBuilder::default().build().unwrap(),
-            playlist: PlaylistOptionsBuilder::default()
-                .transition(0.6_f32)
-                .build()
-                .unwrap(),
+            matrix: DigitalRainOptions::default(),
+            life: ConwayLifeOptions::default(),
+            maze: MazeOptions::default(),
+            boids: BoidsOptions::default(),
+            ascii: AsciiFieldOptions::default(),
+            blank: BlankOptions::default(),
+            cube: CubeOptions::default(),
+            crab: CrabOptions::default(),
+            donut: DonutOptions::default(),
+            dvd: DvdOptions::default(),
+            pipes: PipesOptions::default(),
+            plasma: PlasmaOptions::default(),
+            fire: FireOptions::default(),
+            terrain: TerrainOptions::default(),
+            constellation: ConstellationOptions::default(),
+            playlist: PlaylistOptions::default(),
         }
     }
 }

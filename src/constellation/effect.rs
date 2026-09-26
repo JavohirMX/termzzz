@@ -1,7 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
-use derive_builder::Builder;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
@@ -20,21 +19,32 @@ const DIM_PALETTE: [(u8, u8, u8); 4] =
 
 const BRIGHT: (u8, u8, u8) = (238, 243, 255);
 
-#[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
-#[builder(public, setter(into))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstellationOptions {
-    #[builder(default = "65")]
     pub star_count: usize,
-    #[builder(default = "0.18")]
     pub connect_radius: f64,
-    #[builder(default = "4")]
     pub max_connections: usize,
-    #[builder(default = "true")]
     pub twinkle: bool,
-    #[builder(default = "0.3")]
     pub min_speed: f64,
-    #[builder(default = "1.5")]
     pub max_speed: f64,
+}
+
+impl Default for ConstellationOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file
+    /// that omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            star_count: 65,
+            connect_radius: 0.18,
+            max_connections: 4,
+            twinkle: true,
+            min_speed: 0.3,
+            max_speed: 1.5,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -366,15 +376,14 @@ impl DefaultOptions for Constellation {
     type Options = ConstellationOptions;
 
     fn default_options(_width: u16, _height: u16) -> Self::Options {
-        ConstellationOptionsBuilder::default()
-            .star_count(65_usize)
-            .connect_radius(0.18)
-            .max_connections(4_usize)
-            .twinkle(true)
-            .min_speed(0.3)
-            .max_speed(1.5)
-            .build()
-            .unwrap()
+        ConstellationOptions {
+            star_count: 65,
+            connect_radius: 0.18,
+            max_connections: 4,
+            twinkle: true,
+            min_speed: 0.3,
+            max_speed: 1.5,
+        }
     }
 }
 
@@ -384,7 +393,7 @@ mod tests {
 
     #[test]
     fn creates_constellation_effect() {
-        let options = ConstellationOptionsBuilder::default().build().unwrap();
+        let options = ConstellationOptions::default();
         let effect = Constellation::new(options, (80, 24));
         assert_eq!(effect.screen_size, (80, 24));
     }

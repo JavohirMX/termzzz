@@ -4,23 +4,36 @@ use super::rain_drop::RainDrop;
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DefaultOptions, TerminalEffect};
 
-use derive_builder::Builder;
 use rand::{self, RngExt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-#[derive(Builder, Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct DigitalRainOptions {
-    #[builder(default = "(10, 20)")]
+    /// Derived from the terminal size by the config layer, so not persisted.
     #[serde(skip)]
     pub drops_range: (u16, u16),
-    #[builder(default = "(2, 16)")]
+    /// Derived from the terminal size by the config layer, so not persisted.
     #[serde(skip)]
     pub speed_range: (u16, u16),
-    #[builder(default = "1.0")]
     pub drops_coeff: f32,
-    #[builder(default = "1.0")]
     pub speed_coeff: f32,
+}
+
+impl Default for DigitalRainOptions {
+    /// Hand-written so it is the single source of truth.
+    ///
+    /// The builder carried the real defaults while the derived `Default`
+    /// produced zeros, and serde used the derived one, so a config file that
+    /// omitted a section silently zeroed it.
+    fn default() -> Self {
+        Self {
+            drops_range: (10, 20),
+            speed_range: (2, 16),
+            drops_coeff: 1.0,
+            speed_coeff: 1.0,
+        }
+    }
 }
 
 pub struct DigitalRain {
@@ -232,9 +245,15 @@ impl DefaultOptions for DigitalRain {
     type Options = DigitalRainOptions;
 
     fn default_options(width: u16, height: u16) -> Self::Options {
+        // Widened before multiplying. `width * height` as `u16` wraps on any
+        // terminal past 256x256, which silently produced a small drop count on
+        // exactly the large screens that need the most of them.
+        let area = width as f32 * height as f32;
+
         let drops_range = {
-            let min_drops = (width * height) / 160; // Approximately 0.6% of screen space
-            let max_drops = (width * height) / 80; // Approximately 1.2% of screen space
+            // Approximately 0.6% to 1.2% of screen space.
+            let min_drops = (area / 160.0) as u16;
+            let max_drops = (area / 80.0) as u16;
             (min_drops.max(10), max_drops.max(20)) // Ensure minimum values
         };
 
@@ -244,11 +263,11 @@ impl DefaultOptions for DigitalRain {
             (min_speed, max_speed)
         };
 
-        DigitalRainOptionsBuilder::default()
-            .drops_range(drops_range)
-            .speed_range(speed_range)
-            .build()
-            .unwrap()
+        DigitalRainOptions {
+            drops_range,
+            speed_range,
+            ..Default::default()
+        }
     }
 }
 
@@ -257,11 +276,11 @@ mod tests {
     use super::*;
 
     fn get_sane_default_options() -> DigitalRainOptions {
-        DigitalRainOptionsBuilder::default()
-            .drops_range((20, 30))
-            .speed_range((10, 20))
-            .build()
-            .unwrap()
+        DigitalRainOptions {
+            drops_range: (20, 30),
+            speed_range: (10, 20),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -272,13 +291,12 @@ mod tests {
 
     #[test]
     fn resize_recomputes_drop_and_speed_ranges() {
-        let options = DigitalRainOptionsBuilder::default()
-            .drops_range((50u16, 60u16))
-            .speed_range((3u16, 4u16))
-            .drops_coeff(1.0f32)
-            .speed_coeff(1.0f32)
-            .build()
-            .unwrap();
+        let options = DigitalRainOptions {
+            drops_range: (50, 60),
+            speed_range: (3, 4),
+            drops_coeff: 1.0,
+            speed_coeff: 1.0,
+        };
         let mut rain = DigitalRain::new(options, (80, 40));
 
         rain.update_size(10, 10);
