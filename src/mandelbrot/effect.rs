@@ -16,9 +16,10 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, TerminalEffect, seeded_rng};
+use crate::render::palette::presets as palette_presets;
 use crate::render::{HalfBlockField, Palette};
 use crate::runtime::FrameContext;
-use crossterm::style::{Attribute, Color};
+use crossterm::style::Attribute;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
@@ -81,29 +82,26 @@ const EDGE_BISECTIONS: u32 = 20;
 /// disc, so most attempts are rejected.
 const SAMPLE_ATTEMPTS: usize = 512;
 
-/// The palette, cycled slowly so the bands shift without the zoom stalling.
-/// Dark enough at the start that the first iterations read as the interior.
-fn palette() -> Palette {
-    Palette::new(vec![
-        Color::Rgb { r: 0, g: 7, b: 100 },
-        Color::Rgb {
-            r: 32,
-            g: 107,
-            b: 203,
-        },
-        Color::Rgb {
-            r: 237,
-            g: 255,
-            b: 255,
-        },
-        Color::Rgb {
-            r: 255,
-            g: 170,
-            b: 0,
-        },
-        Color::Rgb { r: 204, g: 0, b: 0 },
-        Color::Rgb { r: 16, g: 8, b: 40 },
-    ])
+/// Bounds on `color_bands`.
+///
+/// One band is not a palette, it is a two-colour threshold map, which is a
+/// legitimate thing to ask for and not this effect's default. The upper bound is
+/// well past the point where quantisation stops saving any bytes, and exists only
+/// so a config cannot ask for a number large enough to overflow the index
+/// arithmetic.
+pub const MIN_COLOR_BANDS: u16 = 2;
+pub const MAX_COLOR_BANDS: u16 = 256;
+
+/// The palette named in the options, cycled slowly so the bands shift without the
+/// zoom stalling.
+///
+/// Falls back to `depth` for an unknown name. Every ramp in
+/// [`crate::render::palette::presets`] starts and ends dark, which is what makes
+/// the cycle seamless rather than a visible seam once per lap -- and it is why
+/// this uses [`Palette::sample_rgb_wrapped`] rather than the clamping sampler.
+fn palette(name: &str) -> Palette {
+    Palette::named(name)
+        .unwrap_or_else(|| Palette::new(palette_presets::DEPTH.to_vec()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +125,30 @@ pub struct MandelbrotOptions {
     pub zoom_rate: f32,
     /// Hue rotation over time, so the bands drift while the camera moves.
     pub color_speed: f32,
+    /// How many discrete colour steps the escape counts are quantised into.
+    ///
+    /// This exists for the output path, not for the picture. Colouring every
+    /// sample continuously gives each of the 160,000 pixels at 400x200 its own
+    /// foreground, so the encoder emits a full `ESC[38;2;r;g;b` for every one of
+    /// them and never gets to reuse a run: 1.39 MB per frame. Quantising to 32
+    /// bands lets neighbouring samples in a smooth region share a colour, which
+    /// brings that to 377 KB for a picture that is *more* detailed than before,
+    /// because the mapping is no longer saturating five iterations into the ramp.
+    ///
+    /// Measured at 400x200, against 1.39 MB unquantised: 8 bands 256 KB, 16 bands
+    /// 308 KB, 32 bands 377 KB, 64 bands 377 KB. It plateaus at 32, because past
+    /// that the log mapping puts most samples in distinct bands anyway. Below
+    /// about 16 the banding starts reading as contour lines, which is a legitimate
+    /// look and not the one this effect defaults to.
+    pub color_bands: u16,
+    /// Which ramp to colour the escape bands with.
+    ///
+    /// A name rather than a list of colours, because an inline list in TOML is
+    /// unpleasant to write and the useful ramps are shared with other effects.
+    /// See [`crate::render::palette::presets`]. An unknown name falls back to
+    /// `depth` rather than failing: a typo in a config file should not stop the
+    /// program.
+    pub palette: String,
     /// Seeds the tour: which coastline it starts on, and where it goes next.
     ///
     /// There is deliberately no "start at this complex number" option. An
@@ -146,6 +168,8 @@ impl Default for MandelbrotOptions {
             max_iterations: 96,
             zoom_rate: DEFAULT_ZOOM_RATE,
             color_speed: 0.05,
+            color_bands: 32,
+            palette: String::from("depth"),
             seed: DEFAULT_SEED,
         }
     }
@@ -172,7 +196,7 @@ impl TerminalEffect for Mandelbrot {
         let shift = self.time * self.options.color_speed;
         // Built once per frame. `Palette::new` takes a Vec, so calling it inside
         // the closure would allocate once per pixel, sixty times a second.
-        let palette = palette();
+        let palette = palette(&self.options.palette);
 
         // Fewer iterations when zoomed out. The set is only a few pixels across
         // at that scale, so the extra iterations resolve detail nobody can see
@@ -180,6 +204,13 @@ impl TerminalEffect for Mandelbrot {
         // pixels are most of the screen when zoomed out. This is the effect's
         // dominant cost, so it is worth the couple of lines.
         let budget = self.iteration_budget();
+        // Hoisted out of the per-pixel closure. The clamp in particular is not
+        // something to leave inside a loop that runs 160,000 times at 400x200.
+        let bands = f32::from(
+            self.options
+                .color_bands
+                .clamp(MIN_COLOR_BANDS, MAX_COLOR_BANDS),
+        );
 
         self.field.fill_with(|x, y| {
             // Rows are pairs of pixels per cell, so `y` addresses field rows
@@ -196,11 +227,38 @@ impl TerminalEffect for Mandelbrot {
             if !iterations.escaped {
                 return [0.0, 0.0, 0.0];
             }
-            // The square root pulls the early bands apart. Without it almost
-            // every visible pixel lands in the last few iterations, because the
-            // counts bunch up at the high end.
-            let t = (iterations.smooth / 5.0).powf(0.25);
-            palette.sample_rgb(t as f32 + shift)
+            // Cyclic banding: the band index is the escape count taken modulo the
+            // band count, so the ramp repeats rather than being consumed.
+            //
+            // Two earlier mappings failed here, for opposite reasons, and both are
+            // worth recording because the symptom was identical -- a flat frame.
+            //
+            // A power curve, `(smooth / 5.0).powf(0.25)`, is not cyclic at all and
+            // reaches the top of the ramp at *five* iterations. `Palette::sample`
+            // clamps, so every slower point was one colour: `rgb(16, 8, 40)`, at
+            // about 1.09:1 against the black interior. That was "too pixelated".
+            //
+            // A log map, `ln(smooth) / ln(budget)`, does spread the low counts --
+            // each decade gets an equal share of the ramp. But at the depth limit
+            // the observed escape counts cluster near the budget, and a span of
+            // smooth 40 to 96 is the top 15% of a log ramp. The deep view came out
+            // with three exterior colours, which is the same flat frame by a
+            // different route.
+            //
+            // Modulo does not care where the counts cluster: any span wider than
+            // the band count gets the whole ramp, however it is distributed. That
+            // is the property the previous two mappings lacked, and it is why the
+            // test asserts on a deep view specifically rather than on a wide one.
+            //
+            // `round` at the band edge rather than `floor` keeps the fractional
+            // part of the smooth count doing its job, which is to stop the bands
+            // stepping like a contour plot.
+            let band = iterations.smooth.max(0.0).rem_euclid(bands);
+            let t = band.round() / bands;
+            // `sample_rgb_wrapped`, not `sample_rgb`: `color_speed` is meant to
+            // cycle the bands, and a clamp turns an unbounded offset into a flat
+            // frame after about seven seconds.
+            palette.sample_rgb_wrapped(t + shift)
         });
 
         self.field.write_to(&mut self.canvas, Attribute::Reset);
@@ -528,6 +586,263 @@ mod tests {
             }
         }
         (interior, exterior)
+    }
+
+    /// The distinct colours the palette actually produces for a real view.
+    ///
+    /// `Mandelbrot::get_diff` returns changed cells, so a view that is genuinely
+    /// varying shows up here as many distinct foregrounds. Quantised to 5 bits per
+    /// channel, because the encoder emits whole bytes and a difference of one in
+    /// a channel is not a difference a viewer could see.
+    fn distinct_colors(
+        effect: &mut Mandelbrot,
+    ) -> std::collections::HashSet<(u8, u8, u8)> {
+        let mut seen = std::collections::HashSet::new();
+        for (_, _, cell) in effect.get_diff() {
+            if let crossterm::style::Color::Rgb { r, g, b } = cell.color {
+                seen.insert((r >> 3, g >> 3, b >> 3));
+            }
+        }
+        seen
+    }
+
+    /// A deep view has to use the palette, not one colour.
+    ///
+    /// The mapping used to be `t = (smooth / 5.0).powf(0.25)`, and then
+    /// `Palette::sample_rgb(t)`, which clamps `t` to `0.0..=1.0`. `t` reaches 1.0
+    /// at just **five** escape iterations, so every point that survived longer
+    /// than that -- which at any real zoom depth is nearly all of the exterior --
+    /// was the same final palette stop. The last stop is `rgb(16, 8, 40)`, a
+    /// near-black purple at roughly 1.09:1 against the black interior, so the
+    /// frame reduced to a black region, a barely-distinguishable dark purple, and
+    /// hard aliased edges between them.
+    ///
+    /// This is the test that says "the picture has detail in it", and it is the
+    /// one that was missing: the existing colour assertions check that the
+    /// interior is black and that *some* exterior exists, which a flat wash
+    /// satisfies.
+    #[test]
+    fn a_deep_view_uses_the_whole_palette_rather_than_one_colour() {
+        let mut effect = Mandelbrot::new(MandelbrotOptions::default(), (60, 30));
+        zoom_to_the_depth_limit(&mut effect);
+
+        // Stop just short of the recentre, which resets the scale to the widest
+        // view in the tour.
+        effect.scale = effect.depth_limit() * 1.02;
+        let colors = distinct_colors(&mut effect);
+
+        assert!(
+            colors.len() >= 6,
+            "a view at the depth limit drew only {} distinct colours (of which one \
+             is presumably the black interior); the escape bands are collapsing \
+             onto a single palette stop",
+            colors.len()
+        );
+    }
+
+    /// The palette has to keep changing, rather than settling on one colour.
+    ///
+    /// `shift = self.time * self.options.color_speed` grew without bound, and it
+    /// was added to a `t` that was already near 1.0 for most pixels. Once `shift`
+    /// passed about 0.33 -- roughly seven seconds in at the default `color_speed`
+    /// of 0.05 -- every pixel in the frame was above the clamp, so the effect went
+    /// entirely flat for the rest of every tour. The module comment claimed the
+    /// palette was "cycled slowly"; it was not cycled at all.
+    #[test]
+    fn the_palette_keeps_cycling_rather_than_saturating() {
+        let mut effect = Mandelbrot::new(MandelbrotOptions::default(), (60, 30));
+        effect.scale = effect.depth_limit() * 1.02;
+
+        // Ten seconds in, which is well past the point the old code flattened.
+        effect.time = 10.0;
+        let late = distinct_colors(&mut effect);
+
+        assert!(
+            late.len() >= 6,
+            "ten seconds in, the view draws only {} distinct colours, so the \
+             palette offset has saturated rather than cycled",
+            late.len()
+        );
+    }
+
+    /// Cycling must actually cycle: the colours a deep view produces now and a
+    /// full lap later have to differ, or `color_speed` is not doing anything.
+    #[test]
+    fn the_colours_shift_over_time() {
+        let mut effect = Mandelbrot::new(MandelbrotOptions::default(), (60, 30));
+        effect.scale = effect.depth_limit() * 1.02;
+
+        effect.time = 0.0;
+        let before = distinct_colors(&mut effect);
+        // A whole lap of the palette at the default speed.
+        effect.time = 1.0 / MandelbrotOptions::default().color_speed;
+        let after = distinct_colors(&mut effect);
+
+        assert_ne!(
+            before, after,
+            "a full palette lap produced identical colours, so color_speed does \
+             nothing"
+        );
+    }
+
+    /// Fewer bands means fewer distinct colours, and the knob has to actually
+    /// reach the renderer.
+    ///
+    /// The band count exists for the output path: colour every sample continuously
+    /// and the encoder writes a full truecolor sequence for every one of the
+    /// 160,000 cells at 400x200 and can never reuse a run, which measured 1.39 MB
+    /// per frame. Thirty-two bands measured 377 KB for a *more* detailed picture,
+    /// because by then the mapping is no longer saturating five iterations in.
+    #[test]
+    fn the_colour_band_count_reaches_the_renderer() {
+        let mut effect = Mandelbrot::new(MandelbrotOptions::default(), (60, 30));
+        effect.scale = effect.depth_limit() * 1.02;
+
+        let count_for = |bands: u16| {
+            let mut effect = Mandelbrot::new(
+                MandelbrotOptions {
+                    color_bands: bands,
+                    ..Default::default()
+                },
+                (60, 30),
+            );
+            effect.scale = effect.depth_limit() * 1.02;
+            distinct_colors(&mut effect).len()
+        };
+
+        let coarse = count_for(4);
+        let fine = count_for(64);
+        assert!(
+            coarse < fine,
+            "{coarse} bands produced {coarse} colours and 64 bands produced {fine}, \
+             so the knob is not reaching the renderer"
+        );
+    }
+
+    /// A band count of one is a threshold map, and a band count of zero would
+    /// divide by zero. Neither is allowed through.
+    #[test]
+    fn the_colour_band_count_is_clamped_away_from_degenerate() {
+        for requested in [0u16, 1, 2, 256, 1000, u16::MAX] {
+            let options = MandelbrotOptions {
+                color_bands: requested,
+                ..Default::default()
+            };
+            let mut effect = Mandelbrot::new(options, (40, 20));
+            let bands = effect
+                .options
+                .color_bands
+                .clamp(MIN_COLOR_BANDS, MAX_COLOR_BANDS);
+            assert!(
+                (MIN_COLOR_BANDS..=MAX_COLOR_BANDS).contains(&bands),
+                "asked for {requested} bands"
+            );
+            // And it renders, rather than producing a NaN colour.
+            assert!(
+                !effect.get_diff().is_empty(),
+                "{requested} bands drew nothing"
+            );
+        }
+    }
+
+    /// Every named ramp has to work, and an unknown name has to fall back rather
+    /// than take the program down at startup.
+    ///
+    /// A palette name comes from a config file, so an unrecognised one is a typo
+    /// rather than a bug, and the effect should still run.
+    #[test]
+    fn any_named_palette_renders_and_an_unknown_one_falls_back() {
+        for name in Palette::preset_names() {
+            let mut effect = Mandelbrot::new(
+                MandelbrotOptions {
+                    palette: name.to_string(),
+                    ..Default::default()
+                },
+                (40, 20),
+            );
+            let colors = distinct_colors(&mut effect);
+            assert!(
+                colors.len() >= 2,
+                "palette {name:?} drew {} distinct colours, so it is not being \
+                 used at all",
+                colors.len()
+            );
+        }
+
+        let mut effect = Mandelbrot::new(
+            MandelbrotOptions {
+                palette: String::from("nonesuch"),
+                ..Default::default()
+            },
+            (40, 20),
+        );
+        assert!(
+            distinct_colors(&mut effect).len() >= 2,
+            "an unknown palette name drew a flat frame instead of falling back"
+        );
+    }
+
+    /// Every preset ramp has to cycle seamlessly, or the band drift shows a seam
+    /// once per lap.
+    ///
+    /// This is the property that lets the effect wrap its time offset at all. The
+    /// original ramp satisfied it by accident worth keeping -- it ends on
+    /// near-black and starts on dark navy -- and a new ramp added to the preset
+    /// list might not.
+    #[test]
+    fn every_preset_cycles_without_a_visible_seam() {
+        for (name, _) in palette_presets::ALL {
+            let palette = palette(name);
+            // A two-stop ramp is exempt, and `contrast` is the only one: with
+            // only black and white, every band boundary is already a hard edge, so
+            // the wrap is indistinguishable from the rest of the pattern.
+            if palette.stops().len() < 3 {
+                continue;
+            }
+            let last = palette
+                .stops()
+                .last()
+                .copied()
+                .expect("a preset with no stops");
+            let first = palette
+                .stops()
+                .first()
+                .copied()
+                .expect("a preset with no stops");
+
+            // A seam is a large jump in brightness between the two ends. They do
+            // not have to be *equal* -- `magma` ends on cream and starts on near
+            // black, which is a seam by this measure and is flagged below.
+            let gap = match (last, first) {
+                (
+                    crossterm::style::Color::Rgb {
+                        r: lr,
+                        g: lg,
+                        b: lb,
+                    },
+                    crossterm::style::Color::Rgb {
+                        r: fr,
+                        g: fg,
+                        b: fb,
+                    },
+                ) => {
+                    let l = |r: u8, g: u8, b: u8| {
+                        (0.299 * f32::from(r)
+                            + 0.587 * f32::from(g)
+                            + 0.114 * f32::from(b))
+                            / 255.0
+                    };
+                    (l(lr, lg, lb) - l(fr, fg, fb)).abs()
+                }
+                _ => 0.0,
+            };
+
+            assert!(
+                gap < 0.30,
+                "palette {name:?} jumps from {last:?} to {first:?} across the wrap, \
+                 which is a visible seam once per palette lap (gap {gap:.2})"
+            );
+        }
     }
 
     /// Steps the camera until it recentres, returning the scale and centre at

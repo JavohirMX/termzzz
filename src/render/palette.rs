@@ -96,6 +96,49 @@ impl Palette {
         }
     }
 
+    /// Like [`sample`](Self::sample), but `t` wraps at the top instead of
+    /// saturating.
+    ///
+    /// For a ramp that is meant to *cycle* -- a colour wheel, a slowly rotating
+    /// offset into a fixed palette. [`sample`](Self::sample) clamps, which is
+    /// right for a brightness ramp and catastrophic for a cyclic one: a mandelbrot
+    /// was adding an unbounded time offset to a value already near 1.0, so after
+    /// about seven seconds every pixel was above the clamp and the whole frame was
+    /// one colour until the camera recentred.
+    ///
+    /// Wrapping is only seamless if the ramp's last stop and first stop are close
+    /// in colour. This crate's mandelbrot ramp satisfies that by accident worth
+    /// keeping: it ends on near-black and starts on dark navy.
+    pub fn sample_wrapped(&self, t: f32) -> Color {
+        let t = if t.is_nan() { 0.0 } else { t.rem_euclid(1.0) };
+        self.sample(t)
+    }
+
+    /// [`sample_wrapped`](Self::sample_wrapped), returning floats.
+    pub fn sample_rgb_wrapped(&self, t: f32) -> [f32; 3] {
+        match self.sample_wrapped(t) {
+            Color::Rgb { r, g, b } => {
+                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+            }
+            _ => [1.0, 1.0, 1.0],
+        }
+    }
+
+    /// Looks up a named ramp.
+    ///
+    /// For effects that take `palette = "ember"` in their config rather than a
+    /// list of colours. An inline list in TOML is unpleasant to write and worse to
+    /// read back, and the useful ramps are shared: mandelbrot, donut, fire, ink
+    /// and constellation all want "the same six colours, arranged differently".
+    pub fn named(name: &str) -> Option<Palette> {
+        presets::by_name(name).map(|stops| Palette::new(stops.to_vec()))
+    }
+
+    /// Every named ramp, for `--help` and the docs.
+    pub fn preset_names() -> Vec<&'static str> {
+        presets::ALL.iter().map(|(name, _)| *name).collect()
+    }
+
     /// The anchors, for an effect that wants to reason about them.
     pub fn stops(&self) -> &[Color] {
         &self.stops
@@ -153,6 +196,218 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 /// Black to white, the ramp a scalar field wants when nothing else is specified.
 pub fn greyscale() -> Palette {
     Palette::from_rgb(vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+}
+
+/// Named ramps, for effects that take `palette = "..."` in their config.
+///
+/// The escape-time colouring tradition is that the ramp's last stop and first stop
+/// are close in colour, because the bands cycle. Every ramp here satisfies that,
+/// which is what makes [`Palette::sample_wrapped`] seamless rather than a visible
+/// seam once per lap.
+pub mod presets {
+    use crossterm::style::Color::{self, Rgb};
+
+    /// Navy through blue, a bright band, amber, red, and back to near-black.
+    ///
+    /// The mandelbrot's original ramp, kept as the default because it is the one
+    /// the effect was tuned against. The bright third is deliberate: it puts a
+    /// hard edge where escape counts cross from fast to slow, which is where the
+    /// boundary detail lives.
+    pub const DEPTH: &[Color] = &[
+        Rgb { r: 0, g: 7, b: 100 },
+        Rgb {
+            r: 32,
+            g: 107,
+            b: 203,
+        },
+        Rgb {
+            r: 237,
+            g: 255,
+            b: 255,
+        },
+        Rgb {
+            r: 255,
+            g: 170,
+            b: 0,
+        },
+        Rgb { r: 204, g: 0, b: 0 },
+        Rgb { r: 16, g: 8, b: 40 },
+    ];
+
+    /// Black to red to orange to yellow to white, and back down again.
+    ///
+    /// Fire, for a set boundary. The descending half is not an accident: a ramp
+    /// that goes dark to light cannot cycle, because the wrap from light back to
+    /// dark is a seam. Mirroring makes it a triangle wave, so the bands run out
+    /// and back and the cycle closes on a colour close to where it started. Every
+    /// multi-stop ramp here is mirrored for that reason, and
+    /// `every_preset_cycles_without_a_visible_seam` in the mandelbrot is the guard.
+    pub const EMBER: &[Color] = &[
+        Rgb { r: 0, g: 0, b: 0 },
+        Rgb { r: 120, g: 0, b: 0 },
+        Rgb {
+            r: 200,
+            g: 60,
+            b: 0,
+        },
+        Rgb {
+            r: 255,
+            g: 160,
+            b: 0,
+        },
+        Rgb {
+            r: 255,
+            g: 240,
+            b: 160,
+        },
+        Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+        Rgb {
+            r: 255,
+            g: 160,
+            b: 0,
+        },
+        Rgb {
+            r: 200,
+            g: 60,
+            b: 0,
+        },
+        Rgb { r: 120, g: 0, b: 0 },
+    ];
+
+    /// Black to deep blue to cyan to white, and back down again.
+    ///
+    /// Cold, and the most legible of the set on a dark profile because the
+    /// mid-tones stay far apart in luminance.
+    pub const OCEAN: &[Color] = &[
+        Rgb { r: 0, g: 0, b: 20 },
+        Rgb {
+            r: 0,
+            g: 40,
+            b: 120,
+        },
+        Rgb {
+            r: 0,
+            g: 130,
+            b: 190,
+        },
+        Rgb {
+            r: 60,
+            g: 210,
+            b: 220,
+        },
+        Rgb {
+            r: 220,
+            g: 250,
+            b: 255,
+        },
+        Rgb {
+            r: 60,
+            g: 210,
+            b: 220,
+        },
+        Rgb {
+            r: 0,
+            g: 130,
+            b: 190,
+        },
+        Rgb {
+            r: 0,
+            g: 40,
+            b: 120,
+        },
+        Rgb { r: 0, g: 10, b: 50 },
+    ];
+
+    /// Magma: the standard perceptually-uniform ramp, and back down again.
+    ///
+    /// Dark purple through red and orange to cream, with roughly even *perceived*
+    /// lightness steps, which is the property [`DEPTH`] trades away for the bright
+    /// band in its middle. As given it is one of the best ramps here to look at and
+    /// one of the worst to cycle, which is why the descending half is included.
+    pub const MAGMA: &[Color] = &[
+        Rgb { r: 0, g: 0, b: 4 },
+        Rgb {
+            r: 81,
+            g: 18,
+            b: 124,
+        },
+        Rgb {
+            r: 183,
+            g: 55,
+            b: 121,
+        },
+        Rgb {
+            r: 252,
+            g: 137,
+            b: 97,
+        },
+        Rgb {
+            r: 254,
+            g: 224,
+            b: 181,
+        },
+        Rgb {
+            r: 252,
+            g: 253,
+            b: 191,
+        },
+        Rgb {
+            r: 254,
+            g: 224,
+            b: 181,
+        },
+        Rgb {
+            r: 252,
+            g: 137,
+            b: 97,
+        },
+        Rgb {
+            r: 183,
+            g: 55,
+            b: 121,
+        },
+        Rgb {
+            r: 81,
+            g: 18,
+            b: 124,
+        },
+    ];
+
+    /// Two stops only, so `Palette::sample` returns either black or white.
+    ///
+    /// Reads as a pure boundary map with no interior shading, which is
+    /// occasionally exactly what you want and otherwise a mistake. The one ramp
+    /// here that is exempt from the seamless-wrap rule, and legitimately so: with
+    /// two stops every band boundary is already a hard black-to-white edge, so
+    /// there is no seam distinguishable from the rest of the pattern.
+    pub const CONTRAST: &[Color] = &[
+        Rgb { r: 0, g: 0, b: 0 },
+        Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+    ];
+
+    /// Every ramp above, in the order they should be offered to a user.
+    pub const ALL: &[(&str, &[Color])] = &[
+        ("depth", DEPTH),
+        ("ember", EMBER),
+        ("ocean", OCEAN),
+        ("magma", MAGMA),
+        ("contrast", CONTRAST),
+    ];
+
+    /// Looks up a ramp by name, case-insensitively.
+    pub fn by_name(name: &str) -> Option<&'static [Color]> {
+        ALL.iter()
+            .find(|(preset, _)| preset.eq_ignore_ascii_case(name))
+            .map(|(_, stops)| *stops)
+    }
 }
 
 #[cfg(test)]
