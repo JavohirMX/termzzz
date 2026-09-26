@@ -49,20 +49,26 @@ impl TerminalEffect for DigitalRain {
 
     /// Update each rain drop position
     fn update(&mut self) {
-        for rain_drop in self.rain_drops.iter_mut() {
-            rain_drop.update(
-                self.screen_size,
-                &self.options,
-                Duration::from_millis(50),
-                &mut self.rng,
-            );
-        }
+        self.update_rain(Duration::from_secs_f64(1.0 / 60.0));
+    }
 
-        self.add_one();
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        self.update_rain(context.delta);
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
-        self.screen_size = (width, height);
+        self.screen_size = (width.max(1), height.max(1));
+        let area = self.screen_size.0 as f32 * self.screen_size.1 as f32;
+        self.options.drops_range = (
+            ((area / 160.0 * self.options.drops_coeff) as u16).max(10),
+            ((area / 80.0 * self.options.drops_coeff) as u16).max(20),
+        );
+        self.options.speed_range = (
+            ((self.screen_size.1 as f32 / 20.0 * self.options.speed_coeff) as u16)
+                .max(2),
+            ((self.screen_size.1 as f32 / 10.0 * self.options.speed_coeff) as u16)
+                .max(16),
+        );
     }
 
     fn reset(&mut self) {
@@ -149,6 +155,13 @@ impl DigitalRain {
             buffer,
             rng,
         }
+    }
+
+    fn update_rain(&mut self, delta: Duration) {
+        for rain_drop in self.rain_drops.iter_mut() {
+            rain_drop.update(self.screen_size, &self.options, delta, &mut self.rng);
+        }
+        self.add_one();
     }
 
     pub fn fill_buffer(
@@ -258,6 +271,23 @@ mod tests {
     }
 
     #[test]
+    fn resize_recomputes_drop_and_speed_ranges() {
+        let options = DigitalRainOptionsBuilder::default()
+            .drops_range((50u16, 60u16))
+            .speed_range((3u16, 4u16))
+            .drops_coeff(1.0f32)
+            .speed_coeff(1.0f32)
+            .build()
+            .unwrap();
+        let mut rain = DigitalRain::new(options, (80, 40));
+
+        rain.update_size(10, 10);
+
+        assert_eq!(rain.options.drops_range, (10, 20));
+        assert_eq!(rain.options.speed_range, (2, 16));
+    }
+
+    #[test]
     fn no_diff() {
         let mut foo = DigitalRain::new(get_sane_default_options(), (100, 100));
         let q = foo.get_diff();
@@ -267,8 +297,52 @@ mod tests {
     #[test]
     fn same_diff_and_update() {
         let mut foo = DigitalRain::new(get_sane_default_options(), (100, 100));
-        foo.update();
-        let q = foo.get_diff();
+        let mut q = Vec::new();
+        for _ in 0..60 {
+            foo.update();
+            q = foo.get_diff();
+            if !q.is_empty() {
+                break;
+            }
+        }
         assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn quantum_update_moves_less_than_the_legacy_step() {
+        let options = get_sane_default_options();
+        let mut quick = RainDrop::from_values(
+            1,
+            vec!['a', 'b', 'c'],
+            crate::rain::rain_drop::RainDropStyle::Back,
+            10,
+            10.0,
+            20,
+            10,
+        );
+        let mut tick = RainDrop::from_values(
+            1,
+            vec!['a', 'b', 'c'],
+            crate::rain::rain_drop::RainDropStyle::Back,
+            10,
+            10.0,
+            20,
+            10,
+        );
+
+        quick.update(
+            (100, 100),
+            &options,
+            Duration::from_millis(50),
+            &mut rand::rng(),
+        );
+        tick.update(
+            (100, 100),
+            &options,
+            Duration::from_secs_f64(1.0 / 60.0),
+            &mut rand::rng(),
+        );
+
+        assert!(tick.fy < quick.fy);
     }
 }

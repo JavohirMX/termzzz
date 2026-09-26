@@ -11,9 +11,9 @@ pub struct DonutOptions {
     pub inner_radius: f32,
     #[builder(default = "2.0")]
     pub outer_radius: f32,
-    #[builder(default = "0.07")]
+    #[builder(default = "0.022")]
     pub rotation_speed_a: f32,
-    #[builder(default = "0.03")]
+    #[builder(default = "0.010")]
     pub rotation_speed_b: f32,
     #[builder(default = "5.5")]
     pub distance: f32,
@@ -54,7 +54,9 @@ impl TerminalEffect for Donut {
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
-        self.screen_size = (width, height);
+        self.screen_size = (width.max(1), height.max(1));
+        let min_dimension = self.screen_size.0.min(self.screen_size.1) as f32;
+        self.options.k1 = min_dimension * 0.8 * self.options.k1_coeff;
     }
 
     fn reset(&mut self) {
@@ -249,5 +251,25 @@ impl DefaultOptions for Donut {
             ])
             .build()
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_recomputes_projection_scale() {
+        let options = DonutOptionsBuilder::default()
+            .k1(99.0f32)
+            .k1_coeff(1.0f32)
+            .build()
+            .unwrap();
+        let mut donut = Donut::new(options, (80, 40));
+
+        donut.update_size(10, 20);
+
+        assert_eq!(donut.screen_size, (10, 20));
+        assert_eq!(donut.options.k1, 8.0);
     }
 }

@@ -33,6 +33,8 @@ pub struct ConwayLifeOptions {
     pub initial_cells: u32,
     #[builder(default = "1.0")]
     pub cells_coeff: f32,
+    #[builder(default = "8.0")]
+    pub generations_per_second: f32,
 }
 
 #[derive(Clone)]
@@ -49,6 +51,7 @@ pub struct ConwayLife {
     cells: HashMap<(usize, usize), LifeCell>,
     pub rng: rand::prelude::ThreadRng,
     pub current_gen: u8,
+    generation_accumulator: f32,
 }
 
 impl LifeCell {
@@ -102,41 +105,66 @@ impl TerminalEffect for ConwayLife {
     }
 
     fn update(&mut self) {
-        let mut next_cells = HashMap::new();
+        self.advance(1.0 / 60.0);
+    }
 
-        // update current generation counter
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        self.advance(context.delta.as_secs_f32());
+    }
+
+    fn update_size(&mut self, width: u16, height: u16) {
+        self.screen_size = (width.max(1), height.max(1));
+        self.options.initial_cells = (self.screen_size.0 as f32
+            * self.screen_size.1 as f32
+            * 0.15
+            * self.options.cells_coeff) as u32;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.options.clone(), self.screen_size);
+    }
+}
+
+impl ConwayLife {
+    fn advance(&mut self, delta: f32) {
+        self.generation_accumulator += delta;
+        let step = 1.0 / self.options.generations_per_second.max(0.1);
+        let mut steps = 0;
+        while self.generation_accumulator >= step && steps < 4 {
+            self.generation_accumulator -= step;
+            self.step_generation();
+            steps += 1;
+        }
+        if steps == 4 {
+            self.generation_accumulator = 0.0;
+        }
+    }
+
+    fn step_generation(&mut self) {
+        let mut next_cells = HashMap::new();
         self.current_gen = (self.current_gen + 1) % 255;
 
         for (index, _) in self.buffer.iter().enumerate() {
             let neighbors = get_neighbors_by_index(&self.buffer, index);
             if neighbors.is_empty() {
                 continue;
-            };
+            }
             let (nx, ny) = self.buffer.pos_of(index);
             let alive_neighbors = neighbors.len();
 
             if let Some(cell) = self.cells.get_mut(&(nx, ny)) {
                 cell.update_color_and_char(&mut self.rng, self.current_gen);
-
-                // Survival: an alive cell with 2 or 3 alive neighbors stays alive
                 if alive_neighbors == 2 || alive_neighbors == 3 {
                     next_cells.insert((nx, ny), cell.clone());
                 }
-            } else {
-                // Birth: a dead cell with exactly 3 alive neighbors becomes alive
-                if alive_neighbors == 3 {
-                    let mut new_cell = LifeCell::new('*');
-                    new_cell.update_color_and_char(&mut self.rng, self.current_gen); // Initialize generation and update color/char
-                    next_cells.insert((nx, ny), new_cell);
-                    // Replace 'X' with the desired initial state
-                }
-                // TODO:  here should process state of dead cell
-            };
+            } else if alive_neighbors == 3 {
+                let mut new_cell = LifeCell::new('*');
+                new_cell.update_color_and_char(&mut self.rng, self.current_gen);
+                next_cells.insert((nx, ny), new_cell);
+            }
         }
 
-        // generate new cells, if cell already present, skip
         for _ in 0..9 {
-            // Inserting glider at a random position with random rotation
             let glider_size = 3;
             let x = self
                 .rng
@@ -150,17 +178,8 @@ impl TerminalEffect for ConwayLife {
         self.cells = next_cells;
     }
 
-    fn update_size(&mut self, width: u16, height: u16) {
-        self.screen_size = (width, height);
-    }
-
-    fn reset(&mut self) {
-        todo!();
-    }
-}
-
-impl ConwayLife {
     pub fn new(options: ConwayLifeOptions, screen_size: (u16, u16)) -> Self {
+        let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
         let mut rng = rand::rng();
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
 
@@ -180,6 +199,7 @@ impl ConwayLife {
             cells,
             rng,
             current_gen: 0,
+            generation_accumulator: 0.0,
         }
     }
 
@@ -324,5 +344,36 @@ mod tests {
 
         let res = get_neighbors_by_index(&buf, buf.index_of(0, 0));
         assert_eq!(res.len(), 1);
+    }
+
+    #[test]
+    fn reset_rebuilds_for_new_screen_size() {
+        let options = ConwayLifeOptionsBuilder::default()
+            .initial_cells(0u32)
+            .cells_coeff(0.0f32)
+            .build()
+            .unwrap();
+        let mut life = ConwayLife::new(options, (5, 4));
+
+        life.update_size(8, 6);
+        life.reset();
+
+        assert_eq!(life.screen_size, (8, 6));
+        assert_eq!(life.buffer.get_size(), (8, 6));
+        assert!(life.cells.is_empty());
+    }
+
+    #[test]
+    fn resize_recomputes_initial_cell_count() {
+        let options = ConwayLifeOptionsBuilder::default()
+            .initial_cells(0u32)
+            .cells_coeff(1.0f32)
+            .build()
+            .unwrap();
+        let mut life = ConwayLife::new(options, (20, 20));
+
+        life.update_size(10, 10);
+
+        assert_eq!(life.options.initial_cells, 15);
     }
 }

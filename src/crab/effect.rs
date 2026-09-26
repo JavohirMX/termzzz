@@ -78,7 +78,7 @@ pub struct CrabOptions {
     #[builder(default = "0.05")]
     pub clap_chance: f32, // Random chance for special animation
 
-    #[builder(default = "5.0")]
+    #[builder(default = "3.0")]
     pub movement_speed: f32,
 
     #[builder(default = "1.0")]
@@ -312,7 +312,10 @@ impl TerminalEffect for Crab {
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
-        self.screen_size = (width, height);
+        self.screen_size = (width.max(1), height.max(1));
+        let area = self.screen_size.0 as f32 * self.screen_size.1 as f32;
+        self.options.crab_count =
+            (area / 800.0 * self.options.crab_coeff).clamp(3.0, 15.0) as u16;
     }
 
     fn reset(&mut self) {
@@ -346,10 +349,12 @@ impl Crab {
             crabs.push(CrabEntity::new(position, velocity, &mut rng));
         }
 
-        // ensure crabs won't start to close to each other
         let min_distance_squared = 100.0; // Adjust based on crab size
         let mut i = 0;
-        while i < crabs.len() {
+        let mut attempts = 0;
+        let max_attempts = crabs.len().saturating_mul(64).max(1);
+        while i < crabs.len() && attempts < max_attempts {
+            attempts += 1;
             let mut repositioned = false;
 
             for j in 0..i {
@@ -358,7 +363,6 @@ impl Crab {
                 let distance_squared = dx * dx + dy * dy;
 
                 if distance_squared < min_distance_squared {
-                    // Reposition this crab
                     crabs[i].position.0 = rng.random_range(0.0..width * 0.8);
                     crabs[i].position.1 = rng.random_range(0.0..height * 0.8);
                     repositioned = true;
@@ -367,7 +371,7 @@ impl Crab {
             }
 
             if !repositioned {
-                i += 1; // Only advance if no repositioning was needed
+                i += 1;
             }
         }
 
@@ -447,5 +451,35 @@ impl DefaultOptions for Crab {
             .clap_chance(0.05)
             .build()
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_recomputes_crab_count() {
+        let options = CrabOptionsBuilder::default()
+            .crab_count(10u16)
+            .crab_coeff(1.0f32)
+            .build()
+            .unwrap();
+        let mut crab = Crab::new(options, (80, 40));
+
+        crab.update_size(10, 10);
+
+        assert_eq!(crab.screen_size, (10, 10));
+        assert_eq!(crab.options.crab_count, 3);
+    }
+
+    #[test]
+    fn new_terminates_at_minimum_size() {
+        let options = CrabOptionsBuilder::default()
+            .crab_count(3u16)
+            .build()
+            .unwrap();
+
+        let _ = Crab::new(options, (6, 6));
     }
 }

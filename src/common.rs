@@ -11,9 +11,56 @@ use std::{
 };
 
 pub const MIN_EFFECT_SIZE: u16 = 6;
+pub const MIN_SPEED: f32 = 0.05;
+pub const MAX_SPEED: f32 = 8.0;
+pub const SPEED_STEP: f32 = 0.1;
 
 pub fn normalize_effect_size(size: (u16, u16)) -> (u16, u16) {
     (size.0.max(MIN_EFFECT_SIZE), size.1.max(MIN_EFFECT_SIZE))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeOptions {
+    pub speed: f32,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self { speed: 1.0 }
+    }
+}
+
+impl RuntimeOptions {
+    pub fn new(speed: f32) -> Self {
+        Self {
+            speed: speed.clamp(MIN_SPEED, MAX_SPEED),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TickClock {
+    accumulator: f32,
+}
+
+impl TickClock {
+    pub const QUANTUM: f32 = 1.0 / 60.0;
+    pub const MAX_STEPS: usize = 4;
+
+    pub fn advance(&mut self, delta: Duration, speed: f32) -> usize {
+        self.accumulator += delta.as_secs_f32() * speed.clamp(MIN_SPEED, MAX_SPEED);
+        let mut steps = 0;
+        while self.accumulator + f32::EPSILON >= Self::QUANTUM
+            && steps < Self::MAX_STEPS
+        {
+            self.accumulator -= Self::QUANTUM;
+            steps += 1;
+        }
+        if steps == Self::MAX_STEPS {
+            self.accumulator = 0.0;
+        }
+        steps
+    }
 }
 
 pub trait DefaultOptions {
@@ -50,7 +97,8 @@ where
     let mut input = InputState::default();
     input.set_size(size);
     let mut source = CrosstermInput;
-    process_runtime_events(effect, &mut source, &mut input, &mut size)
+    let mut speed = 1.0;
+    process_runtime_events(effect, &mut source, &mut input, &mut size, &mut speed)
 }
 
 pub fn run_loop<W, TE>(
@@ -64,6 +112,28 @@ where
 {
     let mut source = CrosstermInput;
     run_loop_with_source(stdout, effect, iterations, &mut source)
+}
+
+pub fn run_loop_with_options<W, TE>(
+    stdout: &mut W,
+    effect: &mut TE,
+    iterations: Option<usize>,
+    options: RuntimeOptions,
+) -> Result<f64>
+where
+    W: Write,
+    TE: TerminalEffect,
+{
+    let mut source = CrosstermInput;
+    let size = terminal::size()?;
+    run_loop_with_source_and_size_and_options(
+        stdout,
+        effect,
+        iterations,
+        &mut source,
+        size,
+        options,
+    )
 }
 
 pub fn run_loop_with_source<W, TE, S>(
@@ -99,6 +169,7 @@ where
         iterations,
         source,
         initial_size,
+        RuntimeOptions::default(),
     )
 }
 
@@ -108,6 +179,7 @@ pub fn run_loop_with_source_and_size_and_options<W, TE, S>(
     iterations: Option<usize>,
     source: &mut S,
     initial_size: (u16, u16),
+    options: RuntimeOptions,
 ) -> Result<f64>
 where
     W: Write,
@@ -131,6 +203,8 @@ where
     let mut frame = 0u64;
     let mut is_running = true;
     let mut frames_per_second = 0.0;
+    let mut speed = options.speed.clamp(MIN_SPEED, MAX_SPEED);
+    let mut tick_clock = TickClock::default();
     let target_frame_duration = Duration::from_secs_f64(1.0 / 60.0);
     let mut buffered_stdout = BufWriter::new(stdout);
 
@@ -143,7 +217,9 @@ where
         previous_frame = frame_started_at;
         input.begin_frame();
 
-        if !process_runtime_events(effect, source, &mut input, &mut size)? {
+        if !process_runtime_events(
+            effect, source, &mut input, &mut size, &mut speed,
+        )? {
             break;
         }
 
@@ -160,7 +236,16 @@ where
         }
         buffered_stdout.flush()?;
 
-        effect.update_with_context(&context);
+        if (speed - 1.0).abs() < f32::EPSILON {
+            effect.update_with_context(&context);
+        } else {
+            let steps = tick_clock.advance(delta, speed);
+            let mut tick_context = context.clone();
+            tick_context.delta = Duration::from_secs_f64(TickClock::QUANTUM as f64);
+            for _ in 0..steps {
+                effect.update_with_context(&tick_context);
+            }
+        }
 
         let frame_duration = frame_started_at.elapsed();
         if frame_duration < target_frame_duration {
@@ -185,6 +270,7 @@ fn process_runtime_events<TE, S>(
     source: &mut S,
     input: &mut InputState,
     size: &mut (u16, u16),
+    speed: &mut f32,
 ) -> Result<bool>
 where
     TE: TerminalEffect,
@@ -212,6 +298,21 @@ where
             continue;
         }
         input.apply(event);
+        if let InputEvent::Key { key, phase } = event
+            && matches!(phase, KeyPhase::Pressed | KeyPhase::Repeated)
+        {
+            match key {
+                Key::Char('+') | Key::Char('=') => {
+                    *speed = (*speed + SPEED_STEP).min(MAX_SPEED);
+                    continue;
+                }
+                Key::Char('-') => {
+                    *speed = (*speed - SPEED_STEP).max(MIN_SPEED);
+                    continue;
+                }
+                _ => {}
+            }
+        }
         if !matches!(event, InputEvent::Ignored) {
             effect.handle_input(&event);
         }

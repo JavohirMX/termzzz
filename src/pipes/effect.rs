@@ -32,7 +32,7 @@ pub struct PipesOptions {
     pub turn_probability: f64,
     #[builder(default = "2")]
     pub line_type: usize,
-    #[builder(default = "5")]
+    #[builder(default = "3")]
     pub num_lines: usize,
     #[builder(default = "0.3")]
     pub pipe_type_change: f64,

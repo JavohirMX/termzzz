@@ -3,7 +3,7 @@ use crate::common::{DefaultOptions, TerminalEffect};
 use crossterm::style;
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::time::Duration;
 
 /// Represents a 3D point in space
 #[derive(Clone, Copy, Debug)]
@@ -31,11 +31,11 @@ struct Edge {
 pub struct CubeOptions {
     #[builder(default = "1.0")]
     pub cube_size: f32,
-    #[builder(default = "0.6")]
+    #[builder(default = "0.25")]
     pub rotation_speed_x: f32,
-    #[builder(default = "0.8")]
+    #[builder(default = "0.35")]
     pub rotation_speed_y: f32,
-    #[builder(default = "0.4")]
+    #[builder(default = "0.18")]
     pub rotation_speed_z: f32,
     #[builder(default = "3.5")]
     pub distance: f32,
@@ -50,7 +50,7 @@ pub struct Cube {
     vertices: Vec<Point3D>,
     edges: Vec<Edge>,
     rotation: (f32, f32, f32),
-    start_time: Instant,
+    simulation_time: Duration,
 }
 
 impl TerminalEffect for Cube {
@@ -78,11 +78,13 @@ impl TerminalEffect for Cube {
     }
 
     fn update(&mut self) {
-        // Update rotation based on elapsed time
-        let elapsed = self.start_time.elapsed().as_secs_f32();
-        self.rotation.0 = elapsed * self.options.rotation_speed_x;
-        self.rotation.1 = elapsed * self.options.rotation_speed_y;
-        self.rotation.2 = elapsed * self.options.rotation_speed_z;
+        self.simulation_time += Duration::from_secs_f64(1.0 / 60.0);
+        self.update_rotation();
+    }
+
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        self.simulation_time += context.delta;
+        self.update_rotation();
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -95,6 +97,13 @@ impl TerminalEffect for Cube {
 }
 
 impl Cube {
+    fn update_rotation(&mut self) {
+        let elapsed = self.simulation_time.as_secs_f32();
+        self.rotation.0 = elapsed * self.options.rotation_speed_x;
+        self.rotation.1 = elapsed * self.options.rotation_speed_y;
+        self.rotation.2 = elapsed * self.options.rotation_speed_z;
+    }
+
     pub fn new(options: CubeOptions, screen_size: (u16, u16)) -> Self {
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
 
@@ -169,7 +178,7 @@ impl Cube {
             vertices,
             edges,
             rotation: (0.0, 0.0, 0.0),
-            start_time: Instant::now(),
+            simulation_time: Duration::ZERO,
         }
     }
 

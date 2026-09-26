@@ -15,6 +15,7 @@ struct AppArgs {
     check: bool,
     effect: Option<String>,
     frames: Option<usize>,
+    speed: Option<f32>,
     playlist: Option<Vec<String>>,
     shuffle: bool,
     transition: Option<f32>,
@@ -52,14 +53,14 @@ impl TerminalGuard {
         })
     }
 
-    fn enable_mouse(&mut self) -> io::Result<()> {
-        self.mouse_capture = true;
-        execute!(self.stdout, crossterm::event::EnableMouseCapture)
-    }
-
     // Get mutable access to the stdout
     fn get_stdout(&mut self) -> &mut io::Stdout {
         &mut self.stdout
+    }
+
+    fn enable_mouse(&mut self) -> io::Result<()> {
+        self.mouse_capture = true;
+        execute!(self.stdout, crossterm::event::EnableMouseCapture)
     }
 }
 
@@ -90,13 +91,16 @@ fn main() -> Result<(), error::TermzzzError> {
     };
 
     let (config, config_status) = Config::load()?;
+    let speed = args
+        .speed
+        .unwrap_or(config.global.speed)
+        .clamp(common::MIN_SPEED, common::MAX_SPEED);
 
     if args.check {
         let effect = check_effect(&args);
         let frames = args.frames.unwrap_or(1);
-        return check::run_test_for_effect(&effect, frames, &config);
+        return check::run_test_for_effect(&effect, frames, &config, speed);
     }
-    let size = common::normalize_effect_size(terminal::size()?);
 
     if args.playlist.is_some() || args.shuffle {
         let mut options = config.get_playlist_options();
@@ -124,13 +128,20 @@ fn main() -> Result<(), error::TermzzzError> {
 
         let fps = {
             let mut guard = TerminalGuard::new()?;
-            let mut effect = Playlist::new(options, config.clone(), size);
+            let (width, height) = common::normalize_effect_size(terminal::size()?);
+            let mut effect =
+                Playlist::new(options, config.clone(), (width, height));
 
             if needs_mouse && let Err(error) = guard.enable_mouse() {
                 eprintln!("Mouse capture unavailable: {}", error);
             }
 
-            common::run_loop(guard.get_stdout(), &mut effect, None)?
+            common::run_loop_with_options(
+                guard.get_stdout(),
+                &mut effect,
+                None,
+                common::RuntimeOptions::new(speed),
+            )?
         };
 
         println!("{}", config_status);
@@ -149,7 +160,8 @@ fn main() -> Result<(), error::TermzzzError> {
 
     let fps = {
         let mut guard = TerminalGuard::new()?;
-        let mut effect = AnyEffect::build(effect_id, &config, size);
+        let (width, height) = common::normalize_effect_size(terminal::size()?);
+        let mut effect = AnyEffect::build(effect_id, &config, (width, height));
 
         if effect_id.needs_mouse()
             && let Err(error) = guard.enable_mouse()
@@ -157,7 +169,12 @@ fn main() -> Result<(), error::TermzzzError> {
             eprintln!("Mouse capture unavailable: {}", error);
         }
 
-        common::run_loop(guard.get_stdout(), &mut effect, None)?
+        common::run_loop_with_options(
+            guard.get_stdout(),
+            &mut effect,
+            None,
+            common::RuntimeOptions::new(speed),
+        )?
     };
 
     println!("{}", config_status);
@@ -184,6 +201,7 @@ where
     let mut effect = None;
     let mut effect_explicit = false;
     let mut frames = None;
+    let mut speed = None;
     let mut playlist = None;
     let mut shuffle = false;
     let mut transition = None;
@@ -216,6 +234,24 @@ where
                 if let Some(frame_str) = args.next() {
                     frames = frame_str.parse().ok();
                 }
+            }
+            "--speed" => {
+                let speed_str = args
+                    .next()
+                    .ok_or_else(|| "--speed requires a value".to_string())?;
+                let value = speed_str
+                    .parse::<f32>()
+                    .map_err(|_| "--speed must be a number".to_string())?;
+                if !value.is_finite()
+                    || !(common::MIN_SPEED..=common::MAX_SPEED).contains(&value)
+                {
+                    return Err(format!(
+                        "--speed must be between {} and {}",
+                        common::MIN_SPEED,
+                        common::MAX_SPEED
+                    ));
+                }
+                speed = Some(value);
             }
             "--playlist" => {
                 let value = args.next().ok_or_else(|| {
@@ -269,6 +305,7 @@ where
         check,
         effect,
         frames,
+        speed,
         playlist,
         shuffle,
         transition,
@@ -292,6 +329,7 @@ fn print_help() {
     println!("        --check             Run test mode");
     println!("        --effect <EFFECT>    Effect to test (with --check)");
     println!("        --frames <NUM>       Number of frames to run (with --check)");
+    println!("        --speed <MULT>       Global speed multiplier (default 1.0)");
     println!("        --playlist <LIST>    Play effects in order, comma separated");
     println!("        --shuffle            Play the playlist in random order");
     println!("        --transition <SECS>  Seconds of blank wipe between effects");
@@ -304,9 +342,11 @@ fn print_help() {
     );
     println!();
     println!("EXAMPLES:");
+    println!("    termzzz matrix            Run Matrix effect");
     println!("    termzzz --check            Test with default effect");
     println!("    termzzz --check life       Test Life effect");
     println!("    termzzz --check --frames 100 life");
+    println!("    termzzz plasma --speed 0.5");
     println!("    termzzz --playlist matrix,dvd,plasma");
     println!("    termzzz --shuffle");
     println!("    termzzz --print-config > ~/.config/termzzz.toml");
@@ -320,6 +360,48 @@ fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_mode_uses_positional_effect() {
+        let args = parse_args_from(
+            ["boids".to_string(), "--check".to_string()].into_iter(),
+        )
+        .unwrap();
+
+        assert!(args.check);
+        assert_eq!(check_effect(&args), "boids");
+    }
+
+    #[test]
+    fn explicit_check_effect_takes_precedence() {
+        let args = parse_args_from(
+            [
+                "--check".to_string(),
+                "--effect".to_string(),
+                "life".to_string(),
+                "boids".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(check_effect(&args), "life");
+    }
+
+    #[test]
+    fn parses_speed_override() {
+        let args = parse_args_from(
+            [
+                "--speed".to_string(),
+                "0.5".to_string(),
+                "ascii".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(args.speed, Some(0.5));
+    }
 
     #[test]
     fn parses_playlist_list() {
@@ -382,29 +464,14 @@ mod tests {
     }
 
     #[test]
-    fn check_mode_uses_positional_effect() {
-        let args = parse_args_from(
-            ["boids".to_string(), "--check".to_string()].into_iter(),
-        )
-        .unwrap();
-
-        assert!(args.check);
-        assert_eq!(check_effect(&args), "boids");
-    }
-
-    #[test]
-    fn explicit_check_effect_takes_precedence() {
-        let args = parse_args_from(
-            [
-                "--check".to_string(),
-                "--effect".to_string(),
-                "life".to_string(),
-                "boids".to_string(),
-            ]
-            .into_iter(),
-        )
-        .unwrap();
-
-        assert_eq!(check_effect(&args), "life");
+    fn speed_must_stay_in_range() {
+        assert!(
+            parse_args_from(["--speed".to_string(), "99".to_string()].into_iter())
+                .is_err()
+        );
+        assert!(
+            parse_args_from(["--speed".to_string(), "0".to_string()].into_iter())
+                .is_err()
+        );
     }
 }

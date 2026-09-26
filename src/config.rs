@@ -43,7 +43,21 @@ fn config_path() -> PathBuf {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlobalOptions {
+    pub speed: f32,
+}
+
+impl Default for GlobalOptions {
+    fn default() -> Self {
+        Self { speed: 1.0 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub global: GlobalOptions,
     #[serde(default)]
     pub matrix: DigitalRainOptions,
     #[serde(default)]
@@ -107,6 +121,10 @@ impl Config {
 }
 
 impl Config {
+    pub fn get_global_options(&self) -> GlobalOptions {
+        self.global.clone()
+    }
+
     pub fn get_matrix_options(
         &self,
         screen_size: (u16, u16),
@@ -149,6 +167,10 @@ impl Config {
         options
     }
 
+    pub fn get_ascii_options(&self) -> AsciiFieldOptions {
+        self.ascii.clone()
+    }
+
     pub fn get_blank_options(&self) -> BlankOptions {
         self.blank.clone()
     }
@@ -170,6 +192,10 @@ impl Config {
         let min_dim = screen_size.0.min(screen_size.1) as f32;
         options.k1 = min_dim * 0.8 * options.k1_coeff;
         options
+    }
+
+    pub fn get_dvd_options(&self) -> DvdOptions {
+        self.dvd.clone()
     }
 
     pub fn get_pipes_options(&self) -> PipesOptions {
@@ -195,19 +221,12 @@ impl Config {
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
     }
-
-    pub fn get_dvd_options(&self) -> DvdOptions {
-        self.dvd.clone()
-    }
-
-    pub fn get_ascii_options(&self) -> AsciiFieldOptions {
-        self.ascii.clone()
-    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
+            global: GlobalOptions::default(),
             matrix: DigitalRainOptionsBuilder::default().build().unwrap(),
             life: ConwayLifeOptionsBuilder::default().build().unwrap(),
             maze: MazeOptionsBuilder::default().build().unwrap(),
@@ -218,15 +237,15 @@ impl Default for Config {
             crab: CrabOptionsBuilder::default().build().unwrap(),
             donut: DonutOptionsBuilder::default().build().unwrap(),
             dvd: DvdOptionsBuilder::default().build().unwrap(),
-            playlist: PlaylistOptionsBuilder::default()
-                .transition(0.6_f32)
-                .build()
-                .unwrap(),
             pipes: PipesOptionsBuilder::default().build().unwrap(),
             plasma: PlasmaOptionsBuilder::default().build().unwrap(),
             fire: FireOptionsBuilder::default().build().unwrap(),
             terrain: TerrainOptionsBuilder::default().build().unwrap(),
             constellation: ConstellationOptionsBuilder::default().build().unwrap(),
+            playlist: PlaylistOptionsBuilder::default()
+                .transition(0.6_f32)
+                .build()
+                .unwrap(),
         }
     }
 }

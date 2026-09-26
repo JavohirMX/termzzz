@@ -74,9 +74,9 @@ pub struct BoidsOptions {
     #[builder(default = "1.8")]
     border_factor: f32, // How strongly to avoid borders
 
-    #[builder(default = "1.8")]
+    #[builder(default = "0.6")]
     max_speed: f32,
-    #[builder(default = "0.2")]
+    #[builder(default = "0.08")]
     min_speed: f32,
 
     #[builder(default)]
@@ -157,7 +157,11 @@ impl TerminalEffect for Boids {
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
-        self.options.screen_size = (width, height);
+        self.options.screen_size = (width.max(1), height.max(1));
+        let area =
+            self.options.screen_size.0 as f32 * self.options.screen_size.1 as f32;
+        self.options.boid_count =
+            ((area * 0.5 * self.options.boid_coeff) as u16).clamp(50, 300);
     }
 
     fn reset(&mut self) {
@@ -451,5 +455,26 @@ impl DefaultOptions for Boids {
             .boid_count(boid_count.clamp(50, 300))
             .build()
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_recomputes_boid_count() {
+        let options = BoidsOptionsBuilder::default()
+            .screen_size((80u16, 40u16))
+            .boid_count(10u16)
+            .boid_coeff(1.0f32)
+            .build()
+            .unwrap();
+        let mut boids = Boids::new(options);
+
+        boids.update_size(10, 10);
+
+        assert_eq!(boids.options.screen_size, (10, 10));
+        assert_eq!(boids.options.boid_count, 50);
     }
 }

@@ -8,11 +8,11 @@ use std::f64::consts::PI;
 #[derive(Builder, Default, Debug, Clone, Serialize, Deserialize)]
 #[builder(public, setter(into))]
 pub struct PlasmaOptions {
-    #[builder(default = "1.0")]
+    #[builder(default = "0.5")]
     pub time_scale: f64,
     #[builder(default = "1.0")]
     pub spatial_scale: f64,
-    #[builder(default = "150.0")]
+    #[builder(default = "20.0")]
     pub color_speed: f64,
 }
 

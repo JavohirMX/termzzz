@@ -81,12 +81,17 @@ impl Drop for CheckTerminal {
 /// let mut effect = DigitalRain::new(options);
 /// test_effect(&mut effect, 100)?;
 /// ```
-pub fn test_effect<T: TerminalEffect>(effect: &mut T, frames: usize) -> Result<()> {
+pub fn test_effect<T: TerminalEffect>(
+    effect: &mut T,
+    frames: usize,
+    speed: f32,
+) -> Result<()> {
     let mut terminal = CheckTerminal::new()?;
     let size = crate::common::normalize_effect_size(terminal::size()?);
     let mut input = InputState::default();
     input.set_size(size);
-    let delta = Duration::from_secs_f64(1.0 / 60.0);
+    let speed = speed.clamp(crate::common::MIN_SPEED, crate::common::MAX_SPEED);
+    let delta = Duration::from_secs_f64(1.0 / 60.0 * speed as f64);
 
     for frame in 1..=frames {
         let context =
@@ -129,11 +134,12 @@ pub fn run_test_for_effect(
     effect_name: &str,
     frames: usize,
     config: &crate::config::Config,
+    speed: f32,
 ) -> Result<()> {
     let effect_id = effect_name
         .parse::<crate::registry::EffectId>()
         .map_err(crate::error::TermzzzError::UnsupportedEffect)?;
     let size = crate::common::normalize_effect_size(terminal::size()?);
     let mut effect = crate::registry::AnyEffect::build(effect_id, config, size);
-    test_effect(&mut effect, frames)
+    test_effect(&mut effect, frames, speed)
 }
