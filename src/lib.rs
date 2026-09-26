@@ -9,7 +9,7 @@
 //! | `buffer` | Terminal cell buffer for colored output  |
 //! | `check`  | Terminal event checking (input, resize)  |
 //! | `common` | Shared traits and types (TerminalEffect) |
-//! | `config` | CLI configuration and argument parsing   |
+//! | `config` | TOML configuration loading and options     |
 //! | `constellation` | Drifting stars and dotted connections |
 //! | `crab`   | ASCII crab walking animation             |
 //! | `cube`   | 3D rotating cube in ASCII                |
@@ -21,6 +21,7 @@
 //! | `pipes`  | Pipe maze animation                      |
 //! | `plasma` | Plasma color wave effect                 |
 //! | `rain`   | Matrix-style digital rain                |
+//! | `runtime`| Runtime input and frame context          |
 //! | `terrain`| Terrain generation — scrolling landscape |
 
 pub mod blank;
@@ -40,4 +41,5 @@ pub mod maze;
 pub mod pipes;
 pub mod plasma;
 pub mod rain;
+pub mod runtime;
 pub mod terrain;

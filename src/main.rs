@@ -1,42 +1,12 @@
-#![cfg(not(test))]
 use crossterm::{self, cursor, execute, terminal};
 use std::{io, process};
 
-mod blank;
-mod boids;
-mod buffer;
-mod check;
-mod common;
-mod config;
-mod constellation;
-mod crab;
-mod cube;
-mod donut;
-mod error;
-mod fire;
-mod life;
-mod maze;
-mod pipes;
-mod plasma;
-mod rain;
-mod terrain;
-
-use crate::config::Config;
-
-const VALID_SAVERS: &[&str] = &[
-    "matrix",
-    "life",
-    "maze",
-    "boids",
-    "blank",
-    "cube",
-    "crab",
-    "donut",
-    "pipes",
-    "plasma",
-    "fire",
-    "constellation",
-];
+use termzzz::{
+    blank::Blank, boids::Boids, check, common, config::Config,
+    constellation::Constellation, crab::Crab, cube::Cube, donut::Donut, error,
+    fire::Fire, life::ConwayLife, maze::Maze, pipes::Pipes, plasma::Plasma,
+    rain::digital_rain::DigitalRain, terrain::Terrain,
+};
 
 #[derive(Debug)]
 struct AppArgs {
@@ -55,12 +25,21 @@ impl TerminalGuard {
     fn new() -> Result<Self, io::Error> {
         let mut stdout = io::stdout();
         terminal::enable_raw_mode()?;
-        execute!(
+        if let Err(error) = execute!(
             stdout,
             terminal::EnterAlternateScreen,
             cursor::Hide,
             terminal::Clear(terminal::ClearType::All)
-        )?;
+        ) {
+            let _ = execute!(
+                stdout,
+                cursor::Show,
+                terminal::Clear(terminal::ClearType::All),
+                terminal::LeaveAlternateScreen,
+            );
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
+        }
 
         Ok(Self { stdout })
     }
@@ -73,7 +52,6 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Ignore errors during drop - we're doing best effort cleanup
         let _ = execute!(
             self.stdout,
             cursor::Show,
@@ -96,100 +74,19 @@ fn main() -> Result<(), error::TermzzzError> {
     };
 
     if args.check {
-        let effect = args.effect.unwrap_or_else(|| "matrix".to_string());
+        let effect = check_effect(&args);
         let frames = args.frames.unwrap_or(1);
         return check::run_test_for_effect(&effect, frames);
     }
 
-    // Check if valid before entering alternate screen
-    if !VALID_SAVERS.contains(&args.screen_saver.as_str()) {
-        println!("Unknown screen saver: {}", args.screen_saver);
-        print_help();
-        return Ok(());
-    }
-
     let (config, config_status) = Config::load()?;
+    let size = common::normalize_effect_size(terminal::size()?);
 
     let fps = {
         let mut guard = TerminalGuard::new()?;
-        let (width, height) = terminal::size()?;
+        let mut effect = build_effect(&args.screen_saver, &config, size)?;
 
-        match args.screen_saver.as_str() {
-            "matrix" => {
-                let options = config.get_matrix_options((width, height));
-                let mut digital_rain =
-                    rain::digital_rain::DigitalRain::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut digital_rain, None)?
-            }
-            "life" => {
-                let options = config.get_life_options((width, height));
-                let mut conway_life =
-                    life::ConwayLife::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut conway_life, None)?
-            }
-            "maze" => {
-                let options = config.get_maze_options((width, height));
-                let mut maze = maze::Maze::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut maze, None)?
-            }
-            "boids" => {
-                let options = config.get_boids_options((width, height));
-                let mut boids = boids::Boids::new(options);
-                common::run_loop(guard.get_stdout(), &mut boids, None)?
-            }
-            "blank" => {
-                let options = config.get_blank_options();
-                let mut blank = blank::Blank::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut blank, None)?
-            }
-            "cube" => {
-                let options = config.get_cube_options();
-                let mut cube = cube::Cube::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut cube, None)?
-            }
-            "crab" => {
-                let options = config.get_crab_options((width, height));
-                let mut crab = crab::Crab::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut crab, None)?
-            }
-            "donut" => {
-                let options = config.get_donut_options((width, height));
-                let mut donut = donut::Donut::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut donut, None)?
-            }
-            "pipes" => {
-                let options = config.get_pipes_options();
-                let mut pipes = pipes::Pipes::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut pipes, None)?
-            }
-            "plasma" => {
-                let options = config.get_plasma_options();
-                let mut plasma = plasma::Plasma::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut plasma, None)?
-            }
-            "fire" => {
-                let options = config.get_fire_options();
-                let mut fire = fire::Fire::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut fire, None)?
-            }
-            "constellation" => {
-                let options = config.get_constellation_options();
-                let mut constellation =
-                    constellation::Constellation::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut constellation, None)?
-            }
-            "terrain" => {
-                let options = config.get_terrain_options();
-                let mut terrain = terrain::Terrain::new(options, (width, height));
-                common::run_loop(guard.get_stdout(), &mut terrain, None)?
-            }
-            _ => {
-                println!(
-                    "Pick screensaver: [matrix, life, maze, boids, cube, crab, donut]"
-                );
-                0.0
-            }
-        }
+        common::run_loop(guard.get_stdout(), &mut effect, None)?
     };
 
     println!("{}", config_status);
@@ -197,11 +94,117 @@ fn main() -> Result<(), error::TermzzzError> {
     Ok(())
 }
 
+enum AnyEffect {
+    Matrix(DigitalRain),
+    Life(ConwayLife),
+    Maze(Maze),
+    Boids(Boids),
+    Blank(Blank),
+    Cube(Cube),
+    Crab(Crab),
+    Donut(Donut),
+    Pipes(Pipes),
+    Plasma(Plasma),
+    Fire(Fire),
+    Constellation(Constellation),
+    Terrain(Terrain),
+}
+
+fn build_effect(
+    name: &str,
+    config: &Config,
+    size: (u16, u16),
+) -> Result<AnyEffect, error::TermzzzError> {
+    let unknown = || error::TermzzzError::UnsupportedEffect(name.to_string());
+
+    Ok(match name {
+        "matrix" => AnyEffect::Matrix(DigitalRain::new(
+            config.get_matrix_options(size),
+            size,
+        )),
+        "life" => {
+            AnyEffect::Life(ConwayLife::new(config.get_life_options(size), size))
+        }
+        "maze" => AnyEffect::Maze(Maze::new(config.get_maze_options(size), size)),
+        "boids" => AnyEffect::Boids(Boids::new(config.get_boids_options(size))),
+        "blank" => AnyEffect::Blank(Blank::new(config.get_blank_options(), size)),
+        "cube" => AnyEffect::Cube(Cube::new(config.get_cube_options(), size)),
+        "crab" => AnyEffect::Crab(Crab::new(config.get_crab_options(size), size)),
+        "donut" => {
+            AnyEffect::Donut(Donut::new(config.get_donut_options(size), size))
+        }
+        "pipes" => AnyEffect::Pipes(Pipes::new(config.get_pipes_options(), size)),
+        "plasma" => {
+            AnyEffect::Plasma(Plasma::new(config.get_plasma_options(), size))
+        }
+        "fire" => AnyEffect::Fire(Fire::new(config.get_fire_options(), size)),
+        "constellation" => AnyEffect::Constellation(Constellation::new(
+            config.get_constellation_options(),
+            size,
+        )),
+        "terrain" => {
+            AnyEffect::Terrain(Terrain::new(config.get_terrain_options(), size))
+        }
+        _ => return Err(unknown()),
+    })
+}
+
+macro_rules! dispatch {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            AnyEffect::Matrix(effect) => effect.$method($($arg),*),
+            AnyEffect::Life(effect) => effect.$method($($arg),*),
+            AnyEffect::Maze(effect) => effect.$method($($arg),*),
+            AnyEffect::Boids(effect) => effect.$method($($arg),*),
+            AnyEffect::Blank(effect) => effect.$method($($arg),*),
+            AnyEffect::Cube(effect) => effect.$method($($arg),*),
+            AnyEffect::Crab(effect) => effect.$method($($arg),*),
+            AnyEffect::Donut(effect) => effect.$method($($arg),*),
+            AnyEffect::Pipes(effect) => effect.$method($($arg),*),
+            AnyEffect::Plasma(effect) => effect.$method($($arg),*),
+            AnyEffect::Fire(effect) => effect.$method($($arg),*),
+            AnyEffect::Constellation(effect) => effect.$method($($arg),*),
+            AnyEffect::Terrain(effect) => effect.$method($($arg),*),
+        }
+    };
+}
+
+impl common::TerminalEffect for AnyEffect {
+    fn get_diff(&mut self) -> Vec<(usize, usize, termzzz::buffer::Cell)> {
+        dispatch!(self, get_diff)
+    }
+
+    fn update(&mut self) {
+        dispatch!(self, update)
+    }
+
+    fn update_size(&mut self, width: u16, height: u16) {
+        dispatch!(self, update_size, width, height)
+    }
+
+    fn reset(&mut self) {
+        dispatch!(self, reset)
+    }
+}
+
+fn check_effect(args: &AppArgs) -> String {
+    args.effect
+        .clone()
+        .unwrap_or_else(|| args.screen_saver.clone())
+}
+
 fn parse_args() -> Result<AppArgs, String> {
-    let mut args = std::env::args().skip(1);
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I>(mut args: I) -> Result<AppArgs, String>
+where
+    I: Iterator<Item = String>,
+{
     let mut screen_saver = "matrix".to_string();
     let mut check = false;
     let mut effect = None;
+    let mut effect_explicit = false;
     let mut frames = None;
 
     while let Some(arg) = args.next() {
@@ -226,6 +229,7 @@ fn parse_args() -> Result<AppArgs, String> {
             }
             "--effect" => {
                 effect = args.next();
+                effect_explicit = true;
             }
             "--frames" => {
                 if let Some(frame_str) = args.next() {
@@ -233,9 +237,9 @@ fn parse_args() -> Result<AppArgs, String> {
                 }
             }
             arg if !arg.starts_with('-') => {
-                if check {
+                if check && !effect_explicit {
                     effect = Some(arg.to_string());
-                } else {
+                } else if !check {
                     screen_saver = arg.to_string();
                 }
             }
@@ -258,21 +262,6 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("    termzzz [EFFECT] [OPTIONS]");
-    println!();
-    println!("EFFECTS:");
-    println!("    matrix      Matrix digital rain");
-    println!("    life        Conway's Game of Life");
-    println!("    maze        Maze generation");
-    println!("    boids       Boids flocking simulation");
-    println!("    cube        3D cube rotation");
-    println!("    crab        ASCII crab animation");
-    println!("    donut       3D donut rotation");
-    println!("    pipes       Pipe maze animation");
-    println!("    plasma      Plasma effect");
-    println!("    fire        Fire simulation");
-    println!("    terrain     Terrain generation");
-    println!("    constellation  Drifting stars and dotted connections");
-    println!("    blank       Blank screen");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help              Show help");
@@ -299,4 +288,41 @@ fn print_help() {
 
 fn print_version() {
     println!("termzzz {}", env!("CARGO_PKG_VERSION"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_mode_uses_positional_effect() {
+        let args = parse_args_from(
+            ["boids".to_string(), "--check".to_string()].into_iter(),
+        )
+        .unwrap();
+
+        assert!(args.check);
+        assert_eq!(check_effect(&args), "boids");
+    }
+
+    #[test]
+    fn explicit_check_effect_takes_precedence() {
+        let args = parse_args_from(
+            [
+                "--check".to_string(),
+                "--effect".to_string(),
+                "life".to_string(),
+                "boids".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(check_effect(&args), "life");
+    }
+
+    #[test]
+    fn build_effect_rejects_unknown_names() {
+        assert!(build_effect("nope", &Config::default(), (20, 10)).is_err());
+    }
 }
