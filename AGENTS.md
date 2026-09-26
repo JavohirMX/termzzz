@@ -65,9 +65,15 @@ repository and the distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **Swapping the running effect from a keypress.** The frame loop now takes
-   `&mut dyn TerminalEffect`, so this needs no new plumbing — only a key binding
-   and a rebuild. Reuse the playlist's diagonal wipe for the transition.
+1. **More effects on the sub-cell renderer.** `starfield` and `flow` want
+   braille (line art, one colour per cell); `physarum` and a Gray-Scott
+   reaction-diffusion want half-block (smooth colour). Each is roughly 150-350
+   lines now that the renderer exists.
+
+Effect switching is done: `n` and `p` walk the catalogue behind a diagonal wipe,
+via `EffectHost` and the `FrameTarget` seam in the frame loop. Note the mouse
+decision recorded in `main.rs` -- capture is enabled for the whole session
+because `n` can bring up the ASCII field at any moment.
 
 Two smaller things, both optional:
 

@@ -130,6 +130,10 @@ All notable changes to this project will be documented in this file.
   stable Bayer offset; `palette` holds the colour ramps effects share
 
 ### Added
+- `n` and `p` move to the next and previous effect without leaving the session,
+  behind the same diagonal wipe the playlist uses. `EffectHost` owns the running
+  effect, the cycle order and the transition; `FrameTarget` is the seam that lets
+  one frame loop serve both a swappable effect and a fixed one
 - `mandelbrot`, an escape-time renderer for the Mandelbrot set that zooms
   continuously into the boundary and re-picks its coastline by seeded rejection
   sampling when it gets too deep to resolve. Drawn with half-blocks, so the

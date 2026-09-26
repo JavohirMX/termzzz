@@ -5,8 +5,9 @@ use termzzz::{
     check, common,
     config::Config,
     error,
+    host::EffectHost,
     playlist::{Playlist, PlaylistEntry},
-    registry::{AnyEffect, EffectId},
+    registry::EffectId,
     session::{TerminalSession, install_panic_hook},
 };
 
@@ -123,17 +124,21 @@ fn main() -> Result<(), error::TermzzzError> {
     let fps = {
         let mut session = TerminalSession::enter()?;
         let (width, height) = common::normalize_effect_size(terminal::size()?);
-        let mut effect = AnyEffect::build(effect_id, &config, (width, height));
+        let mut host = EffectHost::new(effect_id, config.clone(), (width, height));
 
-        if effect_id.needs_mouse()
+        // Mouse capture is enabled for the whole session, not just the effect
+        // that happens to be running: `n` can bring up the ASCII field at any
+        // moment, and toggling capture mid-session would leave the terminal
+        // reporting motion the effect never asked for.
+        if EffectId::all().any(|id| id.needs_mouse())
             && let Err(error) = session.enable_mouse()
         {
             eprintln!("Mouse capture unavailable: {}", error);
         }
 
-        common::run_loop_with_options(
+        common::run_loop_with_target(
             session.stdout(),
-            &mut effect,
+            &mut host,
             None,
             common::RuntimeOptions::new(speed),
         )?
@@ -310,6 +315,11 @@ fn print_help() {
     println!("        --shuffle            Play the playlist in random order");
     println!("        --transition <SECS>  Seconds of blank wipe between effects");
     println!("        --print-config       Print default config as TOML to stdout");
+    println!();
+    println!("KEYS:");
+    println!("    q, Esc, Ctrl+C        Quit");
+    println!("    + / -                 Global animation speed");
+    println!("    n / p                 Next / previous effect, behind a wipe");
     println!();
     println!("CONFIG:");
     println!("    Config file (optional): ~/.config/termzzz.toml");

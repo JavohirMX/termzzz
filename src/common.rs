@@ -102,6 +102,67 @@ impl TickClock {
     }
 }
 
+/// What the frame loop drives.
+///
+/// The loop needs four things from whatever it is running, and only one of them
+/// -- the effect -- varies per frame. The rest exist because the program can
+/// swap the running effect mid-session: a key to press, a transition to apply to
+/// the frame, and somewhere to put a resize.
+///
+/// This trait is why there is one copy of the loop rather than two. A second
+/// loop for the swappable case would be ninety lines that drift apart from the
+/// first within a month, and the timing and input handling in particular must
+/// not differ between them.
+pub trait FrameTarget {
+    /// The effect to advance and draw this frame.
+    fn effect(&mut self) -> &mut dyn TerminalEffect;
+
+    /// A key the loop would not otherwise act on. Returning true consumes it, so
+    /// it does not also reach the effect.
+    fn on_global_key(&mut self, _key: Key) -> bool {
+        false
+    }
+
+    /// Called after the frame is produced, before the cells are written.
+    ///
+    /// The canonical use is the transition between effects, which has to reach
+    /// the cells rather than the effect: the wipe is a property of the finished
+    /// frame.
+    fn on_frame(&mut self, _delta: Duration, _cells: &mut [(usize, usize, Cell)]) {}
+
+    /// Called when the terminal resizes, instead of `update_size` on the effect
+    /// directly, so a target with its own size to track can.
+    fn on_resize(&mut self, _width: u16, _height: u16) {}
+}
+
+/// A [`FrameTarget`] over a single effect that cannot be swapped.
+///
+/// What tests, benchmarks and check mode drive: the same loop, without the
+/// ability to change what is running.
+pub struct SingleEffect<'a> {
+    effect: &'a mut dyn TerminalEffect,
+}
+
+impl<'a> SingleEffect<'a> {
+    pub fn new(effect: &'a mut dyn TerminalEffect) -> Self {
+        Self { effect }
+    }
+}
+
+impl FrameTarget for SingleEffect<'_> {
+    fn effect(&mut self) -> &mut dyn TerminalEffect {
+        self.effect
+    }
+
+    /// Forwards to the effect. The trait's default is a no-op, which is right
+    /// for a target that tracks its own size and wrong here -- a bare effect has
+    /// no size but the caller's, and `update_size` is how it hears about a
+    /// resize at all.
+    fn on_resize(&mut self, width: u16, height: u16) {
+        self.effect.update_size(width, height);
+    }
+}
+
 pub trait TerminalEffect {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)>;
     fn update(&mut self);
@@ -176,6 +237,34 @@ pub fn write_cells<W: Write>(
     Ok(())
 }
 
+/// Runs a [`FrameTarget`] against an injected source and a known size.
+///
+/// The seam the integration tests drive a host through: `run_loop_with_target`
+/// needs a real terminal, and these do not.
+pub fn run_loop_with_source_and_size_and_target<W, S, T>(
+    stdout: &mut W,
+    target: &mut T,
+    iterations: Option<usize>,
+    source: &mut S,
+    initial_size: (u16, u16),
+    options: RuntimeOptions,
+) -> Result<f64>
+where
+    W: Write,
+    S: InputSource,
+    T: FrameTarget + ?Sized,
+{
+    run_loop_with_source_and_size_and_options(
+        stdout,
+        target,
+        iterations,
+        source,
+        initial_size,
+        options,
+    )
+}
+
+/// Polls input once, without drawing. Used by check mode.
 pub fn process_input<TE>(effect: &mut TE) -> Result<bool>
 where
     TE: TerminalEffect,
@@ -185,9 +274,17 @@ where
     input.set_size(size);
     let mut source = CrosstermInput;
     let mut speed = 1.0;
-    process_runtime_events(effect, &mut source, &mut input, &mut size, &mut speed)
+    let mut target = SingleEffect::new(effect);
+    process_runtime_events(
+        &mut target,
+        &mut source,
+        &mut input,
+        &mut size,
+        &mut speed,
+    )
 }
 
+/// Runs a bare effect against the real terminal.
 pub fn run_loop<W>(
     stdout: &mut W,
     effect: &mut dyn TerminalEffect,
@@ -197,9 +294,11 @@ where
     W: Write,
 {
     let mut source = CrosstermInput;
-    run_loop_with_source(stdout, effect, iterations, &mut source)
+    let size = terminal::size()?;
+    run_loop_with_source_and_size(stdout, effect, iterations, &mut source, size)
 }
 
+/// Runs a bare effect against the real terminal, with a speed multiplier.
 pub fn run_loop_with_options<W>(
     stdout: &mut W,
     effect: &mut dyn TerminalEffect,
@@ -211,9 +310,10 @@ where
 {
     let mut source = CrosstermInput;
     let size = terminal::size()?;
+    let mut target = SingleEffect::new(effect);
     run_loop_with_source_and_size_and_options(
         stdout,
-        effect,
+        &mut target,
         iterations,
         &mut source,
         size,
@@ -221,6 +321,7 @@ where
     )
 }
 
+/// Runs a bare effect against an injected input source.
 pub fn run_loop_with_source<W, S>(
     stdout: &mut W,
     effect: &mut dyn TerminalEffect,
@@ -235,6 +336,7 @@ where
     run_loop_with_source_and_size(stdout, effect, iterations, source, size)
 }
 
+/// Runs a bare effect against an injected source and a known terminal size.
 pub fn run_loop_with_source_and_size<W, S>(
     stdout: &mut W,
     effect: &mut dyn TerminalEffect,
@@ -246,13 +348,41 @@ where
     W: Write,
     S: InputSource,
 {
+    let mut target = SingleEffect::new(effect);
     run_loop_with_source_and_size_and_options(
         stdout,
-        effect,
+        &mut target,
         iterations,
         source,
         initial_size,
         RuntimeOptions::default(),
+    )
+}
+
+/// Runs a [`FrameTarget`] against the real terminal.
+///
+/// This is how the program gets an effect it can swap mid-session. Every other
+/// entry point above takes a bare effect for tests, benchmarks and check mode
+/// and wraps it in a [`SingleEffect`], so there is still only one loop.
+pub fn run_loop_with_target<W, T>(
+    stdout: &mut W,
+    target: &mut T,
+    iterations: Option<usize>,
+    options: RuntimeOptions,
+) -> Result<f64>
+where
+    W: Write,
+    T: FrameTarget + ?Sized,
+{
+    let mut source = CrosstermInput;
+    let size = terminal::size()?;
+    run_loop_with_source_and_size_and_options(
+        stdout,
+        target,
+        iterations,
+        &mut source,
+        size,
+        options,
     )
 }
 
@@ -262,9 +392,9 @@ where
 /// entire loop once per effect type -- fifteen copies of the timing, input and
 /// encoding code -- and would forbid holding effects of different types at once,
 /// which is what swapping the running effect needs.
-pub fn run_loop_with_source_and_size_and_options<W, S>(
+pub fn run_loop_with_source_and_size_and_options<W, S, T>(
     stdout: &mut W,
-    effect: &mut dyn TerminalEffect,
+    target: &mut T,
     iterations: Option<usize>,
     source: &mut S,
     initial_size: (u16, u16),
@@ -273,6 +403,7 @@ pub fn run_loop_with_source_and_size_and_options<W, S>(
 where
     W: Write,
     S: InputSource,
+    T: FrameTarget + ?Sized,
 {
     if iterations == Some(0) {
         return Ok(0.0);
@@ -283,8 +414,8 @@ where
     input.set_size(size);
     let effect_size = normalize_effect_size(size);
     if effect_size != size {
-        effect.update_size(effect_size.0, effect_size.1);
-        effect.reset();
+        target.on_resize(effect_size.0, effect_size.1);
+        target.effect().reset();
     }
     let started_at = Instant::now();
     let mut previous_frame = started_at;
@@ -306,24 +437,28 @@ where
         input.begin_frame();
 
         if !process_runtime_events(
-            effect, source, &mut input, &mut size, &mut speed,
+            target, source, &mut input, &mut size, &mut speed,
         )? {
             break;
         }
 
         let context = FrameContext::new(size, frame, elapsed, delta, input.clone());
-        let diff = effect.get_diff_with_context(&context);
+        let mut diff = target.effect().get_diff_with_context(&context);
+
+        // Before anything is written, so a transition can reach the cells.
+        target.on_frame(delta, &mut diff);
+
         write_cells(&mut buffered_stdout, size, &diff)?;
         buffered_stdout.flush()?;
 
         if (speed - 1.0).abs() < f32::EPSILON {
-            effect.update_with_context(&context);
+            target.effect().update_with_context(&context);
         } else {
             let steps = tick_clock.advance(delta, speed);
             let mut tick_context = context.clone();
             tick_context.delta = Duration::from_secs_f64(TickClock::QUANTUM as f64);
             for _ in 0..steps {
-                effect.update_with_context(&tick_context);
+                target.effect().update_with_context(&tick_context);
             }
         }
 
@@ -345,8 +480,8 @@ where
     Ok(frames_per_second)
 }
 
-fn process_runtime_events<S>(
-    effect: &mut dyn TerminalEffect,
+fn process_runtime_events<S, T>(
+    target: &mut T,
     source: &mut S,
     input: &mut InputState,
     size: &mut (u16, u16),
@@ -354,6 +489,7 @@ fn process_runtime_events<S>(
 ) -> Result<bool>
 where
     S: InputSource,
+    T: FrameTarget + ?Sized,
 {
     let events = source.poll(Duration::from_millis(10))?;
     if events.iter().any(is_quit_event) {
@@ -368,8 +504,8 @@ where
         *size = (new_size.0.max(1), new_size.1.max(1));
         input.set_size(*size);
         let effect_size = normalize_effect_size(*size);
-        effect.update_size(effect_size.0, effect_size.1);
-        effect.reset();
+        target.on_resize(effect_size.0, effect_size.1);
+        target.effect().reset();
     }
 
     for event in events {
@@ -389,11 +525,12 @@ where
                     *speed = (*speed - SPEED_STEP).max(MIN_SPEED);
                     continue;
                 }
+                key if target.on_global_key(key) => continue,
                 _ => {}
             }
         }
         if !matches!(event, InputEvent::Ignored) {
-            effect.handle_input(&event);
+            target.effect().handle_input(&event);
         }
     }
     Ok(true)

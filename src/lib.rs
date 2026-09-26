@@ -19,6 +19,7 @@
 //! | `dvd`    | Bouncing DVD logo                        |
 //! | `error`  | Error types for the crate                |
 //! | `fire`   | Fire simulation effect                   |
+//! | `host`   | The running effect, and swapping it        |
 //! | `life`   | Conway's Game of Life                    |
 //! | `maze`   | Maze generation and animation            |
 //! | `pipes`  | Pipe maze animation                      |
@@ -50,6 +51,7 @@ pub mod donut;
 pub mod dvd;
 pub mod error;
 pub mod fire;
+pub mod host;
 pub mod life;
 pub mod mandelbrot;
 pub mod maze;

@@ -54,7 +54,10 @@ termzzz --playlist matrix,dvd,plasma --seed 1234
 Omit `--seed` to get the default, which is the same every time. The seed can also
 be set per effect in the config file, for example `[matrix] seed = 7`.
 
-Press `q`, `Esc`, or `Ctrl+C` to exit. `+` and `-` change the global animation speed in every effect. In ASCII mode:
+Press `q`, `Esc`, or `Ctrl+C` to exit. `+` and `-` change the global animation speed
+in every effect. `n` and `p` move to the next and previous effect, behind the same
+diagonal wipe the playlist uses, so you can walk the whole catalogue without
+restarting. In ASCII mode:
 
 - `r` reseeds the field
 - `Space` pauses and resumes the animation

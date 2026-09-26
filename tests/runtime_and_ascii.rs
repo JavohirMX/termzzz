@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use termzzz::ascii::{AsciiField, AsciiFieldOptions, GlyphPalette};
 use termzzz::buffer::Cell;
-use termzzz::common::{TerminalEffect, TickClock, run_loop_with_source_and_size};
+use termzzz::common::{
+    self, TerminalEffect, TickClock, run_loop_with_source_and_size,
+};
 use termzzz::config::Config;
 use termzzz::registry::{AnyEffect, EffectId};
 use termzzz::runtime::{
@@ -151,6 +153,14 @@ impl InputSource for ScriptedInput {
 
 struct BatchInput {
     events: Option<Vec<InputEvent>>,
+}
+
+impl BatchInput {
+    fn with(events: Vec<InputEvent>) -> Self {
+        Self {
+            events: Some(events),
+        }
+    }
 }
 
 impl InputSource for BatchInput {
@@ -505,4 +515,130 @@ fn legacy_effect_defaults_use_calmer_pacing() {
     assert_eq!(config.get_pipes_options().num_lines, 3);
     assert_eq!(config.get_cube_options().rotation_speed_x, 0.25);
     assert_eq!(config.get_crab_options((20, 10)).movement_speed, 3.0);
+}
+
+/// `n` and `p` change the running effect, through the real frame loop.
+///
+/// The unit tests on `EffectHost` cover the state machine; this covers the
+/// wiring, which is the part that can be wrong while the host is fine -- a key
+/// that never reaches `on_global_key`, a target the loop never drives, or a
+/// rebuild that does not happen mid-transition.
+#[test]
+fn the_frame_loop_switches_effects_on_n_and_p() {
+    use termzzz::config::Config;
+    use termzzz::host::EffectHost;
+    use termzzz::registry::EffectId;
+    use termzzz::runtime::{InputEvent, Key, KeyPhase};
+
+    let press = |key: char| InputEvent::Key {
+        key: Key::Char(key),
+        phase: KeyPhase::Pressed,
+    };
+
+    let run = |keys: Vec<InputEvent>| {
+        let mut source = BatchInput::with(keys);
+        let mut host = EffectHost::new(EffectId::Life, Config::default(), (20, 8));
+        // No transition, so the swap lands on the next frame rather than
+        // part-way through a wipe. The wipe is covered by the host's own tests.
+        host.set_transition(0.0);
+
+        let mut output = Vec::new();
+        // A scripted source and no real terminal, so the loop is driven
+        // entirely by the injected events.
+        // Bounded: the scripted source runs dry after its events, and a loop
+        // with no iteration limit would never stop.
+        common::run_loop_with_source_and_size_and_target(
+            &mut output,
+            &mut host,
+            Some(6),
+            &mut source,
+            (20, 8),
+            common::RuntimeOptions::default(),
+        )
+        .expect("the loop runs");
+        host.id()
+    };
+
+    assert_eq!(
+        run(Vec::new()),
+        EffectId::Life,
+        "`n` was pressed but nothing happened"
+    );
+    assert_eq!(
+        run(vec![press('n')]),
+        EffectId::Mandelbrot,
+        "`n` did not advance the effect"
+    );
+    assert_eq!(
+        run(vec![press('n'), press('p')]),
+        EffectId::Life,
+        "`p` did not step back"
+    );
+    // Life is second in the order, so `p` from it lands on the first, Matrix.
+    assert_eq!(
+        run(vec![press('p')]),
+        EffectId::Matrix,
+        "`p` did not step back"
+    );
+    // And from the first effect it has to wrap round to the last.
+    assert_eq!(
+        run(vec![press('p'), press('p')]),
+        EffectId::Terrain,
+        "`p` from the first effect did not wrap to the last"
+    );
+}
+
+/// A key the loop does not handle must still reach the effect.
+///
+/// `n` and `p` are consumed by the target. Everything else has to fall through
+/// to the effect, or the interactive effect loses its controls the moment a
+/// host is introduced. `Space` pauses the ASCII field, which is observable: a
+/// paused field stops changing, so the frames after it produce no cells at all.
+#[test]
+fn unhandled_keys_still_reach_the_effect_through_the_host() {
+    use termzzz::config::Config;
+    use termzzz::host::EffectHost;
+    use termzzz::registry::EffectId;
+    use termzzz::runtime::{InputEvent, Key, KeyPhase};
+
+    let frames = |keys: Vec<InputEvent>, count: usize| -> usize {
+        let mut source = BatchInput::with(keys);
+        let mut host = EffectHost::new(EffectId::Ascii, Config::default(), (20, 8));
+        let mut output = Vec::new();
+        common::run_loop_with_source_and_size_and_target(
+            &mut output,
+            &mut host,
+            Some(count),
+            &mut source,
+            (20, 8),
+            common::RuntimeOptions::default(),
+        )
+        .expect("the loop runs");
+        output.len()
+    };
+
+    let space = || InputEvent::Key {
+        key: Key::Space,
+        phase: KeyPhase::Pressed,
+    };
+
+    // With no key the field animates, so thirty frames write far more than one.
+    let one = frames(Vec::new(), 1);
+    let thirty = frames(Vec::new(), 30);
+    assert!(
+        thirty > one,
+        "an unpaused field wrote the same for 1 and 30 frames ({one} vs \
+         {thirty}), so this test cannot tell the cases apart"
+    );
+
+    // Paused, frames after the first write nothing: the opening frame is
+    // rendered before the keypress is read, and then the field stops changing.
+    // So thirty paused frames cost exactly what one costs.
+    let paused_one = frames(vec![space()], 1);
+    let paused_thirty = frames(vec![space()], 30);
+    assert_eq!(
+        paused_thirty, paused_one,
+        "Space did not reach the effect: {paused_thirty} bytes over 30 frames \
+         against {paused_one} over 1"
+    );
 }

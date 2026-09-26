@@ -1,10 +1,10 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crate::config::Config;
 use crate::registry::{AnyEffect, EffectId};
+use crate::render::wipe::blank_cell;
 use crate::runtime::{FrameContext, InputEvent, InputState};
-use crossterm::style;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -304,38 +304,19 @@ impl Playlist {
             // Wiped on a copy, so the undimmed frame underneath survives and the
             // wipe can be taken back rather than being baked in permanently.
             let mut target = self.canvas.surface().clone();
-            Self::apply_wipe(&mut target, width, height, wipe);
+            crate::render::wipe::apply(&mut target, width, height, wipe);
             self.canvas.replace_surface(target);
         }
 
         self.canvas.commit()
     }
-
-    /// Diagonal wipe: a cell is hidden once the wipe front has reached it.
-    /// The front is sampled at cell centers so `progress` 0.0 hides nothing
-    /// and `progress` 1.0 hides everything.
-    fn apply_wipe(buffer: &mut Buffer, width: usize, height: usize, progress: f32) {
-        let progress = progress.clamp(0.0, 1.0);
-        for y in 0..height {
-            for x in 0..width {
-                let front = ((x as f32 + 0.5) / width as f32
-                    + (y as f32 + 0.5) / height as f32)
-                    / 2.0;
-                if front <= progress {
-                    buffer.set(x, y, blank_cell());
-                }
-            }
-        }
-    }
-}
-
-fn blank_cell() -> Cell {
-    Cell::new(' ', style::Color::Reset, style::Attribute::Reset)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Buffer;
+    use crossterm::style;
 
     fn playlist_with(
         entries: &[(&str, Option<f32>)],
@@ -441,17 +422,17 @@ mod tests {
     fn wipe_clears_cells_the_front_has_passed() {
         let mut buffer = filled_buffer(10, 10);
 
-        Playlist::apply_wipe(&mut buffer, 10, 10, 0.0);
+        crate::render::wipe::apply(&mut buffer, 10, 10, 0.0);
         assert_eq!(buffer.get(0, 0).symbol, '#');
         assert_eq!(buffer.get(9, 9).symbol, '#');
 
         buffer = filled_buffer(10, 10);
-        Playlist::apply_wipe(&mut buffer, 10, 10, 0.5);
+        crate::render::wipe::apply(&mut buffer, 10, 10, 0.5);
         assert_eq!(buffer.get(0, 0).symbol, ' ');
         assert_eq!(buffer.get(9, 9).symbol, '#');
 
         buffer = filled_buffer(10, 10);
-        Playlist::apply_wipe(&mut buffer, 10, 10, 1.0);
+        crate::render::wipe::apply(&mut buffer, 10, 10, 1.0);
         assert_eq!(buffer.get(0, 0).symbol, ' ');
         assert_eq!(buffer.get(9, 9).symbol, ' ');
     }
@@ -470,7 +451,7 @@ mod tests {
         assert_eq!(playlist.phase, Phase::WipeIn);
 
         let mut buffer = filled_buffer(40, 12);
-        Playlist::apply_wipe(&mut buffer, 40, 12, 1.0);
+        crate::render::wipe::apply(&mut buffer, 40, 12, 1.0);
         for y in 0..12 {
             for x in 0..40 {
                 assert_eq!(buffer.get(x, y).symbol, ' ');

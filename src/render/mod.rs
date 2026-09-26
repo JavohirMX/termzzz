@@ -21,8 +21,10 @@ pub mod braille;
 pub mod dither;
 pub mod halfblock;
 pub mod palette;
+pub mod wipe;
 
 pub use braille::BrailleGrid;
 pub use dither::Dither;
 pub use halfblock::HalfBlockField;
 pub use palette::Palette;
+pub use wipe::{apply as apply_wipe, blank_cell};

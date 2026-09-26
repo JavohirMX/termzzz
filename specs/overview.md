@@ -16,6 +16,8 @@
 - `config.rs`: TOML configuration loading and runtime option construction
 - `error.rs`: Error types for the crate
 - `registry.rs`: The `EFFECT_SPECS` table, effect ids, and the `AnyEffect` enum used by the CLI
+- `host.rs`: The running effect, the cycle order, and the `n`/`p` transition
+- `render/`: Sub-cell renderers -- braille, half-block, dithering, palettes, wipe
 - `session.rs`: Terminal setup and teardown, including panic safety
 - `check.rs`: Bounded frame-count test mode
 - `ascii/`: Reusable ASCII renderer and interactive generative field
