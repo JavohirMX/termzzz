@@ -174,16 +174,65 @@ pub fn lerp(a: Color, b: Color, t: f32) -> Color {
             g: lerp_u8(g0, g1, t),
             b: lerp_u8(b0, b1, t),
         },
-        // Mixing an indexed or reset colour with a truecolor one has no
-        // meaningful answer, so the endpoints win rather than inventing one.
-        _ => {
-            if t < 0.5 {
-                a
-            } else {
-                b
+        // Named colours have well-defined RGB values in the standard 16-colour
+        // palette, so they blend with a truecolor like anything else. They have to:
+        // `lerp(Color::Black, ink, t)` is the natural way to write "fade this in
+        // from the background", and under the old policy it returned `Color::Black`
+        // for every `t < 0.5` and the ink for every `t >= 0.5`. That is a hard step
+        // at the halfway point, not a fade, and it looks like working code.
+        // A named colour mixed with a truecolor. Resolved independently per side,
+        // so `Black` against an `Rgb` blends -- which is the case that matters,
+        // because "fade this in from the background" is written that way.
+        (a, b) => match (named_rgb(a), named_rgb(b)) {
+            (Some((r0, g0, b0)), Some((r1, g1, b1))) => Color::Rgb {
+                r: lerp_u8(r0, r1, t),
+                g: lerp_u8(g0, g1, t),
+                b: lerp_u8(b0, b1, t),
+            },
+            // `Color::Reset` means "whatever the terminal's foreground is", which
+            // this code has no way to know, and `AnsiValue` means "index into a
+            // palette whose contents are the terminal's business". Neither has an
+            // answer, so the nearer endpoint wins rather than inventing one.
+            _ => {
+                if t < 0.5 {
+                    a
+                } else {
+                    b
+                }
             }
-        }
+        },
     }
+}
+
+/// The standard 16-colour palette as RGB, for the variants that have one.
+///
+/// `None` for `Reset` and `AnsiValue`, which are not resolvable without knowing
+/// the terminal's configuration. Those are the only two that make
+/// [`lerp`] fall back to picking an endpoint.
+fn named_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    Some(match color {
+        // A truecolor resolves to itself. The two-`Rgb` case is matched before
+        // this is ever consulted, so it costs nothing on the hot path -- it is here
+        // so that a *named* colour mixed with a truecolor resolves both sides.
+        Color::Rgb { r, g, b } => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::DarkGrey => (128, 128, 128),
+        Color::Red => (170, 0, 0),
+        Color::DarkRed => (170, 0, 0),
+        Color::Green => (0, 170, 0),
+        Color::DarkGreen => (0, 170, 0),
+        Color::Yellow => (170, 170, 0),
+        Color::DarkYellow => (170, 170, 0),
+        Color::Blue => (0, 0, 170),
+        Color::DarkBlue => (0, 0, 170),
+        Color::Magenta => (170, 0, 170),
+        Color::DarkMagenta => (170, 0, 170),
+        Color::Cyan => (0, 170, 170),
+        Color::DarkCyan => (0, 170, 170),
+        Color::Grey => (170, 170, 170),
+        Color::White => (255, 255, 255),
+        _ => return None,
+    })
 }
 
 #[inline]
@@ -489,6 +538,140 @@ mod tests {
         // A one-entry table would divide by zero below.
         let table = Palette::new(vec![rgb(0, 0, 0), rgb(1, 1, 1)]).expand(1);
         assert_eq!(table.len(), 2);
+    }
+
+    /// Fading to black has to be a fade.
+    ///
+    /// This is a real bug that was found by an effect, not by reading the code:
+    /// `lerp` had a policy of "endpoints win" for any pair it could not blend,
+    /// and `Color::Black` fell into it because the match only handled two `Rgb`
+    /// values. So `lerp(Color::Black, ink, 0.4)` returned `Color::Black` and
+    /// `lerp(Color::Black, ink, 0.6)` returned `ink` -- a hard step at the halfway
+    /// point, from code that reads exactly like a working fade. Every one of
+    /// those effects was drawing full-brightness trail cells and calling it a
+    /// gradient.
+    #[test]
+    fn fading_from_black_is_a_fade_and_not_a_step() {
+        let ink = Color::Rgb {
+            r: 200,
+            g: 100,
+            b: 50,
+        };
+        let mut previous = lerp(Color::Black, ink, 0.9);
+        for step in 1..=20 {
+            let t = step as f32 / 20.0;
+            let blended = lerp(Color::Black, ink, t);
+            assert_ne!(
+                blended, previous,
+                "at t = {t} the colour did not change, so this is a step"
+            );
+            previous = blended;
+        }
+
+        // And it lands exactly on the endpoints -- as *resolved* colours, not as
+        // the named variants they were given. `Color::Black` becomes
+        // `rgb(0,0,0)`, which renders identically and costs a few more bytes on
+        // the wire. That is the price of resolving, and it is worth paying: a
+        // caller that mixes a named colour with a truecolor now gets a truecolor
+        // back rather than a colour that silently changes meaning depending on
+        // which side of the blend it was on.
+        assert_eq!(
+            lerp(Color::Black, ink, 0.0),
+            Color::Rgb { r: 0, g: 0, b: 0 }
+        );
+        assert_eq!(lerp(Color::Black, ink, 1.0), ink);
+        // Order does not matter.
+        assert_eq!(lerp(ink, Color::Black, 0.0), ink);
+        assert_eq!(
+            lerp(ink, Color::Black, 1.0),
+            Color::Rgb { r: 0, g: 0, b: 0 }
+        );
+    }
+
+    /// Every named colour blends with a truecolor, in both directions.
+    ///
+    /// `Color::Black` is the endpoint anyone actually reaches for, but the same
+    /// trap applies to all sixteen, and `Color::White` is the second most likely.
+    #[test]
+    fn every_named_colour_blends_with_a_truecolor() {
+        let ink = Color::Rgb {
+            r: 200,
+            g: 100,
+            b: 50,
+        };
+        let named = [
+            Color::Black,
+            Color::DarkGrey,
+            Color::Red,
+            Color::Green,
+            Color::Blue,
+            Color::Magenta,
+            Color::Cyan,
+            Color::Yellow,
+            Color::Grey,
+            Color::White,
+        ];
+        for color in named {
+            for (a, b) in [(color, ink), (ink, color)] {
+                let middle = lerp(a, b, 0.5);
+                assert_ne!(
+                    middle, a,
+                    "{color:?} did not blend towards {ink:?} at the halfway point"
+                );
+                assert_ne!(
+                    middle, b,
+                    "{ink:?} did not blend towards {color:?} at the halfway point"
+                );
+            }
+        }
+    }
+
+    /// `Reset` and `AnsiValue` genuinely have no answer, and must not be faked.
+    ///
+    /// `Reset` is "whatever the terminal's foreground is", which this code cannot
+    /// know, and inventing a value for it would produce a colour the user did not
+    /// ask for. Picking the nearer endpoint is the honest failure.
+    #[test]
+    fn unresolvable_endpoints_still_pick_an_endpoint() {
+        let ink = Color::Rgb {
+            r: 200,
+            g: 100,
+            b: 50,
+        };
+        for unresolvable in [Color::Reset, Color::AnsiValue(42)] {
+            assert_eq!(lerp(unresolvable, ink, 0.0), unresolvable);
+            assert_eq!(lerp(unresolvable, ink, 0.49), unresolvable);
+            assert_eq!(lerp(unresolvable, ink, 0.5), ink);
+            assert_eq!(lerp(unresolvable, ink, 1.0), ink);
+        }
+    }
+
+    /// A ramp that starts at `Color::Black` has to actually ramp.
+    ///
+    /// This is the case the bug produced in the wild, expressed as a test on the
+    /// type an effect would build rather than on the function directly.
+    #[test]
+    fn a_ramp_starting_at_black_is_monotonic() {
+        let ramp = Palette::new(vec![Color::Black, ink_colour()]);
+        assert_eq!(ramp.sample(0.0), Color::Rgb { r: 0, g: 0, b: 0 });
+        assert_eq!(ramp.sample(1.0), ink_colour());
+
+        let mut previous = 0u8;
+        for step in 1..=20 {
+            let Color::Rgb { r, .. } = ramp.sample(step as f32 / 20.0) else {
+                panic!("a two-stop black ramp stopped being truecolor");
+            };
+            assert!(r >= previous, "the ramp went backwards at step {step}");
+            previous = r;
+        }
+    }
+
+    fn ink_colour() -> Color {
+        Color::Rgb {
+            r: 200,
+            g: 100,
+            b: 50,
+        }
     }
 
     #[test]
