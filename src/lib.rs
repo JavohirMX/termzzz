@@ -4,6 +4,7 @@
 //!
 //! | Module   | Description                              |
 //! |----------|------------------------------------------|
+//! | `ascii`  | Interactive generative ASCII field         |
 //! | `blank`  | Blank screen — no-op placeholder         |
 //! | `boids`  | Boids flocking simulation                |
 //! | `buffer` | Terminal cell buffer for colored output  |
@@ -24,6 +25,7 @@
 //! | `runtime`| Runtime input and frame context          |
 //! | `terrain`| Terrain generation — scrolling landscape |
 
+pub mod ascii;
 pub mod blank;
 pub mod boids;
 pub mod buffer;

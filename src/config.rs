@@ -1,4 +1,5 @@
 use crate::{
+    ascii::{AsciiFieldOptions, AsciiFieldOptionsBuilder},
     blank::{BlankOptions, BlankOptionsBuilder},
     boids::{BoidsOptions, BoidsOptionsBuilder},
     constellation::{ConstellationOptions, ConstellationOptionsBuilder},
@@ -49,6 +50,8 @@ pub struct Config {
     pub maze: MazeOptions,
     #[serde(default)]
     pub boids: BoidsOptions,
+    #[serde(default)]
+    pub ascii: AsciiFieldOptions,
     #[serde(default)]
     pub blank: BlankOptions,
     #[serde(default)]
@@ -182,6 +185,10 @@ impl Config {
     pub fn get_constellation_options(&self) -> ConstellationOptions {
         self.constellation.clone()
     }
+
+    pub fn get_ascii_options(&self) -> AsciiFieldOptions {
+        self.ascii.clone()
+    }
 }
 
 impl Default for Config {
@@ -191,6 +198,7 @@ impl Default for Config {
             life: ConwayLifeOptionsBuilder::default().build().unwrap(),
             maze: MazeOptionsBuilder::default().build().unwrap(),
             boids: BoidsOptionsBuilder::default().build().unwrap(),
+            ascii: AsciiFieldOptionsBuilder::default().build().unwrap(),
             blank: BlankOptionsBuilder::default().build().unwrap(),
             cube: CubeOptionsBuilder::default().build().unwrap(),
             crab: CrabOptionsBuilder::default().build().unwrap(),
