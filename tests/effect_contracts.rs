@@ -14,25 +14,10 @@ use termzzz::common::TerminalEffect;
 use termzzz::config::Config;
 use termzzz::registry::{AnyEffect, EffectId};
 
-/// Every effect name the CLI is expected to accept. Adding an effect means
-/// adding a line here, which is the point: the change becomes deliberate.
-const EXPECTED_EFFECT_NAMES: &[&str] = &[
-    "ascii",
-    "blank",
-    "boids",
-    "constellation",
-    "crab",
-    "cube",
-    "donut",
-    "dvd",
-    "fire",
-    "life",
-    "maze",
-    "matrix",
-    "pipes",
-    "plasma",
-    "terrain",
-];
+// The effect names the CLI accepts are checked once, against
+// `registry::KNOWN_IDS`, in `registry.rs`. They are deliberately not listed
+// here: this file iterates `EffectId::all()` everywhere else, so a second copy
+// of the names would only be able to drift.
 
 /// Splits serialized TOML into `(section_name, body)` pairs. The `[global]`
 /// table is included so a partial-config test can drop any one section.
@@ -96,21 +81,12 @@ fn drive(id: EffectId, size: (u16, u16), frames: u64) -> usize {
 }
 
 // --- registry drift -------------------------------------------------------
-
-#[test]
-fn registry_lists_every_effect() {
-    let mut names: Vec<&str> = EffectId::all().map(|id| id.as_str()).collect();
-    let mut expected: Vec<&str> = EXPECTED_EFFECT_NAMES.to_vec();
-    expected.sort_unstable();
-    names.sort_unstable();
-
-    assert_eq!(
-        names, expected,
-        "EffectId::all() is out of sync with EXPECTED_EFFECT_NAMES. An effect that \
-         is missing from ALL is invisible to --help, to argument parsing, and to \
-         playlists."
-    );
-}
+//
+// Registry completeness, name uniqueness and metadata all live in
+// `registry.rs`'s own tests, next to the table they check and using
+// `KNOWN_IDS` as the single hand-maintained list of effects. Nothing is
+// re-listed here: a second copy of the effect names is exactly the kind of
+// drift this suite exists to catch.
 
 #[test]
 fn effect_names_are_unique() {

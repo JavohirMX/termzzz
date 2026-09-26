@@ -24,9 +24,14 @@
 //! | `plasma` | Plasma color wave effect                 |
 //! | `playlist` | Timed playlist with blank-wipe transitions |
 //! | `rain`   | Matrix-style digital rain                |
+//! | `registry`| The effect table: ids, names, durations |
 //! | `runtime`| Runtime input and frame context          |
 //! | `session`| Terminal setup, teardown and panic safety |
 //! | `terrain`| Terrain generation — scrolling landscape |
+//!
+//! The list of effects, their names, help text and default playlist durations
+//! is [`registry::EFFECT_SPECS`]. It is not repeated here or in the docs,
+//! because a second copy is a second thing to forget to update.
 
 pub mod ascii;
 pub mod blank;
