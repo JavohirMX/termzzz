@@ -2,7 +2,7 @@
 
 ## Quick Reference
 
-`termzzz` (Terminal Arts) - A collection of terminal-based screensavers written in Rust.
+`termzzz` is a collection of terminal-based screensavers and generative visual effects written in Rust.
 
 ### Main Commands
 ```bash
@@ -11,7 +11,7 @@ cargo build --release
 
 # Run effects
 termzzz matrix      # Matrix digital rain
-termzzz life        # Conway's Game of Life  
+termzzz life        # Conway's Game of Life
 termzzz maze        # Maze generation
 termzzz boids       # Boids flocking simulation
 termzzz cube        # 3D cube rotation
@@ -21,30 +21,38 @@ termzzz pipes       # Pipe maze animation
 termzzz plasma      # Plasma effect
 termzzz fire        # Fire simulation
 termzzz terrain     # Terrain generation
+termzzz constellation # Drifting stars and dotted connections
+termzzz dvd         # Bouncing ASCII logo
+termzzz blank       # Blank screen
+termzzz ascii       # Interactive generative ASCII field
+
+# Run a timed playlist of effects
+termzzz --playlist matrix,dvd,plasma
+termzzz --shuffle
 
 # Development
 cargo test        # Run tests
 cargo bench       # Run benchmarks
 
-# Code Quality (run after changes)
+# Code Quality
 cargo fmt --check  # Check formatting
 cargo test --lib   # Run library tests
 cargo clippy       # Run linter
 ```
 
-### Installation Methods
-- **Homebrew**: `brew install oiwn/tap/termzzz`
-- **Cargo**: `cargo install termzzz`
-- **Manual**: Download from GitHub releases
+### Installation
+- **Local checkout**: `cargo install --path .`
+- **Crates.io**: `cargo install termzzz` after publication is enabled
+- **GitHub**: canonical repository and release links are pending selection
 
 ## Project Status
-- **Version**: 0.1.23
-- **Effects**: 12 working screensavers
-- **Platforms**: macOS (x86_64, arm64), Linux
-- **Homebrew**: Tap available and working
+- **Version**: 0.2.0
+- **Effects**: 15 screensavers and visual effects, plus a playlist mode
+- **Platforms**: macOS and Linux
+- **Configuration**: `~/.config/termzzz.toml`
 
 ## Current Focus
-Preparing for public release and Reddit announcement. See `specs/current_task.md` for detailed release preparation plan.
+Ship the `termzzz` 0.2.0 release: global speed control, the DVD logo, playlist mode, and the canonical GitHub and distribution metadata.
 
 ## Architecture
-See `specs/overview.md` for detailed project architecture and technical overview.
+See `specs/overview.md` for the project architecture and technical overview.

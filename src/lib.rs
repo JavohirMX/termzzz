@@ -22,7 +22,6 @@
 //! | `maze`   | Maze generation and animation            |
 //! | `pipes`  | Pipe maze animation                      |
 //! | `plasma` | Plasma color wave effect                 |
-//! | `registry`| Canonical effect IDs and construction     |
 //! | `playlist` | Timed playlist with blank-wipe transitions |
 //! | `rain`   | Matrix-style digital rain                |
 //! | `runtime`| Runtime input and frame context          |

@@ -2,49 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.25] - 2026-05-11
+## [0.2.0] - Unreleased
 
 ### Added
-- **Constellation effect** — drifting stars and dotted connections (thanks [@AnarchistHoneybun](https://github.com/AnarchistHoneybun))
-- Config system: loads from `~/.config/termzzz.toml` (macOS/Linux) or `%APPDATA%/termzzz.toml` (Windows)
-- `--print-config` flag: prints default config as TOML to stdout (pipe to file)
-- Screen-adaptive coefficients: effects scale naturally to terminal size (`drops_coeff`, `speed_coeff`, `cells_coeff`, `boid_coeff`, `crab_coeff`, `k1_coeff`)
-- `BoidCharset` enum: Braille (default), Arrow, Simple, Dot — configurable boid character sets
-- `src/lib.rs` module-level docstring with effect description table
-- `prek` pre-commit checks
+- Context-driven input and frame state through the runtime module
+- Interactive generative ASCII field effect available with `termzzz ascii`
+- Pointer interaction, pause/resume, reseeding, palette cycling, and brush-size controls
+- Resize-safe rendering with screen-derived option updates for existing effects
+- `terrain` is now available through the normal CLI validator
+- Bouncing ASCII logo effect available with `termzzz dvd`, with a configurable multi-line logo
+- Timed playlist mode via `--playlist`, `--shuffle`, and `--transition`, also configurable in `[playlist]`
+- Central effect registry so the CLI, help output, check mode, and playlists share one source of truth
+- Global speed control through `[global] speed`, `--speed <MULT>`, and the `+`/`-` keys
 
 ### Changed
-- Builder defaults aligned with original `DefaultOptions` values: cube size, fire colors, donut projection, pipes density, plasma speed, terrain scale, crab count
-- `Config::load()` returns defaults in memory when config file missing (no auto-write)
-- Config status printed after effect exits (loaded path or "using defaults")
-- Updated dependencies: rand 0.10, toml 1.x, criterion 0.8, tempfile 3.27
+- ASCII field is now a radial ring/spiral field with a larger glyph ramp
+- ASCII pointer energy fades over elapsed time (~2s) instead of a fixed per-frame rate
+- `+` and `-` now change global animation speed; the mouse wheel resizes the ASCII brush
+- Conway's Game of Life advances at a configurable generations-per-second rate
+- Matrix, cube, and DVD effects advance on real frame deltas rather than fixed step counts
+- Calmer defaults for plasma, boids, donut, pipes, cube, crab, and life
+- Check mode now honours the configured effect options and global speed
+- Release and crates.io workflows now require explicit manual dispatch
 
-### Removed
-- `--generate-config` flag (replaced by `--print-config`)
-
-## [0.1.24] - 2025-01-27
-
-### Changed
-- **Removed pico-args dependency** - Replaced with manual argument parsing for better control and maintainability
-- **Improved CLI experience** - Added comprehensive help system with detailed descriptions for all effects
-- **Enhanced argument parsing** - Added support for `--version`, `--help`, and improved `--check` functionality
-
-### Added
-- New help system with detailed effect descriptions and usage examples
-- Version information via `--version` or `-v` flag
-- Better error handling for invalid arguments
-- Comprehensive help text for all 12 available effects
-
-### Benefits
-- **Zero external dependencies** for argument parsing
-- **Smaller binary size**
-- **Faster compilation**
-- **Full control** over CLI behavior
-- **Better user experience** with proper help and error messages
-
-## [0.1.23] - Previous
-
-### Features
-- Multiple terminal screensaver effects
-- Homebrew tap integration
-- Cross-platform support (macOS, Linux)
+### Compatibility
+- `termzzz` is a clean break from earlier package and command names, and provides no compatibility aliases

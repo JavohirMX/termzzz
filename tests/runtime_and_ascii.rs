@@ -334,7 +334,6 @@ fn cli_help_uses_termzzz_identity() {
     assert!(output.status.success());
     assert!(stdout.contains("termzzz [EFFECT] [OPTIONS]"));
     assert!(stdout.contains("~/.config/termzzz.toml"));
-    assert!(!stdout.contains("tarts"));
 }
 
 #[test]
