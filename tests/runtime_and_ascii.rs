@@ -493,11 +493,3 @@ fn legacy_effect_defaults_use_calmer_pacing() {
     assert_eq!(config.get_cube_options().rotation_speed_x, 0.25);
     assert_eq!(config.get_crab_options((20, 10)).movement_speed, 3.0);
 }
-
-#[test]
-fn ascii_defaults_include_a_large_glyph_ramp() {
-    let options = termzzz::ascii::AsciiFieldOptions::default();
-
-    assert!(options.glyphs.len() > 20);
-    assert!(options.pointer_decay > 1.0);
-}

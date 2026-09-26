@@ -49,7 +49,7 @@ Effects are registered once in `registry.rs`. `EffectId::ALL` is the single sour
 
 `common::run_loop` uses `runtime::InputSource` to collect normalized input, update `InputState`, create a `FrameContext`, and pass it to the effect. The effect returns changed cells through `Buffer`, and the loop writes only those cells to the terminal.
 
-The ASCII field uses a seeded radial scalar field, a large narrow ASCII glyph ramp, a bounded glyph palette, and pointer energy injection that decays over roughly two seconds of elapsed time. The renderer has no media dependencies and only depends on the existing `Buffer`/`Cell` model. Effects are initialized with a safe minimum simulation size of 6x6 while output writes are clipped to the actual terminal dimensions.
+The ASCII field uses a seeded scalar field, narrow ASCII glyphs, a bounded glyph palette, and pointer energy injection. The renderer has no media dependencies and only depends on the existing `Buffer`/`Cell` model. Effects are initialized with a safe minimum simulation size of 6x6 while output writes are clipped to the actual terminal dimensions.
 
 ## Speed Control
 

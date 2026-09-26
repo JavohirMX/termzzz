@@ -16,9 +16,7 @@ All notable changes to this project will be documented in this file.
 - Global speed control through `[global] speed`, `--speed <MULT>`, and the `+`/`-` keys
 
 ### Changed
-- ASCII field is now a radial ring/spiral field with a larger glyph ramp
-- ASCII pointer energy fades over elapsed time (~2s) instead of a fixed per-frame rate
-- `+` and `-` now change global animation speed; the mouse wheel resizes the ASCII brush
+- `+` and `-` change global animation speed; the mouse wheel resizes the ASCII brush
 - Conway's Game of Life advances at a configurable generations-per-second rate
 - Matrix, cube, and DVD effects advance on real frame deltas rather than fixed step counts
 - Calmer defaults for plasma, boids, donut, pipes, cube, crab, and life

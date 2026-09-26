@@ -1,4 +1,4 @@
-use super::renderer::{AsciiRenderer, DEFAULT_GLYPHS, GlyphPalette};
+use super::renderer::{AsciiRenderer, GlyphPalette};
 use crate::buffer::{Buffer, Cell};
 use crate::common::TerminalEffect;
 use crate::runtime::{FrameContext, InputEvent, Key, KeyPhase, PointerPhase};
@@ -6,7 +6,6 @@ use crossterm::style::Color;
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::TAU;
-use std::time::Duration;
 
 #[derive(Builder, Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,9 +19,7 @@ pub struct AsciiFieldOptions {
     pub pointer_strength: f32,
     #[builder(default = "0.2")]
     pub brush_radius: f32,
-    #[builder(default = "2.0")]
-    pub pointer_decay: f32,
-    #[builder(default = "String::from(DEFAULT_GLYPHS)")]
+    #[builder(default = "String::from(\" .:-=+*#%@\")")]
     pub glyphs: String,
 }
 
@@ -33,8 +30,7 @@ impl Default for AsciiFieldOptions {
             time_scale: 1.0,
             pointer_strength: 0.7,
             brush_radius: 0.2,
-            pointer_decay: 2.0,
-            glyphs: String::from(DEFAULT_GLYPHS),
+            glyphs: String::from(" .:-=+*#%@"),
         }
     }
 }
@@ -44,20 +40,6 @@ struct PointerEnergy {
     position: (f32, f32),
     strength: f32,
     radius: f32,
-}
-
-fn circular_coordinates(u: f32, v: f32, aspect: f32) -> (f32, f32) {
-    let dx = (u - 0.5) * aspect;
-    let dy = v - 0.5;
-    ((dx * dx + dy * dy).sqrt(), dy.atan2(dx))
-}
-
-fn circular_value(u: f32, v: f32, time: f32, aspect: f32) -> f32 {
-    let (radius, angle) = circular_coordinates(u, v, aspect);
-    let rings = (radius * 8.0 - time * 1.1).sin();
-    let spiral = (angle * 3.0 + radius * 5.0 - time * 0.7).sin();
-    let ripples = (radius * 14.0 + time * 0.45).cos();
-    0.5 + 0.24 * rings + 0.16 * spiral + 0.1 * ripples
 }
 
 pub struct AsciiField {
@@ -84,14 +66,14 @@ impl TerminalEffect for AsciiField {
         if !self.paused {
             self.phase += 0.035 * self.options.time_scale;
         }
-        self.decay_pointer(Duration::from_secs_f64(1.0 / 60.0));
+        self.decay_pointer();
     }
 
     fn update_with_context(&mut self, context: &FrameContext) {
         if !self.paused {
             self.phase += context.delta.as_secs_f32() * self.options.time_scale;
         }
-        self.decay_pointer(context.delta);
+        self.decay_pointer();
     }
 
     fn handle_input(&mut self, event: &InputEvent) {
@@ -172,7 +154,14 @@ impl AsciiField {
             let v = y as f32 / height.max(1) as f32;
             for x in 0..width {
                 let u = x as f32 / width.max(1) as f32;
-                let mut value = circular_value(u, v, time, aspect);
+                let warped_u = u + 0.12 * (v * 4.0 + time).sin();
+                let warped_v = v + 0.12 * (u * 3.0 - time * 0.7).cos();
+                let wave = ((warped_u * 3.2 + time).sin()
+                    + (warped_v * 2.4 - time * 0.8).cos()
+                    + ((warped_u + warped_v) * 4.6 + time * 0.35).sin())
+                    / 3.0;
+                let diagonal = (u * aspect * 1.7 - v * 2.2 + time * 0.5).sin();
+                let mut value = 0.5 + 0.34 * wave + 0.16 * diagonal;
 
                 if let Some(pointer) = pointer {
                     let dx = u - pointer.position.0;
@@ -229,11 +218,9 @@ impl AsciiField {
         }
     }
 
-    fn decay_pointer(&mut self, delta: Duration) {
+    fn decay_pointer(&mut self) {
         if let Some(pointer) = &mut self.pointer {
-            let factor =
-                (-delta.as_secs_f32() / self.options.pointer_decay.max(0.05)).exp();
-            pointer.strength *= factor;
+            pointer.strength *= 0.94;
             if pointer.strength < 0.01 {
                 self.pointer = None;
             }
@@ -270,36 +257,5 @@ mod tests {
 
         assert!(field.paused);
         assert_eq!(field.palette_index, 1);
-    }
-
-    #[test]
-    fn pointer_decay_is_time_based() {
-        let mut field = AsciiField::new(AsciiFieldOptions::default(), (20, 10));
-        field.handle_input(&InputEvent::Pointer {
-            position: (5, 5),
-            phase: PointerPhase::Pressed,
-            button: crate::runtime::PointerButton::Left,
-        });
-        let initial = field.pointer.expect("pointer should be active").strength;
-        let context = FrameContext::new(
-            (20, 10),
-            0,
-            Duration::ZERO,
-            Duration::from_secs(1),
-            crate::runtime::InputState::default(),
-        );
-
-        field.update_with_context(&context);
-
-        let remaining = field.pointer.expect("pointer should remain").strength;
-        assert!(remaining < initial * 0.7);
-    }
-
-    #[test]
-    fn field_is_symmetric_around_the_vertical_axis() {
-        let (left_radius, _) = circular_coordinates(0.25, 0.5, 1.0);
-        let (right_radius, _) = circular_coordinates(0.75, 0.5, 1.0);
-
-        assert!((left_radius - right_radius).abs() < 0.0001);
     }
 }

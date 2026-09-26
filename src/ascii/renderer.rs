@@ -1,9 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crossterm::style::{self, Color};
 
-pub const DEFAULT_GLYPHS: &str =
-    " .'`^\",:;Il!i~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
-
 #[derive(Debug, Clone)]
 pub struct GlyphPalette {
     glyphs: Vec<char>,
@@ -13,7 +10,7 @@ pub struct GlyphPalette {
 impl Default for GlyphPalette {
     fn default() -> Self {
         Self {
-            glyphs: DEFAULT_GLYPHS.chars().collect(),
+            glyphs: " .:-=+*#%@".chars().collect(),
             colors: vec![
                 Color::Rgb { r: 8, g: 32, b: 24 },
                 Color::Rgb {

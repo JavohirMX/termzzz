@@ -48,7 +48,7 @@ Press `q`, `Esc`, or `Ctrl+C` to exit. `+` and `-` change the global animation s
 - `Space` pauses and resumes the animation
 - `[` and `]` cycle glyph palettes
 - The mouse wheel resizes the pointer brush
-- Pointer movement temporarily brightens the field, then fades out slowly
+- Pointer movement temporarily brightens the field, then fades out
 
 ### Speed
 
