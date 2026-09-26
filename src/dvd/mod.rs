@@ -1,2 +1,2 @@
 pub mod effect;
-pub use effect::{Dvd, DvdOptions};
+pub use effect::{ColorChange, Dvd, DvdOptions};

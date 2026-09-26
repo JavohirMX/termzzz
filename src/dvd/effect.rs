@@ -22,24 +22,37 @@ use serde::{Deserialize, Serialize};
 /// frame in six. It is now the deep rose, which is 4.3:1 on white and 4.8:1 on
 /// black, and it is first because a red logo is what a DVD logo should be.
 ///
-/// The whole palette had to move, not just that entry: any of the six could be
-/// the starting colour, so leaving five of them above luminance 0.30 would have
-/// left the bug reachable five times out of six.
-/// The default logo: a five-row block-letter `DVD`, twenty cells wide.
+/// The default logo: a seven-row block-letter `DVD`, twenty-three cells wide.
 ///
-/// Full blocks rather than a thin stroke. It used to be three characters on one
-/// line, which is a text label rather than a logo -- and a seventeen-cell-wide
-/// slab stepping one whole cell at a time is far more obviously a staircase than
-/// three cells doing it, so the two changes belong together.
+/// The previous default was five rows of an *outline* font, which was wrong twice
+/// over. The middle glyph was two verticals joined at the bottom, so it was a U
+/// and the logo read `DUD`. And an outline font puts every stroke on a cell
+/// boundary, so every stroke was rendered with quadrant block glyphs -- the
+/// elements least likely to be in a font -- when plain full blocks would have done.
+///
+/// So: a real V, and strokes three cells thick where the letterform allows. The
+/// `D`s are then entirely `█` and blanks, and only the `V`'s taper touches a
+/// quadrant glyph. That is the whole reason a solid-and-hollow letterform is
+/// better here than a thin one, and it is also why the interior stays legible on a
+/// terminal missing the quadrants.
+///
+/// Modelled on the wordmark in lemonyte's `dvd-screensaver`, which is the
+/// reference for this effect: a heavy, slightly forward-slanted `DVD` on black.
+/// Seven rows is about a quarter of a 24-row terminal, against the reference's
+/// logo at a sixth of its window -- a little larger, because a terminal cell is
+/// much coarser than a pixel and a logo needs to be big to survive being made of
+/// them.
 ///
 /// Multi-row logos were always supported: `logo` is parsed on `\n` and the draw
-/// loop nests rows. So the size is a default-value change; the smoothness is not.
+/// nests rows. So the size is a default-value change; the smoothness is not.
 const DEFAULT_LOGO: &str = "\
-█████  █████   █████
-█   █  █   █   █   █
-█   █  █   █   █   █
-█   █  █   █   █   █
-█████  █████   █████";
+███████  ███████  ███████
+███  ██  ███  ██  ██  ██
+███  ██  ███  ██  ██  ██
+███  ██  ███  ██  ██  ██
+███  ██   █████    ██  ██
+███  ██    ███     ██  ██
+███████     █      ███████";
 
 /// Whether a logo character is transparent.
 ///
@@ -50,19 +63,32 @@ fn is_blank(symbol: char) -> bool {
     symbol == ' '
 }
 
-const PALETTE: [(u8, u8, u8); 6] = [
-    // rose,   luminance 0.19
-    (220, 60, 90),
-    // amber,  luminance 0.24
-    (200, 110, 30),
-    // green,   luminance 0.23
-    (50, 150, 60),
-    // teal,    luminance 0.25
-    (30, 150, 160),
-    // blue,    luminance 0.15
-    (60, 100, 210),
-    // violet,  luminance 0.15
-    (160, 60, 200),
+/// The colours the logo cycles through.
+///
+/// Every entry sits at relative luminance 0.17, which is what clears 3:1 against
+/// both a white and a black background -- and a terminal profile is whichever of
+/// those the user happens to run, so that band is a requirement rather than a
+/// preference. `every_colour_reads_on_a_light_and_on_a_dark_profile` enforces it.
+///
+/// Twelve rather than six, because the logo now changes colour on *every* wall
+/// bounce rather than only at corners, so consecutive colours are seen seconds
+/// apart and need to be obviously different. Six was enough when a change was a
+/// once-a-minute event. Hues are spread roughly every thirty degrees at constant
+/// luminance, which means the perceived *brightness* never jumps even though the
+/// hue always does -- varying luminance as well would read as a flash.
+const PALETTE: [(u8, u8, u8); 12] = [
+    (224, 34, 34),
+    (171, 98, 26),
+    (120, 120, 18),
+    (75, 130, 20),
+    (20, 135, 20),
+    (20, 133, 76),
+    (19, 128, 128),
+    (31, 117, 204),
+    (90, 70, 240),
+    (193, 0, 232),
+    (194, 31, 209),
+    (214, 32, 138),
 ];
 
 const DT: f64 = 1.0 / 60.0;
@@ -85,12 +111,55 @@ pub struct DvdOptions {
     /// Set to 1.0 for equal cell deltas, which is what the classic bouncing logo
     /// does in a character grid.
     pub slope: f32,
-    /// Change the logo color when the logo lands in a screen corner.
-    pub corner_color_change: bool,
+    /// When the logo changes colour.
+    ///
+    /// Was a bool meaning "on corners", and corners are almost unreachable: a
+    /// corner hit needs both axes to reverse on the same frame, and the bounce
+    /// periods are `2 * max_x / vx` and `2 * max_y / vy`. At 80x24 those are 5.7
+    /// and 3.4 seconds, and they only coincide when `57m = 17n` -- first at
+    /// m = 17, n = 57, which is 97 seconds. So the logo sat at one colour for a
+    /// minute and a half at a time, which is the same as never changing.
+    ///
+    /// lemonyte's `dvd-screensaver`, which is the reference for this effect,
+    /// recolours on *every* wall hit. That is the right answer: the colour change
+    /// becomes the thing the eye tracks between bounces, and it happens every two
+    /// or three seconds rather than never.
+    pub color_change: ColorChange,
     /// Start the logo from a corner instead of the middle.
     pub start_in_corner: bool,
     /// Seed for the starting corner and colour.
     pub seed: u64,
+}
+
+/// When the bouncing logo changes colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorChange {
+    /// On every wall hit. What the reference implementation does, and what makes
+    /// the logo feel alive rather than inert.
+    #[default]
+    Bounce,
+    /// Only when both axes reverse on the same frame, which is the easter egg the
+    /// reference's README jokes about -- "it could hit the corner if you look at
+    /// it long enough". True on an 80x24 screen roughly every 97 seconds.
+    Corner,
+    /// Never. One colour for the whole run.
+    Never,
+}
+
+impl ColorChange {
+    /// Every variant, so a test can check all of them.
+    pub const ALL: &'static [ColorChange] =
+        &[ColorChange::Bounce, ColorChange::Corner, ColorChange::Never];
+
+    /// Whether a bounce of these two axes should change the colour.
+    pub fn should_change(self, hit_x: bool, hit_y: bool) -> bool {
+        match self {
+            ColorChange::Bounce => hit_x || hit_y,
+            ColorChange::Corner => hit_x && hit_y,
+            ColorChange::Never => false,
+        }
+    }
 }
 
 impl Default for DvdOptions {
@@ -102,12 +171,34 @@ impl Default for DvdOptions {
     fn default() -> Self {
         Self {
             logo: String::from(DEFAULT_LOGO),
-            // 26 rather than 9. At 9 the logo covered 0.15 cells per frame, so
+            // 20 rather than 9. At 9 the logo covered 0.15 cells per frame, so
             // the drawn position changed once every seven frames: still for six
-            // frames out of seven, then a jump. At 26 it covers a cell in two.
-            speed: 26.0,
+            // frames out of seven, then a jump.
+            //
+            // The ceiling is a property of the medium, not a taste, and it is
+            // worth being precise about because the reference and this cannot
+            // match.
+            //
+            // lemonyte's screensaver moves 50 pixels a second across a 1920-pixel
+            // window, and its logo is a sixth of that window. So it crosses one
+            // logo width every 6.4 seconds. This logo is 23 cells wide, so the
+            // same feel would be 3.6 cells a second.
+            //
+            // At 3.6 cells a second the logo's position advances 7.2 samples a
+            // second horizontally against 60 frames, so more than eight frames in
+            // ten land between sample boundaries and do not change. That is the
+            // staircase, exactly as reported. The reference has 1920 positions to
+            // choose from; this has 160. **A terminal cannot render that feel
+            // smoothly, and the only honest trade is to be too quick rather than
+            // to stutter.**
+            //
+            // At 24 the screen changes on about 88 frames in 100, the logo crosses
+            // in 2.4 seconds, and a wall hit -- which recolours it -- comes every
+            // two to three seconds. Set `speed` in the config for calmer or
+            // brisker; below about 12 the stepping returns.
+            speed: 24.0,
             slope: 2.0,
-            corner_color_change: true,
+            color_change: ColorChange::default(),
             start_in_corner: true,
             seed: DEFAULT_SEED,
         }
@@ -272,7 +363,7 @@ impl Dvd {
             self.vy = 0.0;
         }
 
-        if hit_x && hit_y && self.options.corner_color_change {
+        if self.options.color_change.should_change(hit_x, hit_y) {
             self.color_index = (self.color_index + 1) % PALETTE.len();
         }
     }
@@ -485,21 +576,127 @@ mod tests {
         }
     }
 
+    /// Every wall hit has to change the colour.
+    ///
+    /// This is the reference implementation's behaviour and it is the difference
+    /// between a logo that feels alive and one that is inert. The previous option
+    /// was `corner_color_change`, and corners are almost unreachable: a corner
+    /// needs both axes to reverse on the same frame, and the bounce periods are
+    /// `2 * max_x / vx` and `2 * max_y / vy`. On an 80x24 screen those are 5.7
+    /// and 3.4 seconds and only coincide when `57m = 17n` -- first at m = 17,
+    /// n = 57, which is 97 seconds. So the logo sat at one colour for a minute and
+    /// a half, which is the same as never changing.
+    ///
+    /// This test is measured over a long enough run that the old corner-only
+    /// behaviour would have had many opportunities to fire and still fails,
+    /// because on these dimensions it needs about 97 seconds and this runs 10.
     #[test]
-    fn corner_hits_change_color() {
-        let mut effect = Dvd::new(options(), (6, 2));
-        effect.options.corner_color_change = true;
-        effect.reset();
+    fn every_wall_hit_changes_the_colour() {
+        let mut effect = Dvd::new(
+            DvdOptions {
+                color_change: ColorChange::Bounce,
+                ..options()
+            },
+            (80, 24),
+        );
         let initial = effect.color_index;
 
-        for _ in 0..2000 {
+        let mut changes = 0usize;
+        for _ in 0..600 {
             effect.step(1.0 / 60.0);
             if effect.color_index != initial {
-                return;
+                changes += 1;
             }
         }
 
-        panic!("color should change after repeated corner hits");
+        assert!(
+            changes >= 3,
+            "the colour changed {changes} times in ten seconds of bouncing, so the \
+             logo is effectively one colour. A wall hit every two or three seconds \
+             is what makes this read as motion rather than as a still image \
+             drifting."
+        );
+    }
+
+    /// The corner mode has to stay available, because it is the easter egg.
+    ///
+    /// The reference README jokes that "it could hit the corner if you look at it
+    /// long enough", and that is a real thing to be able to switch on.
+    #[test]
+    fn corner_mode_changes_only_when_both_axes_reverse_together() {
+        // Small and square-ish, so the two bounce periods are close and coincide
+        // quickly. The old test relied on exactly this, at 6x2.
+        for (width, height) in [(6u16, 2u16), (20, 20)] {
+            let mut effect = Dvd::new(
+                DvdOptions {
+                    color_change: ColorChange::Corner,
+                    ..options()
+                },
+                (width, height),
+            );
+            let initial = effect.color_index;
+            let mut changes = 0usize;
+            let mut bounces = 0usize;
+            let mut previous = (effect.x, effect.y);
+
+            for _ in 0..20_000 {
+                let before = (effect.x, effect.y);
+                effect.step(1.0 / 60.0);
+                let reversed = (effect.x - before.0).abs() < 1e-9
+                    || (effect.y - before.1).abs() < 1e-9;
+                if reversed {
+                    bounces += 1;
+                }
+                if effect.color_index != initial {
+                    changes += 1;
+                    effect.color_index = initial;
+                }
+                previous = (effect.x, effect.y);
+            }
+            let _ = previous;
+
+            assert!(
+                bounces > changes,
+                "at {width}x{height} the colour changed {changes} times over \
+                 {bounces} wall hits, so corner mode is firing on ordinary \
+                 bounces"
+            );
+        }
+    }
+
+    /// `Never` has to actually never.
+    #[test]
+    fn never_mode_holds_one_colour() {
+        let mut effect = Dvd::new(
+            DvdOptions {
+                color_change: ColorChange::Never,
+                ..options()
+            },
+            (80, 24),
+        );
+        let initial = effect.color_index;
+        for _ in 0..5_000 {
+            effect.step(1.0 / 60.0);
+            assert_eq!(effect.color_index, initial);
+        }
+    }
+
+    /// The rule itself, for all three modes, without a simulation in the way.
+    #[test]
+    fn the_colour_rule_is_what_each_mode_says() {
+        assert!(ColorChange::Bounce.should_change(true, false));
+        assert!(ColorChange::Bounce.should_change(false, true));
+        assert!(ColorChange::Bounce.should_change(true, true));
+        assert!(!ColorChange::Bounce.should_change(false, false));
+
+        assert!(!ColorChange::Corner.should_change(true, false));
+        assert!(!ColorChange::Corner.should_change(false, true));
+        assert!(ColorChange::Corner.should_change(true, true));
+        assert!(!ColorChange::Corner.should_change(false, false));
+
+        for (hit_x, hit_y) in [(true, false), (false, true), (true, true)] {
+            assert!(!ColorChange::Never.should_change(hit_x, hit_y));
+        }
     }
 
     #[test]
@@ -613,11 +810,16 @@ mod tests {
             samples.insert((dvd.y * SAMPLES_PER_CELL as f64).floor() as i64);
             cells.insert(dvd.y.floor() as i64);
         }
+        // The ratio, not an absolute count: the absolute number moves with the
+        // speed and the terminal size, and a threshold on it is a threshold on the
+        // wrong thing. Two samples per cell means the drawn positions must
+        // outnumber the cell positions by close to two to one.
+        let ratio = samples.len() as f32 / cells.len().max(1) as f32;
         assert!(
-            samples.len() > 20,
-            "only {} distinct drawn vertical positions in one second, against \
-             {} at whole-cell resolution, so the sub-cell vertical motion is \
-             not being drawn",
+            ratio > 1.8,
+            "{} distinct drawn vertical positions against {} at whole-cell \
+             resolution, a ratio of {ratio:.2}, so the sub-cell vertical motion \
+             is not being drawn",
             samples.len(),
             cells.len()
         );

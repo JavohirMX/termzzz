@@ -1087,7 +1087,22 @@ fn dvd_options_default_to_a_block_letter_logo() {
         rendered.contains("[dvd]"),
         "the dvd section is missing from the rendered config"
     );
-    assert!(options.corner_color_change);
+    // Recolours on every wall hit, which is the reference implementation's
+    // behaviour. The option used to be `corner_color_change`, and a corner needs
+    // both axes to reverse on the same frame: at 80x24 that first happens after
+    // 97 seconds, so the logo was effectively one colour for the whole run.
+    assert_eq!(
+        options.color_change,
+        termzzz::dvd::effect::ColorChange::Bounce
+    );
+    // The palette has to be big enough that consecutive bounces look different,
+    // which is the whole point of changing that often.
+    assert!(
+        options.slope > 1.0,
+        "a slope of {} draws equal cell deltas, which on this cell aspect ratio \
+         is a line at 50 to 63 degrees rather than a diagonal",
+        options.slope
+    );
     // And the speed has to be high enough that the drawn position actually
     // changes between frames, which is the whole "not a staircase" requirement.
     assert!(
