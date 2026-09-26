@@ -23,6 +23,7 @@
 //! | `pipes`  | Pipe maze animation                      |
 //! | `plasma` | Plasma color wave effect                 |
 //! | `registry`| Canonical effect IDs and construction     |
+//! | `playlist` | Timed playlist with blank-wipe transitions |
 //! | `rain`   | Matrix-style digital rain                |
 //! | `runtime`| Runtime input and frame context          |
 //! | `terrain`| Terrain generation — scrolling landscape |
@@ -45,6 +46,7 @@ pub mod life;
 pub mod maze;
 pub mod pipes;
 pub mod plasma;
+pub mod playlist;
 pub mod rain;
 pub mod registry;
 pub mod runtime;

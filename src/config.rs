@@ -13,6 +13,7 @@ use crate::{
     maze::{MazeOptions, MazeOptionsBuilder},
     pipes::{PipesOptions, PipesOptionsBuilder},
     plasma::{PlasmaOptions, PlasmaOptionsBuilder},
+    playlist::{PlaylistOptions, PlaylistOptionsBuilder},
     rain::digital_rain::{DigitalRainOptions, DigitalRainOptionsBuilder},
     terrain::{TerrainOptions, TerrainOptionsBuilder},
 };
@@ -41,7 +42,7 @@ fn config_path() -> PathBuf {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub matrix: DigitalRainOptions,
@@ -73,6 +74,8 @@ pub struct Config {
     pub terrain: TerrainOptions,
     #[serde(default)]
     pub constellation: ConstellationOptions,
+    #[serde(default)]
+    pub playlist: PlaylistOptions,
 }
 
 impl Config {
@@ -189,6 +192,10 @@ impl Config {
         self.constellation.clone()
     }
 
+    pub fn get_playlist_options(&self) -> PlaylistOptions {
+        self.playlist.clone()
+    }
+
     pub fn get_dvd_options(&self) -> DvdOptions {
         self.dvd.clone()
     }
@@ -211,6 +218,10 @@ impl Default for Config {
             crab: CrabOptionsBuilder::default().build().unwrap(),
             donut: DonutOptionsBuilder::default().build().unwrap(),
             dvd: DvdOptionsBuilder::default().build().unwrap(),
+            playlist: PlaylistOptionsBuilder::default()
+                .transition(0.6_f32)
+                .build()
+                .unwrap(),
             pipes: PipesOptionsBuilder::default().build().unwrap(),
             plasma: PlasmaOptionsBuilder::default().build().unwrap(),
             fire: FireOptionsBuilder::default().build().unwrap(),

@@ -5,6 +5,7 @@ use termzzz::{
     check, common,
     config::Config,
     error,
+    playlist::{Playlist, PlaylistEntry},
     registry::{AnyEffect, EffectId},
 };
 
@@ -14,11 +15,15 @@ struct AppArgs {
     check: bool,
     effect: Option<String>,
     frames: Option<usize>,
+    playlist: Option<Vec<String>>,
+    shuffle: bool,
+    transition: Option<f32>,
 }
 
 /// Guard to drop out alternate screen in case of errors
 struct TerminalGuard {
     stdout: io::Stdout,
+    mouse_capture: bool,
 }
 
 impl TerminalGuard {
@@ -41,7 +46,15 @@ impl TerminalGuard {
             return Err(error);
         }
 
-        Ok(Self { stdout })
+        Ok(Self {
+            stdout,
+            mouse_capture: false,
+        })
+    }
+
+    fn enable_mouse(&mut self) -> io::Result<()> {
+        self.mouse_capture = true;
+        execute!(self.stdout, crossterm::event::EnableMouseCapture)
     }
 
     // Get mutable access to the stdout
@@ -52,6 +65,9 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.mouse_capture {
+            let _ = execute!(self.stdout, crossterm::event::DisableMouseCapture);
+        }
         let _ = execute!(
             self.stdout,
             cursor::Show,
@@ -82,6 +98,46 @@ fn main() -> Result<(), error::TermzzzError> {
     }
     let size = common::normalize_effect_size(terminal::size()?);
 
+    if args.playlist.is_some() || args.shuffle {
+        let mut options = config.get_playlist_options();
+        if let Some(names) = &args.playlist {
+            options.effects = names
+                .iter()
+                .map(|name| PlaylistEntry {
+                    effect: name.clone(),
+                    duration: None,
+                })
+                .collect();
+        }
+        if args.shuffle {
+            options.shuffle = true;
+        }
+        if let Some(transition) = args.transition {
+            options.transition = transition;
+        }
+
+        let needs_mouse = options
+            .effects
+            .iter()
+            .filter_map(|entry| entry.effect.parse::<EffectId>().ok())
+            .any(|id| id.needs_mouse());
+
+        let fps = {
+            let mut guard = TerminalGuard::new()?;
+            let mut effect = Playlist::new(options, config.clone(), size);
+
+            if needs_mouse && let Err(error) = guard.enable_mouse() {
+                eprintln!("Mouse capture unavailable: {}", error);
+            }
+
+            common::run_loop(guard.get_stdout(), &mut effect, None)?
+        };
+
+        println!("{}", config_status);
+        println!("Frames per second: {:.1}", fps);
+        return Ok(());
+    }
+
     let effect_id = match args.screen_saver.parse::<EffectId>() {
         Ok(effect_id) => effect_id,
         Err(error) => {
@@ -94,6 +150,12 @@ fn main() -> Result<(), error::TermzzzError> {
     let fps = {
         let mut guard = TerminalGuard::new()?;
         let mut effect = AnyEffect::build(effect_id, &config, size);
+
+        if effect_id.needs_mouse()
+            && let Err(error) = guard.enable_mouse()
+        {
+            eprintln!("Mouse capture unavailable: {}", error);
+        }
 
         common::run_loop(guard.get_stdout(), &mut effect, None)?
     };
@@ -122,6 +184,9 @@ where
     let mut effect = None;
     let mut effect_explicit = false;
     let mut frames = None;
+    let mut playlist = None;
+    let mut shuffle = false;
+    let mut transition = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -152,6 +217,40 @@ where
                     frames = frame_str.parse().ok();
                 }
             }
+            "--playlist" => {
+                let value = args.next().ok_or_else(|| {
+                    "--playlist requires a comma-separated list of effects"
+                        .to_string()
+                })?;
+                playlist = Some(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                );
+                if playlist.as_ref().is_some_and(Vec::is_empty) {
+                    return Err(
+                        "--playlist requires at least one effect".to_string()
+                    );
+                }
+            }
+            "--shuffle" => {
+                shuffle = true;
+            }
+            "--transition" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--transition requires a value".to_string())?;
+                let parsed = value
+                    .parse::<f32>()
+                    .map_err(|_| "--transition must be a number".to_string())?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err("--transition must be zero or greater".to_string());
+                }
+                transition = Some(parsed);
+            }
             arg if !arg.starts_with('-') => {
                 if check && !effect_explicit {
                     effect = Some(arg.to_string());
@@ -170,6 +269,9 @@ where
         check,
         effect,
         frames,
+        playlist,
+        shuffle,
+        transition,
     })
 }
 
@@ -190,6 +292,9 @@ fn print_help() {
     println!("        --check             Run test mode");
     println!("        --effect <EFFECT>    Effect to test (with --check)");
     println!("        --frames <NUM>       Number of frames to run (with --check)");
+    println!("        --playlist <LIST>    Play effects in order, comma separated");
+    println!("        --shuffle            Play the playlist in random order");
+    println!("        --transition <SECS>  Seconds of blank wipe between effects");
     println!("        --print-config       Print default config as TOML to stdout");
     println!();
     println!("CONFIG:");
@@ -202,6 +307,8 @@ fn print_help() {
     println!("    termzzz --check            Test with default effect");
     println!("    termzzz --check life       Test Life effect");
     println!("    termzzz --check --frames 100 life");
+    println!("    termzzz --playlist matrix,dvd,plasma");
+    println!("    termzzz --shuffle");
     println!("    termzzz --print-config > ~/.config/termzzz.toml");
     println!("    termzzz --version          Show version");
 }
@@ -213,6 +320,66 @@ fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_playlist_list() {
+        let args = parse_args_from(
+            ["--playlist".to_string(), "matrix, dvd ,plasma".to_string()]
+                .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.playlist,
+            Some(vec![
+                "matrix".to_string(),
+                "dvd".to_string(),
+                "plasma".to_string()
+            ])
+        );
+        assert!(!args.shuffle);
+    }
+
+    #[test]
+    fn rejects_empty_playlist() {
+        assert!(
+            parse_args_from(
+                ["--playlist".to_string(), " , ".to_string()].into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn playlist_requires_a_value() {
+        assert!(parse_args_from(["--playlist".to_string()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn parses_shuffle_and_transition() {
+        let args = parse_args_from(
+            [
+                "--shuffle".to_string(),
+                "--transition".to_string(),
+                "1.5".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert!(args.shuffle);
+        assert_eq!(args.transition, Some(1.5));
+    }
+
+    #[test]
+    fn rejects_negative_transition() {
+        assert!(
+            parse_args_from(
+                ["--transition".to_string(), "-1".to_string()].into_iter()
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn check_mode_uses_positional_effect() {
