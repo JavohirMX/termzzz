@@ -30,6 +30,9 @@ termzzz ascii       # Interactive generative ASCII field
 termzzz --playlist matrix,dvd,plasma
 termzzz --shuffle
 
+# Reproducible runs: every effect that uses randomness honours the seed
+termzzz matrix --seed 1234
+
 # Development
 cargo test        # Run tests
 cargo bench       # Run benchmarks (criterion)
@@ -61,17 +64,25 @@ repository and the distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **Determinism.** Eight effects still draw from an unseeded thread-local
-   generator, so they cannot be compared against a second instance — which is why
-   `tests/effect_contracts.rs` reports them as unverifiable rather than checking
-   them. Adding a `seed` to each closes the gap and gives users reproducible runs.
-   `ThreadRng` cannot be seeded, so those effects need `StdRng`.
-2. **The contract refactor** (`Canvas` plus `Box<dyn TerminalEffect>`), which
+1. **The contract refactor** (`Canvas` plus `Box<dyn TerminalEffect>`), which
    deletes the 14 copies of the double-buffer pattern and the per-frame
-   full-screen buffer allocation, and makes dispatch a vtable.
+   full-screen buffer allocation, and makes dispatch a vtable. It is also what
+   makes swapping the running effect from a keypress possible.
+2. **The sub-cell renderer.** Braille first, which needs no change to `Cell`
+   because it is monochrome per cell; half-block afterwards, which needs `Cell`
+   to grow a background colour.
+
+Determinism is done: all nine effects that used an unseeded generator now carry a
+`seed` option and a seeded `StdRng`, `--seed <N>` overrides all of them, and
+`tests/effect_contracts.rs` asserts both reproducibility and seed sensitivity for
+every effect. Because they became comparable, that suite also found that five of
+them advanced by a fixed step per rendered frame — `maze`, `boids`, `crab`,
+`pipes` and `constellation` ignored the speed keys — which is fixed too.
 
 Not worth doing soon: further performance work. Nothing is dropping frames — the
-worst effect uses about 2% of a 60 fps budget at 200x50.
+worst effect uses about 2% of a 60 fps budget at 200x50. `life`, `plasma` and
+`fire` exceed the 2 ms budget at 400x200, and did so before the determinism work
+too.
 
 ## Working Practices
 

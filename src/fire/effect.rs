@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,8 @@ const MAXTABLE: usize = 256 * 5;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FireOptions {
     pub use_colors: bool,
+    /// Seed for the combustion noise that seeds new fires along the bottom row.
+    pub seed: u64,
 }
 
 impl Default for FireOptions {
@@ -63,7 +65,10 @@ impl Default for FireOptions {
     /// produced zeros, and serde used the derived one, so a config file
     /// that omitted a section silently zeroed it.
     fn default() -> Self {
-        Self { use_colors: true }
+        Self {
+            use_colors: true,
+            seed: DEFAULT_SEED,
+        }
     }
 }
 
@@ -85,7 +90,7 @@ pub struct Fire {
     sloop_counter: i32,       // Secondary loop counter
     height_counter: u32,      // Height counter for fire growth
     step_accumulator: f32,    // Elapsed time not yet spent on a combustion step
-    rng: rand::prelude::ThreadRng,
+    rng: EffectRng,
 }
 
 impl TerminalEffect for Fire {
@@ -124,6 +129,11 @@ impl TerminalEffect for Fire {
         // Generate the intensity table
         self.generate_intensity_table();
 
+        // Reseeded with the rest of the state this function already rebuilds,
+        // so a resize restarts the combustion noise rather than continuing the
+        // old sequence against a blank bitmap.
+        self.rng = seeded_rng(self.options.seed, "fire");
+
         // Reset animation counters
         self.loop_counter = 0;
         self.sloop_counter = 0;
@@ -156,6 +166,7 @@ impl Fire {
 
         let mut fire = Fire {
             screen_size,
+            rng: seeded_rng(options.seed, "fire"),
             options,
             buffer,
             color_palette,
@@ -165,7 +176,6 @@ impl Fire {
             sloop_counter: 0,
             height_counter: 0,
             step_accumulator: 0.0,
-            rng: rand::rng(),
         };
 
         // Generate the intensity table
@@ -351,13 +361,5 @@ impl Fire {
         }
 
         new_buffer
-    }
-}
-
-impl DefaultOptions for Fire {
-    type Options = FireOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        FireOptions { use_colors: true }
     }
 }

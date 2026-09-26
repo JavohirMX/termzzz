@@ -20,6 +20,7 @@ struct AppArgs {
     playlist: Option<Vec<String>>,
     shuffle: bool,
     transition: Option<f32>,
+    seed: Option<u64>,
 }
 
 fn main() -> Result<(), error::TermzzzError> {
@@ -37,7 +38,12 @@ fn main() -> Result<(), error::TermzzzError> {
         }
     };
 
-    let (config, config_status) = Config::load()?;
+    let (mut config, config_status) = Config::load()?;
+    // Applied before anything reads an options struct, so it reaches the single
+    // effect that runs as well as every entry of a playlist.
+    if let Some(seed) = args.seed {
+        config.override_seed(seed);
+    }
     let speed = args
         .speed
         .unwrap_or(config.global.speed)
@@ -161,6 +167,7 @@ where
     let mut playlist = None;
     let mut shuffle = false;
     let mut transition = None;
+    let mut seed = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -208,6 +215,15 @@ where
                     ));
                 }
                 speed = Some(value);
+            }
+            "--seed" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--seed requires a value".to_string())?;
+                seed =
+                    Some(value.parse::<u64>().map_err(|_| {
+                        "--seed must be a whole number".to_string()
+                    })?);
             }
             "--playlist" => {
                 let value = args.next().ok_or_else(|| {
@@ -265,6 +281,7 @@ where
         playlist,
         shuffle,
         transition,
+        seed,
     })
 }
 
@@ -286,6 +303,9 @@ fn print_help() {
     println!("        --effect <EFFECT>    Effect to test (with --check)");
     println!("        --frames <NUM>       Number of frames to run (with --check)");
     println!("        --speed <MULT>       Global speed multiplier (default 1.0)");
+    println!(
+        "        --seed <N>           Seed the random effects, for a reproducible run"
+    );
     println!("        --playlist <LIST>    Play effects in order, comma separated");
     println!("        --shuffle            Play the playlist in random order");
     println!("        --transition <SECS>  Seconds of blank wipe between effects");
@@ -357,6 +377,45 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.speed, Some(0.5));
+    }
+
+    #[test]
+    fn parses_seed_override() {
+        let args = parse_args_from(
+            [
+                "--seed".to_string(),
+                "1234".to_string(),
+                "matrix".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(args.seed, Some(1234));
+    }
+
+    #[test]
+    fn seed_defaults_to_none_and_rejects_nonsense() {
+        let untouched =
+            parse_args_from(["matrix".to_string()].into_iter()).unwrap();
+        assert_eq!(untouched.seed, None);
+
+        // A seed is a whole number, so a negative or fractional value has to be
+        // refused rather than silently truncated to something else.
+        for bad in ["-1", "1.5", "abc", ""] {
+            assert!(
+                parse_args_from(
+                    ["--seed".to_string(), bad.to_string()].into_iter()
+                )
+                .is_err(),
+                "--seed {bad:?} was accepted"
+            );
+        }
+
+        assert!(
+            parse_args_from(["--seed".to_string()].into_iter()).is_err(),
+            "--seed with no value was accepted"
+        );
     }
 
     #[test]

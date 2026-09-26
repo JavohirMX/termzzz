@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::TerminalEffect;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -173,18 +173,6 @@ impl Plasma {
 
                 buffer.set(x, y, cell);
             }
-        }
-    }
-}
-
-impl DefaultOptions for Plasma {
-    type Options = PlasmaOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        PlasmaOptions {
-            time_scale: 1.0,
-            spatial_scale: 1.0,
-            color_speed: 150.0,
         }
     }
 }

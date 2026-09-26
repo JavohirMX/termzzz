@@ -213,6 +213,27 @@ impl Config {
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
     }
+
+    /// Overrides the seed of every section that has one.
+    ///
+    /// Spelled out field by field on purpose: a `--seed` that quietly skipped a
+    /// section would leave that effect unreproducible while appearing to work,
+    /// which is the same class of silent gap as an effect missing from the
+    /// registry. The sections listed here are exactly the ones whose options
+    /// carry a `seed`.
+    pub fn override_seed(&mut self, seed: u64) {
+        self.matrix.seed = seed;
+        self.life.seed = seed;
+        self.maze.seed = seed;
+        self.boids.seed = seed;
+        self.ascii.seed = seed;
+        self.crab.seed = seed;
+        self.dvd.seed = seed;
+        self.pipes.seed = seed;
+        self.fire.seed = seed;
+        self.terrain.seed = seed;
+        self.constellation.seed = seed;
+    }
 }
 
 impl Default for Config {

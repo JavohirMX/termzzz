@@ -28,7 +28,7 @@ impl Permutation {
     /// stored the seed and then ignored it: every terrain, at every seed,
     /// rendered the identical landscape, while the config file advertised
     /// `seed` as if it did something.
-    fn seeded(seed: u32) -> Self {
+    fn seeded(seed: u64) -> Self {
         let mut p = [0u8; 256];
         p.copy_from_slice(&BASE);
 
@@ -43,7 +43,7 @@ impl Permutation {
         };
 
         for i in (1..256).rev() {
-            let j = (next() % (i as u32 + 1)) as usize;
+            let j = (next() % (i as u64 + 1)) as usize;
             p.swap(i, j);
         }
 
@@ -65,7 +65,7 @@ pub struct PerlinNoise {
 }
 
 impl PerlinNoise {
-    pub fn new(seed: u32) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self {
             permutation: Box::new(Permutation::seeded(seed)),
         }

@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,9 @@ pub struct CrabOptions {
     pub movement_speed: f32,
 
     pub crab_coeff: f32,
+
+    /// Seed for the initial colony and every movement, turn and clap after it.
+    pub seed: u64,
 }
 
 impl Default for CrabOptions {
@@ -91,6 +94,7 @@ impl Default for CrabOptions {
             clap_chance: 0.05,
             movement_speed: 3.0,
             crab_coeff: 1.0,
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -100,7 +104,7 @@ pub struct Crab {
     options: CrabOptions,
     buffer: Buffer,
     crabs: Vec<CrabEntity>,
-    rng: rand::prelude::ThreadRng,
+    rng: EffectRng,
     frame_timer: f32,
 }
 
@@ -108,7 +112,7 @@ impl CrabEntity {
     fn new(
         position: (f32, f32),
         velocity: (f32, f32),
-        rng: &mut rand::prelude::ThreadRng,
+        rng: &mut EffectRng,
     ) -> Self {
         // Determine initial direction based on velocity
         let direction = if velocity.0 >= 0.0 {
@@ -179,7 +183,7 @@ impl CrabEntity {
         animation_speed: f32,
         movement_speed: f32,
         clap_chance: f32,
-        rng: &mut rand::prelude::ThreadRng,
+        rng: &mut EffectRng,
     ) {
         // Update position based on velocity
         self.position.0 += self.velocity.0 * movement_speed * dt;
@@ -299,26 +303,15 @@ impl TerminalEffect for Crab {
     }
 
     fn update(&mut self) {
-        // Use a fixed delta time for smooth animation
-        let dt = 0.033; // ~30 FPS
+        // The rate the defaults were tuned against. Driven through the plain
+        // `update` path, the colony still walks at the speed it was designed
+        // for; the frame loop supplies the real delta below.
+        self.step(1.0 / 30.0);
+    }
 
-        // Update frame timer
-        self.frame_timer += dt;
-
-        // Update each crab
-        for crab in &mut self.crabs {
-            crab.update(
-                dt,
-                self.screen_size,
-                self.options.animation_speed,
-                self.options.movement_speed,
-                self.options.clap_chance,
-                &mut self.rng,
-            );
-        }
-
-        // Check for collisions between crabs
-        self.check_crab_collisions();
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        // Capped so a stall does not teleport the colony across the screen.
+        self.step(context.delta.as_secs_f64().min(0.1));
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -334,8 +327,27 @@ impl TerminalEffect for Crab {
 }
 
 impl Crab {
+    fn step(&mut self, dt: f64) {
+        self.frame_timer += dt as f32;
+
+        for crab in &mut self.crabs {
+            crab.update(
+                dt as f32,
+                self.screen_size,
+                self.options.animation_speed,
+                self.options.movement_speed,
+                self.options.clap_chance,
+                &mut self.rng,
+            );
+        }
+
+        self.check_crab_collisions();
+    }
+
     pub fn new(options: CrabOptions, screen_size: (u16, u16)) -> Self {
-        let mut rng = rand::rng();
+        // One generator for the whole colony, drawn from sequentially, so the
+        // crabs diverge from each other the way separate draws would.
+        let mut rng = seeded_rng(options.seed, "crab");
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
 
         let width = screen_size.0 as f32;
@@ -442,24 +454,6 @@ impl Crab {
                     };
                 }
             }
-        }
-    }
-}
-
-impl DefaultOptions for Crab {
-    type Options = CrabOptions;
-
-    fn default_options(width: u16, height: u16) -> Self::Options {
-        // Adjust crab count based on screen size
-        let screen_area = width as f32 * height as f32;
-        let crab_count = (screen_area / 800.0).clamp(3.0, 15.0) as u16;
-
-        CrabOptions {
-            crab_count,
-            animation_speed: 0.2,
-            movement_speed: 5.0,
-            clap_chance: 0.05,
-            ..Default::default()
         }
     }
 }

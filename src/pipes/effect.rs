@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,8 @@ pub struct PipesOptions {
     pub num_lines: usize,
     pub pipe_type_change: f64,
     pub cleanup_factor: f64,
+    /// Seed for pipe placement, turning, colour and line style.
+    pub seed: u64,
 }
 
 impl Default for PipesOptions {
@@ -46,6 +48,7 @@ impl Default for PipesOptions {
             num_lines: 3,
             pipe_type_change: 0.3,
             cleanup_factor: 0.9,
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -58,27 +61,31 @@ pub struct Pipe {
     next_location: (usize, usize),
     curr_color: style::Color,
     pub colors: Vec<style::Color>,
-    pub rng: rand::prelude::ThreadRng,
+    pub rng: EffectRng,
 }
 
 pub struct Pipes {
     pub screen_size: (u16, u16),
     options: PipesOptions,
+    /// Last frame handed to the terminal.
     buffer: Buffer,
+    /// The frame being built. Pipes are drawn here during `update` and only
+    /// diffed against `buffer` during `get_diff`.
+    frame: Buffer,
     pipes_made: bool,
     pipes: Vec<Pipe>,
+    /// Fraction of a pipe step not yet spent.
+    step_accumulator: f32,
 }
 
 impl TerminalEffect for Pipes {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        // Clone the previous buffer to work with
-        let mut curr_buffer = self.buffer.clone();
-
-        if !self.pipes_made {
-            self.start_new_pipes(&mut curr_buffer);
-        } else {
-            self.continue_pipes(&mut curr_buffer);
-        }
+        // Pure rendering. The pipes were advanced during `update`, so all that
+        // happens here is to decide whether the frame is full enough to keep and
+        // then hand over the cells that changed. Advancing from here meant the
+        // pipes grew one cell per *rendered frame*, so they crawled on a slow
+        // terminal and raced on a fast one.
+        let curr_buffer = self.frame.clone();
 
         // Check if cleanup threshold has been reached by counting empty cells
         let total_cells = self.screen_size.0 as usize * self.screen_size.1 as usize;
@@ -113,7 +120,12 @@ impl TerminalEffect for Pipes {
     }
 
     fn update(&mut self) {
-        // No additional state updates needed between frames
+        self.advance(1.0 / 60.0);
+    }
+
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        // Capped so a stall cannot draw a hundred cells in one frame.
+        self.advance(context.delta.as_secs_f64().min(0.1));
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -124,7 +136,17 @@ impl TerminalEffect for Pipes {
     fn reset(&mut self) {
         self.buffer =
             Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        self.frame =
+            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
         self.pipes_made = false;
+        self.step_accumulator = 0.0;
+
+        // This effect does not rebuild itself through `new`, so the generators
+        // are refreshed here. Without it a resize would leave every pipe
+        // carrying on from wherever its sequence had reached.
+        for (index, pipe) in self.pipes.iter_mut().enumerate() {
+            pipe.rng = seeded_rng(self.options.seed ^ index as u64, "pipes");
+        }
     }
 }
 
@@ -355,7 +377,48 @@ impl Pipe {
     }
 }
 
+/// Seconds of progress per pipe cell, i.e. how fast the pipes grow.
+const PIPE_STEP: f64 = 1.0 / 60.0;
+/// Upper bound on cells grown in one frame.
+const MAX_STEPS_PER_FRAME: usize = 8;
+
 impl Pipes {
+    /// Grows the pipes by `seconds` worth of progress, in whole cells.
+    fn advance(&mut self, seconds: f64) {
+        self.step_accumulator += (seconds / PIPE_STEP) as f32;
+        let budget = self.step_accumulator.floor();
+        self.step_accumulator -= budget;
+        let mut steps = (budget as usize).min(MAX_STEPS_PER_FRAME);
+        if steps == 0 {
+            return;
+        }
+        // If the budget was clipped, drop the remainder rather than carrying it
+        // forward, so a long stall cannot leave a burst of catch-up steps queued
+        // for the following frames.
+        if budget as usize > MAX_STEPS_PER_FRAME {
+            self.step_accumulator = 0.0;
+        }
+        while steps > 0 {
+            if self.pipes_made {
+                Self::continue_pipes(
+                    &mut self.pipes,
+                    &mut self.frame,
+                    &self.options,
+                    self.screen_size,
+                );
+            } else {
+                Self::start_new_pipes(
+                    &mut self.pipes,
+                    &mut self.frame,
+                    &self.options,
+                    self.screen_size,
+                    &mut self.pipes_made,
+                );
+            }
+            steps -= 1;
+        }
+    }
+
     pub fn new(options: PipesOptions, screen_size: (u16, u16)) -> Self {
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
         let colors = vec![
@@ -368,7 +431,11 @@ impl Pipes {
         ];
 
         let mut pipes = Vec::with_capacity(options.num_lines);
-        for _ in 0..options.num_lines {
+        // The index is folded into each pipe's seed. Giving them all the same
+        // generator would make every pipe draw the identical sequence, so they
+        // would turn, recolour and restart on the same frame — the animation
+        // would look like one pipe, not several.
+        for index in 0..options.num_lines {
             pipes.push(Pipe {
                 line_type: options.line_type,
                 turn_probability: options.turn_probability,
@@ -377,62 +444,53 @@ impl Pipes {
                 next_location: (0, 0),
                 curr_color: style::Color::White,
                 colors: colors.clone(),
-                rng: rand::rng(),
+                rng: seeded_rng(options.seed ^ index as u64, "pipes"),
             });
         }
 
         Self {
             screen_size,
             options,
+            frame: buffer.clone(),
             buffer,
             pipes_made: false,
+            step_accumulator: 0.0,
             pipes,
         }
     }
 
-    // Start a new pipe from a random edge location
-    fn start_new_pipes(&mut self, buffer: &mut Buffer) {
-        let width = self.screen_size.0 as usize;
-        let height = self.screen_size.1 as usize;
+    /// Starts each pipe at a random point on an edge.
+    ///
+    /// Takes the pieces rather than `&mut self` so the caller can pass the pipe
+    /// list and the frame it draws into as two disjoint borrows.
+    fn start_new_pipes(
+        pipes: &mut [Pipe],
+        frame: &mut Buffer,
+        options: &PipesOptions,
+        screen_size: (u16, u16),
+        pipes_made: &mut bool,
+    ) {
+        let (width, height) = (screen_size.0 as usize, screen_size.1 as usize);
 
-        for pipe in &mut self.pipes {
-            pipe.start_new_pipe(
-                buffer,
-                width,
-                height,
-                self.options.pipe_type_change,
-            );
+        for pipe in pipes.iter_mut() {
+            pipe.start_new_pipe(frame, width, height, options.pipe_type_change);
         }
 
-        self.pipes_made = true;
+        *pipes_made = true;
     }
 
     // Continue an existing pipe
-    fn continue_pipes(&mut self, buffer: &mut Buffer) {
-        let width = self.screen_size.0 as usize;
-        let height = self.screen_size.1 as usize;
+    /// Grows every pipe by one cell.
+    fn continue_pipes(
+        pipes: &mut [Pipe],
+        frame: &mut Buffer,
+        options: &PipesOptions,
+        screen_size: (u16, u16),
+    ) {
+        let (width, height) = (screen_size.0 as usize, screen_size.1 as usize);
 
-        for pipe in &mut self.pipes {
-            pipe.continue_pipe(
-                buffer,
-                width,
-                height,
-                self.options.pipe_type_change,
-            );
-        }
-    }
-}
-
-impl DefaultOptions for Pipes {
-    type Options = PipesOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        PipesOptions {
-            turn_probability: 0.2,
-            line_type: 2,
-            num_lines: 5,
-            cleanup_factor: 0.9,
-            ..Default::default()
+        for pipe in pipes.iter_mut() {
+            pipe.continue_pipe(frame, width, height, options.pipe_type_change);
         }
     }
 }

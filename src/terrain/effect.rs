@@ -1,12 +1,12 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::TerminalEffect;
 use crate::terrain::noise::PerlinNoise;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerrainOptions {
-    pub seed: u32,
+    pub seed: u64,
     pub scale: f64,
     pub octaves: i32,
     pub persistence: f64,
@@ -20,7 +20,7 @@ impl Default for TerrainOptions {
     /// that omitted a section silently zeroed it.
     fn default() -> Self {
         Self {
-            seed: 42,
+            seed: crate::common::DEFAULT_SEED,
             scale: 0.02,
             octaves: 4,
             persistence: 0.5,
@@ -142,18 +142,5 @@ impl Terrain {
                 b: intensity,
             },
         )
-    }
-}
-
-impl DefaultOptions for Terrain {
-    type Options = TerrainOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        TerrainOptions {
-            seed: 42,
-            scale: 0.02,
-            octaves: 4,
-            persistence: 0.5,
-        }
     }
 }

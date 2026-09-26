@@ -1,4 +1,5 @@
 // use super::rain_options::DigitalRainOptions;
+use crate::common::EffectRng;
 use crate::rain::digital_rain::DigitalRainOptions;
 use rand::{
     self, Rng, RngExt,
@@ -69,7 +70,7 @@ impl RainDrop {
         screen_size: (u16, u16),
         options: &DigitalRainOptions,
         drop_id: usize,
-        rng: &mut rand::prelude::ThreadRng,
+        rng: &mut EffectRng,
     ) -> Self {
         // Drawn from the generator we were handed, not from the ambient thread
         // RNG. Using `rand::random()` here meant a caller seeding `rng` to get a
@@ -142,7 +143,7 @@ impl RainDrop {
         &mut self,
         screen_size: (u16, u16),
         options: &DigitalRainOptions,
-        rng: &mut rand::prelude::ThreadRng,
+        rng: &mut EffectRng,
     ) {
         self.body.clear();
         self.body.insert(0, *CHARACTERS.choose(rng).unwrap());
@@ -161,7 +162,7 @@ impl RainDrop {
     }
 
     /// Grow up matrix worm characters array
-    fn grow(&mut self, head_y: u16, rng: &mut rand::prelude::ThreadRng) {
+    fn grow(&mut self, head_y: u16, rng: &mut EffectRng) {
         if self.body.len() >= self.max_length {
             self.body.truncate(self.max_length);
             return;
@@ -203,7 +204,7 @@ impl RainDrop {
         screen_size: (u16, u16),
         options: &DigitalRainOptions,
         dt: Duration,
-        rng: &mut rand::prelude::ThreadRng,
+        rng: &mut EffectRng,
     ) {
         // NOTE: looks like guard, but why i even need it here?
         if self.body.is_empty() {
@@ -249,6 +250,7 @@ impl RainDrop {
 #[cfg(test)]
 mod tests {
     use super::{super::digital_rain::DigitalRainOptions, *};
+    use crate::common::seeded_rng;
 
     fn get_sane_options() -> DigitalRainOptions {
         DigitalRainOptions {
@@ -260,7 +262,7 @@ mod tests {
 
     #[test]
     fn create_new_and_reset() {
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(1, "rain_drop_test");
         let mut new_drop =
             RainDrop::new((100, 100), &get_sane_options(), 1, &mut rng);
         assert!(!new_drop.body.is_empty());
@@ -274,7 +276,7 @@ mod tests {
 
     #[test]
     fn generate_a_lot_of_drops() {
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(1, "rain_drop_test");
         let mut drops = vec![];
         for index in 1..=1000 {
             drops.push(RainDrop::new(
@@ -321,7 +323,7 @@ mod tests {
 
     #[test]
     fn grow() {
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(1, "rain_drop_test");
         let mut new_drop = RainDrop::from_values(
             1,
             vec!['a'],
@@ -367,7 +369,7 @@ mod tests {
 
     #[test]
     fn update() {
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(1, "rain_drop_test");
 
         // nothing special worm update
         let mut new_drop = RainDrop::from_values(
@@ -467,7 +469,7 @@ mod tests {
 
     #[test]
     fn out_of_bounds() {
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(1, "rain_drop_test");
         let mut drops = vec![];
         for i in 1..=10 {
             drops.push(RainDrop::new((100, 100), &get_sane_options(), i, &mut rng));

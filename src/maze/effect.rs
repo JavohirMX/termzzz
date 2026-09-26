@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::{RngExt, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,10 @@ static CHARACTERS: LazyLock<Vec<char>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MazeOptions {}
+pub struct MazeOptions {
+    /// Seed for the wall texture, the start cell and the carve order.
+    pub seed: u64,
+}
 
 impl Default for MazeOptions {
     /// Hand-written so it is the single source of truth.
@@ -36,9 +39,15 @@ impl Default for MazeOptions {
     /// produced zeros, and serde used the derived one, so a config file
     /// that omitted a section silently zeroed it.
     fn default() -> Self {
-        Self {}
+        Self { seed: DEFAULT_SEED }
     }
 }
+/// Seconds of carving per cell, i.e. how fast the maze draws itself.
+const CARVE_STEP: f32 = 1.0 / 60.0;
+/// Upper bound on cells carved in one frame, so a stall cannot be paid off in
+/// a single visible jump.
+const MAX_CARVE_STEPS_PER_FRAME: usize = 8;
+
 pub struct Maze {
     pub screen_size: (u16, u16),
     options: MazeOptions,
@@ -47,7 +56,13 @@ pub struct Maze {
     paths: HashSet<(usize, usize)>,
     stack: VecDeque<(isize, isize)>,
     maze_complete: bool,
-    pub rng: rand::prelude::ThreadRng,
+    /// Fraction of a cell of carving progress not yet spent.
+    ///
+    /// Carving used to happen once per `update` call, so a terminal refreshing
+    /// at 144 Hz generated its maze three times as fast as one at 48 Hz. The
+    /// accumulator converts elapsed time into a whole number of carve steps.
+    carve_accumulator: f32,
+    pub rng: EffectRng,
 }
 
 impl TerminalEffect for Maze {
@@ -93,10 +108,42 @@ impl TerminalEffect for Maze {
     }
 
     fn update(&mut self) {
-        if self.maze_complete {
-            return;
-        }
+        self.carve(1.0 / 60.0);
+    }
 
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        // Capped so a stall does not finish the whole maze in one frame, which
+        // would be a single visible jump rather than an animation.
+        self.carve(context.delta.as_secs_f64().min(0.1) as f32);
+    }
+
+    fn update_size(&mut self, width: u16, height: u16) {
+        self.screen_size = (width.max(1), height.max(1));
+        let (width, height) =
+            (self.screen_size.0 as usize, self.screen_size.1 as usize);
+
+        // Both buffers are full-screen, so both have to follow the new size or
+        // the carved path coordinates no longer fit. `reset` rebuilds them
+        // anyway, but `update_size` is a public entry point and has to leave a
+        // renderable effect behind on its own.
+        self.buffer = Buffer::new(width, height);
+        self.initial_walls = Buffer::new(width, height);
+        let mut rng = seeded_rng(self.options.seed, "maze");
+        fill_initial_walls(&mut self.initial_walls, &mut rng);
+        self.paths.retain(|(x, y)| *x < width && *y < height);
+    }
+
+    fn reset(&mut self) {
+        // `Self::new` already picks a start cell, generates the wall texture and
+        // seeds the stack. Calling `fill_initial_walls` again here, and then
+        // replacing the generator it just built, threw away a full random fill
+        // for nothing.
+        *self = Self::new(self.options.clone(), self.screen_size);
+    }
+}
+
+impl Maze {
+    fn carve_one(&mut self) {
         if let Some((x, y)) = self.stack.pop_back() {
             let directions = [(2, 0), (0, 2), (-2, 0), (0, -2)]; // Skip one cell to maintain walls
             let mut shuffled_directions = directions;
@@ -133,34 +180,29 @@ impl TerminalEffect for Maze {
         }
     }
 
-    fn update_size(&mut self, width: u16, height: u16) {
-        self.screen_size = (width.max(1), height.max(1));
-        let (width, height) =
-            (self.screen_size.0 as usize, self.screen_size.1 as usize);
+    /// Carves for `seconds` worth of progress, in whole cells.
+    fn carve(&mut self, seconds: f32) {
+        if self.maze_complete {
+            return;
+        }
 
-        // Both buffers are full-screen, so both have to follow the new size or
-        // the carved path coordinates no longer fit. `reset` rebuilds them
-        // anyway, but `update_size` is a public entry point and has to leave a
-        // renderable effect behind on its own.
-        self.buffer = Buffer::new(width, height);
-        self.initial_walls = Buffer::new(width, height);
-        fill_initial_walls(&mut self.initial_walls);
-        self.paths.retain(|(x, y)| *x < width && *y < height);
+        self.carve_accumulator += seconds / CARVE_STEP;
+        let mut budget = self.carve_accumulator.floor() as usize;
+        self.carve_accumulator -= budget as f32;
+        // Bounded so a long stall cannot spend an unbounded amount of work in a
+        // single frame.
+        budget = budget.min(MAX_CARVE_STEPS_PER_FRAME);
+        for _ in 0..budget {
+            self.carve_one();
+            if self.maze_complete {
+                break;
+            }
+        }
     }
 
-    fn reset(&mut self) {
-        // `Self::new` already picks a start cell, generates the wall texture and
-        // seeds the stack. Calling `fill_initial_walls` again here, and then
-        // replacing the generator it just built, threw away a full random fill
-        // for nothing.
-        *self = Self::new(self.options.clone(), self.screen_size);
-    }
-}
-
-impl Maze {
     pub fn new(options: MazeOptions, screen_size: (u16, u16)) -> Self {
         let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(options.seed, "maze");
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
 
         let paths = HashSet::new();
@@ -170,7 +212,7 @@ impl Maze {
         stack.push_back((start_x as isize, start_y as isize));
 
         let mut initial_walls = buffer.clone();
-        fill_initial_walls(&mut initial_walls);
+        fill_initial_walls(&mut initial_walls, &mut rng);
 
         Self {
             screen_size,
@@ -180,6 +222,7 @@ impl Maze {
             paths,
             stack,
             maze_complete: false,
+            carve_accumulator: 0.0,
             rng,
         }
     }
@@ -196,8 +239,12 @@ impl Maze {
     }
 }
 
-fn fill_initial_walls(buffer: &mut Buffer) {
-    let mut rng = rand::rng();
+/// Fills `buffer` with the decorative wall texture.
+///
+/// Takes the generator rather than making its own. A local thread RNG here
+/// meant the texture was unseeded even once the effect was seedable, so two
+/// instances of the same `seed` still disagreed on every brick.
+fn fill_initial_walls(buffer: &mut Buffer, rng: &mut EffectRng) {
     for y in 0..buffer.height {
         for x in 0..buffer.width {
             let random_char = CHARACTERS[rng.random_range(0..CHARACTERS.len())];
@@ -212,14 +259,6 @@ fn fill_initial_walls(buffer: &mut Buffer) {
                 Cell::new(random_char, random_color, style::Attribute::Bold),
             );
         }
-    }
-}
-
-impl DefaultOptions for Maze {
-    type Options = MazeOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        MazeOptions::default()
     }
 }
 

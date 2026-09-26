@@ -6,7 +6,7 @@
 //! from `EffectId::all()` and `Config` rather than hard-coding per-effect
 //! values, so a newly added effect is covered without editing this file.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use termzzz::buffer::Cell;
@@ -359,28 +359,45 @@ fn no_effect_repaints_more_cells_than_the_screen_has() {
 fn effects_advance_using_the_frame_delta() {
     let size = (60u16, 20u16);
     let config = Config::default();
-    // Far enough from the 1/60s a fixed-step effect would hard-code that any
-    // effect which genuinely consumes it must land somewhere visibly different.
-    let odd_delta = Duration::from_secs_f64(0.4);
 
-    let render_after = |id: EffectId, use_context: bool| {
+    // Two rates, and the same number of frames at each.
+    //
+    // The obvious probe — one frame at a large delta — cannot tell a
+    // delta-driven effect from a fixed-step one. Every effect here caps its
+    // delta at 0.1s so a stall cannot teleport it, and at 9 cells per second
+    // 0.1s is 0.9 of a cell: the position truncates to the same integer either
+    // way and the frames come out identical. Running the same sixty frames at
+    // three times the rate makes the difference many cells wide, which no amount
+    // of sub-cell truncation can hide, while 0.05s stays under every cap in the
+    // crate (the 0.1s delta clamps, and fire's four-steps-per-frame ceiling
+    // admits the three steps 0.05s asks for).
+    const FRAMES: u64 = 60;
+    let nominal = Duration::from_secs_f64(1.0 / 60.0);
+    let faster = Duration::from_secs_f64(0.05);
+
+    let run = |id: EffectId, delta: Duration| {
         let mut effect = AnyEffect::build(id, &config, size);
         let mut input = termzzz::runtime::InputState::default();
         input.set_size(size);
-        let context = termzzz::runtime::FrameContext::new(
-            size, 0, odd_delta, odd_delta, input,
-        );
-        if use_context {
-            effect.update_with_context(&context);
-        } else {
-            effect.update();
+
+        for frame in 0..FRAMES {
+            let step = termzzz::runtime::FrameContext::new(
+                size,
+                frame,
+                delta * frame as u32,
+                delta,
+                input.clone(),
+            );
+            effect.get_diff_with_context(&step);
+            effect.update_with_context(&step);
         }
+
         let view = termzzz::runtime::FrameContext::new(
             size,
-            1,
-            odd_delta,
-            odd_delta,
-            termzzz::runtime::InputState::default(),
+            FRAMES,
+            delta * FRAMES as u32,
+            delta,
+            input,
         );
         effect.get_diff_with_context(&view)
     };
@@ -389,11 +406,11 @@ fn effects_advance_using_the_frame_delta() {
     let mut nondeterministic: Vec<&str> = Vec::new();
 
     for id in EffectId::all() {
-        // A static effect has no time dependence to express, so both update
-        // paths render the same still image. Compare two settled frames rather
-        // than the first one: a lazily generated effect renders its content on
-        // its first frame and nothing on every frame after, which would
-        // otherwise look like animation.
+        // A static effect has no time dependence to express, so every rate
+        // renders the same still image. Compare two settled frames rather than
+        // the first one: a lazily generated effect renders its content on its
+        // first frame and nothing on every frame after, which would otherwise
+        // look like animation.
         let is_static = {
             let mut effect = AnyEffect::build(id, &config, size);
             let mut input = termzzz::runtime::InputState::default();
@@ -403,8 +420,8 @@ fn effects_advance_using_the_frame_delta() {
                 let step = termzzz::runtime::FrameContext::new(
                     size,
                     frame,
-                    odd_delta * frame as u32,
-                    odd_delta,
+                    nominal * frame as u32,
+                    nominal,
                     input.clone(),
                 );
                 let diff = effect.get_diff_with_context(&step);
@@ -416,8 +433,8 @@ fn effects_advance_using_the_frame_delta() {
             let later = termzzz::runtime::FrameContext::new(
                 size,
                 40,
-                odd_delta * 40,
-                odd_delta,
+                nominal * 40,
+                nominal,
                 input,
             );
             effect.get_diff_with_context(&later) == settled
@@ -432,24 +449,24 @@ fn effects_advance_using_the_frame_delta() {
         // compared. Sampled several times rather than twice: a single pair can
         // coincide by chance, which would make this check flaky in both
         // directions.
-        let baseline = render_after(id, false);
-        let repeats_match = (0..4).all(|_| render_after(id, false) == baseline);
+        let baseline = run(id, nominal);
+        let repeats_match = (0..4).all(|_| run(id, nominal) == baseline);
         if !repeats_match {
             nondeterministic.push(id.as_str());
             continue;
         }
 
-        if baseline == render_after(id, true) {
+        if baseline == run(id, faster) {
             ignore_delta.push(id.as_str());
         }
     }
 
     assert!(
         ignore_delta.is_empty(),
-        "these effects advance by a hard-coded step per update() call and never \
-         look at context.delta, so their speed depends on the terminal refresh \
-         rate: {ignore_delta:?}. Override update_with_context and drive the \
-         simulation from context.delta."
+        "these effects render the same frame at 60fps as they do at 20fps, so \
+         their speed depends on the terminal refresh rate: {ignore_delta:?}. \
+         Override update_with_context and drive the simulation from \
+         context.delta."
     );
 
     // Not a failure. An effect that draws from an unseeded generator cannot be
@@ -578,5 +595,112 @@ fn a_blank_cell_is_the_identity_for_diffing() {
     assert!(
         buffer.diff(&buffer).is_empty(),
         "a buffer diffed against an identical copy must be empty"
+    );
+}
+
+/// Every seeded effect must be reproducible, and a different seed must actually
+/// change what it draws.
+///
+/// This is the contract that made the timebase check above able to see the
+/// delta at all: it compares two independently built instances, which is only
+/// meaningful if both are deterministic. It is also the user-facing promise —
+/// `--seed` is only worth documenting if it holds.
+#[test]
+fn seeded_effects_are_reproducible_and_seed_sensitive() {
+    let size = (60u16, 20u16);
+    let frames = 45u64;
+
+    // Drives an effect for a while and returns everything it drew, as a map
+    // from coordinate to the last cell written there.
+    //
+    // Accumulating rather than returning the last frame matters. A diff only
+    // reports what changed since the previous frame, and a slow effect covering
+    // less than a cell per frame changes nothing on any given frame — so the
+    // final diff of a perfectly good run is empty, and two different seeds look
+    // identical because neither drew a cell. The accumulated footprint cannot
+    // be empty by accident.
+    let render = |id: EffectId, seed: u64| {
+        let mut config = Config::default();
+        config.override_seed(seed);
+
+        let mut effect = AnyEffect::build(id, &config, size);
+        let mut input = termzzz::runtime::InputState::default();
+        input.set_size(size);
+
+        let mut drawn: BTreeMap<(usize, usize), Cell> = BTreeMap::new();
+        let mut record = |cells: Vec<(usize, usize, Cell)>| {
+            for (x, y, cell) in cells {
+                drawn.insert((x, y), cell);
+            }
+        };
+
+        for frame in 0..frames {
+            let delta = Duration::from_secs_f64(1.0 / 60.0);
+            let step = termzzz::runtime::FrameContext::new(
+                size,
+                frame,
+                delta * frame as u32,
+                delta,
+                input.clone(),
+            );
+            record(effect.get_diff_with_context(&step));
+            effect.update_with_context(&step);
+        }
+
+        let view = termzzz::runtime::FrameContext::new(
+            size,
+            frames,
+            Duration::from_secs_f64(1.0),
+            Duration::from_secs_f64(1.0 / 60.0),
+            input,
+        );
+        record(effect.get_diff_with_context(&view));
+        drawn
+    };
+
+    // `blank` draws a constant field and `plasma`, `cube` and `donut` are pure
+    // functions of time, so a seed cannot change them. Terrain renders once and
+    // then never again, so its settled frame is empty either way. Those five
+    // have no business being seed-sensitive; the rest do.
+    const SEED_INSENSITIVE: &[&str] =
+        &["blank", "cube", "donut", "plasma", "terrain"];
+
+    let mut not_reproducible: Vec<&str> = Vec::new();
+    let mut seed_ignored: Vec<&str> = Vec::new();
+
+    for id in EffectId::all() {
+        let name = id.as_str();
+
+        // Sampled more than twice: one pair can coincide by chance, which would
+        // make this check flaky in both directions.
+        let baseline = render(id, 42);
+        if !(0..3).all(|_| render(id, 42) == baseline) {
+            not_reproducible.push(name);
+            continue;
+        }
+
+        if SEED_INSENSITIVE.contains(&name) {
+            continue;
+        }
+
+        // A different seed has to produce a different picture. An effect that
+        // stores the seed and then ignores it — which terrain's noise generator
+        // used to do — passes the reproducibility half of this and fails here.
+        if render(id, 43) == baseline {
+            seed_ignored.push(name);
+        }
+    }
+
+    assert!(
+        not_reproducible.is_empty(),
+        "these effects render differently on two runs with the same seed, so they \\
+         are drawing from an unseeded generator: {not_reproducible:?}. Store a \\
+         StdRng built from the configured seed instead of calling rand::rng()."
+    );
+
+    assert!(
+        seed_ignored.is_empty(),
+        "these effects render identically for seed 42 and seed 43, so the seed \\
+         reaches the struct but not the simulation: {seed_ignored:?}"
     );
 }

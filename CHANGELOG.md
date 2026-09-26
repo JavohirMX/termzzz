@@ -12,9 +12,9 @@ All notable changes to this project will be documented in this file.
 - A configuration file that omits a section no longer silently zeroes that
   section. `Config` now falls back to the real per-effect defaults for any
   section the user did not mention, instead of to each options struct's derived
-  all-zero `Default`. Previously a config containing only `[dvd]` reset the
-  other fourteen sections, which made the donut panic, the cube invisible and
-  the terrain a solid block
+  all-zero `Default`. Previously a config containing only `[dvd]` reset every
+  other section, which made the donut panic, the cube invisible and the terrain a
+  solid block
 - Resizing the terminal no longer makes effects emit cells outside the new
   screen, and no longer panics in Conway's Game of Life. Cell coordinates are
   now derived from the frame being produced rather than the stale previous frame
@@ -54,6 +54,17 @@ All notable changes to this project will be documented in this file.
   the camera
 - Maze no longer generates its wall texture twice per reset, and no longer
   panics on a zero-sized terminal
+- Nine effects no longer ignore the global speed control. `maze`, `boids`,
+  `crab`, `pipes` and `constellation` advanced by a fixed step per rendered frame
+  or did their work inside `get_diff`, so their speed depended on the terminal
+  refresh rate and the `+`/`-` keys changed only how often they were drawn. All
+  five now integrate `context.delta`, and `maze` and `pipes` accumulate elapsed
+  time into whole cells so they advance at a fixed rate regardless of frame rate
+- Nine effects are now reproducible. `matrix`, `life`, `maze`, `boids`, `crab`,
+  `dvd`, `pipes`, `fire` and `constellation` drew from an unseeded thread-local
+  generator, so no two runs looked alike and the contract suite could not check
+  their timing at all. Each now carries a `seed` option and a seeded generator,
+  reseeded on reset so a resize starts a fresh run rather than continuing one
 
 ### Changed
 - The release profile optimizes for speed rather than size. This is a real-time
@@ -69,6 +80,15 @@ All notable changes to this project will be documented in this file.
   scans the whole screen to find the handful of cells a small logo changed
 - Conway's Game of Life counts live neighbours without allocating a vector per
   cell per generation
+- `+` and `-` change global animation speed; the mouse wheel resizes the ASCII brush
+- Conway's Game of Life advances at a configurable generations-per-second rate
+- Matrix, cube, and DVD effects advance on real frame deltas rather than fixed step counts
+- Calmer defaults for plasma, boids, donut, pipes, cube, crab, and life
+- Check mode now honours the configured effect options and global speed
+- Release and crates.io workflows now require explicit manual dispatch
+- The pipes effect simulates in `update` and only renders in `get_diff`, which is
+  what let its growth be driven by elapsed time. Its render cost drops about 20%
+  because the frame is no longer rebuilt as a side effect of drawing it
 
 ### Added
 - Effect contract and drift tests covering the registry, the config surface,
@@ -87,14 +107,18 @@ All notable changes to this project will be documented in this file.
 - Timed playlist mode via `--playlist`, `--shuffle`, and `--transition`, also configurable in `[playlist]`
 - Central effect registry so the CLI, help output, check mode, and playlists share one source of truth
 - Global speed control through `[global] speed`, `--speed <MULT>`, and the `+`/`-` keys
+- A `seed` option on every effect that uses randomness, and a `--seed <N>` flag to
+  override all of them for one run, so a run can be reproduced or shared
+- Contract tests asserting that every seeded effect is reproducible and that a
+  different seed actually changes what it draws, and that every animated effect
+  renders differently at 60fps than at 20fps
 
-### Changed
-- `+` and `-` change global animation speed; the mouse wheel resizes the ASCII brush
-- Conway's Game of Life advances at a configurable generations-per-second rate
-- Matrix, cube, and DVD effects advance on real frame deltas rather than fixed step counts
-- Calmer defaults for plasma, boids, donut, pipes, cube, crab, and life
-- Check mode now honours the configured effect options and global speed
-- Release and crates.io workflows now require explicit manual dispatch
+### Removed
+- The `DefaultOptions` trait and its thirteen implementations. Nothing called it,
+  and its hand-written copies of the per-effect defaults had drifted from the real
+  ones in nine places across five effects — `plasma` still claimed a colour speed
+  of 150.0 against a real 20.0, and `pipes` a line count of 5 against a real 3.
+  Each options struct's own `Default` is now the only place a default is written
 
 ### Compatibility
 - `termzzz` is a clean break from earlier package and command names, and provides no compatibility aliases

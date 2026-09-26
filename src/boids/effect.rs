@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,10 @@ pub struct BoidsOptions {
     min_speed: f32,
 
     charset: BoidCharset,
+
+    /// Seed for the initial flock. Boids never draw again after `new`, so this
+    /// fixes the whole run.
+    pub seed: u64,
 }
 
 impl Default for BoidsOptions {
@@ -89,6 +93,7 @@ impl Default for BoidsOptions {
             max_speed: 0.6,
             min_speed: 0.08,
             charset: BoidCharset::default(),
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -159,11 +164,16 @@ impl TerminalEffect for Boids {
     }
 
     fn update(&mut self) {
-        // Apply the three boid rules
-        self.apply_rules();
+        // `scale` is 1.0 at 60 fps, which is the rate the weights in the config
+        // were tuned against, so the plain `update` path is unchanged.
+        self.step(1.0);
+    }
 
-        // Update positions and appearance
-        self.update_positions();
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        // Capped so a stall does not fling the flock off screen, and converted
+        // to a multiple of the nominal frame so the weights keep their meaning.
+        let seconds = context.delta.as_secs_f64().min(0.1);
+        self.step((seconds * 60.0) as f32);
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -180,8 +190,14 @@ impl TerminalEffect for Boids {
 }
 
 impl Boids {
+    /// Advances the flock by `scale`, a multiple of the nominal frame.
+    fn step(&mut self, scale: f32) {
+        self.apply_rules(scale);
+        self.update_positions(scale);
+    }
+
     pub fn new(options: BoidsOptions) -> Self {
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(options.seed, "boids");
         let buffer = Buffer::new(
             options.screen_size.0 as usize,
             options.screen_size.1 as usize,
@@ -237,7 +253,7 @@ impl Boids {
         (dx, dy)
     }
 
-    fn apply_rules(&mut self) {
+    fn apply_rules(&mut self, scale: f32) {
         let num_boids = self.boids.len();
         let mut separation_adjustments = vec![(0.0, 0.0); num_boids];
         let mut alignment_adjustments = vec![(0.0, 0.0); num_boids];
@@ -383,18 +399,20 @@ impl Boids {
             let mut new_vx = self.boids[i].velocity.0;
             let mut new_vy = self.boids[i].velocity.1;
 
-            // Apply rules
-            new_vx += separation_adjustments[i].0;
-            new_vy += separation_adjustments[i].1;
+            // Apply rules. Scaled so the flock turns at the same rate whatever
+            // the frame rate; the damping below is left unscaled because it is a
+            // fixed fraction of the previous velocity, not a force.
+            new_vx += separation_adjustments[i].0 * scale;
+            new_vy += separation_adjustments[i].1 * scale;
 
-            new_vx += alignment_adjustments[i].0;
-            new_vy += alignment_adjustments[i].1;
+            new_vx += alignment_adjustments[i].0 * scale;
+            new_vy += alignment_adjustments[i].1 * scale;
 
-            new_vx += cohesion_adjustments[i].0;
-            new_vy += cohesion_adjustments[i].1;
+            new_vx += cohesion_adjustments[i].0 * scale;
+            new_vy += cohesion_adjustments[i].1 * scale;
 
-            new_vx += border_adjustments[i].0;
-            new_vy += border_adjustments[i].1;
+            new_vx += border_adjustments[i].0 * scale;
+            new_vy += border_adjustments[i].1 * scale;
 
             // Apply drive factor
             let speed = (new_vx * new_vx + new_vy * new_vy).sqrt();
@@ -426,14 +444,14 @@ impl Boids {
         }
     }
 
-    fn update_positions(&mut self) {
+    fn update_positions(&mut self, scale: f32) {
         let width = self.options.screen_size.0 as f32;
         let height = self.options.screen_size.1 as f32;
 
         for boid in &mut self.boids {
             // Update position
-            boid.position.0 += boid.velocity.0;
-            boid.position.1 += boid.velocity.1;
+            boid.position.0 += boid.velocity.0 * scale;
+            boid.position.1 += boid.velocity.1 * scale;
 
             // Wrap around screen boundaries
             if boid.position.0 < 0.0 {
@@ -450,22 +468,6 @@ impl Boids {
 
             // Update visual representation
             boid.update_visual(&self.charset_chars);
-        }
-    }
-}
-
-impl DefaultOptions for Boids {
-    type Options = BoidsOptions;
-
-    fn default_options(width: u16, height: u16) -> Self::Options {
-        // Widened before multiplying: `width * height` as `u16` wraps past
-        // 256x256. The comment was also wrong by 50x, so it is corrected here.
-        let boid_count = (width as f32 * height as f32 * 0.5) as u16; // About 50% of screen space
-
-        BoidsOptions {
-            screen_size: (width, height),
-            boid_count: boid_count.clamp(50, 300),
-            ..Default::default()
         }
     }
 }

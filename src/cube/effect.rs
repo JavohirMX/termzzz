@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::TerminalEffect;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -424,21 +424,6 @@ impl Cube {
                     ),
                 );
             }
-        }
-    }
-}
-
-impl DefaultOptions for Cube {
-    type Options = CubeOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        CubeOptions {
-            cube_size: 1.0,
-            rotation_speed_x: 0.6,
-            rotation_speed_y: 0.8,
-            rotation_speed_z: 0.4,
-            distance: 3.5,
-            use_braille: true,
         }
     }
 }

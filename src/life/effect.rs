@@ -11,7 +11,7 @@
 //!     If a dead cell is surrounded by exactly three living cells,
 //!     it becomes a living cell.
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,9 @@ pub struct ConwayLifeOptions {
     pub initial_cells: u32,
     pub cells_coeff: f32,
     pub generations_per_second: f32,
+    /// Seed for the initial population, the gliders seeded each generation, and
+    /// the glyph each cell is drawn with.
+    pub seed: u64,
 }
 
 impl Default for ConwayLifeOptions {
@@ -48,6 +51,7 @@ impl Default for ConwayLifeOptions {
             initial_cells: 200,
             cells_coeff: 1.0,
             generations_per_second: 8.0,
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -64,7 +68,7 @@ pub struct ConwayLife {
     options: ConwayLifeOptions,
     buffer: Buffer,
     cells: HashMap<(usize, usize), LifeCell>,
-    pub rng: rand::prelude::ThreadRng,
+    pub rng: EffectRng,
     pub current_gen: u8,
     generation_accumulator: f32,
 }
@@ -77,11 +81,7 @@ impl LifeCell {
         }
     }
 
-    pub fn update_color_and_char(
-        &mut self,
-        rng: &mut rand::prelude::ThreadRng,
-        current_gen: u8,
-    ) {
+    pub fn update_color_and_char(&mut self, rng: &mut EffectRng, current_gen: u8) {
         let green_color = 255_u8.wrapping_sub(current_gen);
         match current_gen {
             0..=230 => {
@@ -223,7 +223,7 @@ impl ConwayLife {
 
     pub fn new(options: ConwayLifeOptions, screen_size: (u16, u16)) -> Self {
         let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(options.seed, "life");
         let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
 
         let mut cells = HashMap::new();
@@ -330,19 +330,6 @@ pub fn count_live_neighbors(
     }
 
     live
-}
-
-impl DefaultOptions for ConwayLife {
-    type Options = ConwayLifeOptions;
-
-    fn default_options(width: u16, height: u16) -> Self::Options {
-        let initial_cells = ((width as u32 * height as u32) as f32 * 0.3) as u32; // 30% of screen space
-
-        ConwayLifeOptions {
-            initial_cells,
-            ..Default::default()
-        }
-    }
 }
 
 #[cfg(test)]

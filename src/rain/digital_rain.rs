@@ -2,9 +2,9 @@ use super::draw::{pick_color, pick_style};
 use super::gradient;
 use super::rain_drop::RainDrop;
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 
-use rand::{self, RngExt};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -18,6 +18,8 @@ pub struct DigitalRainOptions {
     pub speed_range: (u16, u16),
     pub drops_coeff: f32,
     pub speed_coeff: f32,
+    /// Seed for drop placement, style, length and speed.
+    pub seed: u64,
 }
 
 impl Default for DigitalRainOptions {
@@ -32,6 +34,7 @@ impl Default for DigitalRainOptions {
             speed_range: (2, 16),
             drops_coeff: 1.0,
             speed_coeff: 1.0,
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -42,7 +45,7 @@ pub struct DigitalRain {
     gradients: Vec<Vec<gradient::Color>>,
     rain_drops: Vec<RainDrop>,
     buffer: Buffer,
-    rng: rand::prelude::ThreadRng,
+    rng: EffectRng,
 }
 
 impl TerminalEffect for DigitalRain {
@@ -96,7 +99,7 @@ impl TerminalEffect for DigitalRain {
 impl DigitalRain {
     // Initialize screensaver
     pub fn new(options: DigitalRainOptions, screen_size: (u16, u16)) -> Self {
-        let mut rng = rand::rng();
+        let mut rng = seeded_rng(options.seed, "matrix");
         let mut rain_drops: Vec<RainDrop> = vec![];
         let mut buffer: Buffer =
             Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
@@ -207,13 +210,15 @@ impl DigitalRain {
         if self.rain_drops.len() >= self.options.get_max_drops_number() as usize {
             return;
         };
-        let mut rng = rand::rng();
-        if rng.random_range(0.0..=1.0) <= 0.3 {
+        // Uses the carried generator rather than a fresh thread-local one, so the
+        // sequence of additions is part of the reproducible run.
+        let roll = self.rng.random_range(0.0..=1.0);
+        if roll <= 0.3 {
             self.rain_drops.push(RainDrop::new(
                 self.screen_size,
                 &self.options,
                 self.rain_drops.len() + 1,
-                &mut rng,
+                &mut self.rng,
             ));
         };
     }
@@ -238,36 +243,6 @@ impl DigitalRainOptions {
     #[inline]
     pub fn get_max_speed(&self) -> u16 {
         self.speed_range.1
-    }
-}
-
-impl DefaultOptions for DigitalRain {
-    type Options = DigitalRainOptions;
-
-    fn default_options(width: u16, height: u16) -> Self::Options {
-        // Widened before multiplying. `width * height` as `u16` wraps on any
-        // terminal past 256x256, which silently produced a small drop count on
-        // exactly the large screens that need the most of them.
-        let area = width as f32 * height as f32;
-
-        let drops_range = {
-            // Approximately 0.6% to 1.2% of screen space.
-            let min_drops = (area / 160.0) as u16;
-            let max_drops = (area / 80.0) as u16;
-            (min_drops.max(10), max_drops.max(20)) // Ensure minimum values
-        };
-
-        let speed_range = {
-            let min_speed = (height / 20).max(2); // Faster for larger screens
-            let max_speed = (height / 10).max(16); // But not too fast
-            (min_speed, max_speed)
-        };
-
-        DigitalRainOptions {
-            drops_range,
-            speed_range,
-            ..Default::default()
-        }
     }
 }
 
@@ -296,6 +271,7 @@ mod tests {
             speed_range: (3, 4),
             drops_coeff: 1.0,
             speed_coeff: 1.0,
+            seed: DEFAULT_SEED,
         };
         let mut rain = DigitalRain::new(options, (80, 40));
 
@@ -352,13 +328,13 @@ mod tests {
             (100, 100),
             &options,
             Duration::from_millis(50),
-            &mut rand::rng(),
+            &mut seeded_rng(1, "rain_test"),
         );
         tick.update(
             (100, 100),
             &options,
             Duration::from_secs_f64(1.0 / 60.0),
-            &mut rand::rng(),
+            &mut seeded_rng(1, "rain_test"),
         );
 
         assert!(tick.fy < quick.fy);

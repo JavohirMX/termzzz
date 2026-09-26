@@ -5,6 +5,18 @@ use termzzz::{
     rain::{digital_rain, rain_drop},
 };
 
+/// A generator that differs on every call, so a measurement never depends on
+/// how much randomness the previous iteration happened to consume.
+///
+/// `rand::rng()` used to serve this purpose and cannot any more: it is not
+/// seedable, and the effects now take a seedable generator so they can be
+/// reproduced.
+fn fresh_rng(tag: &str) -> common::EffectRng {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    common::seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed), tag)
+}
+
 fn get_sane_options() -> digital_rain::DigitalRainOptions {
     digital_rain::DigitalRainOptions {
         drops_range: (10, 20),
@@ -44,7 +56,7 @@ fn run_loop_benchmark(_c: &mut Criterion) {
 fn vertical_worm_benchmark(c: &mut Criterion) {
     c.bench_function("raindrop/new_1000", |b| {
         b.iter(|| {
-            let mut rng = rand::rng();
+            let mut rng = fresh_rng("rain_bench");
             for index in 1..=1000 {
                 black_box(rain_drop::RainDrop::new(
                     (80, 40),
@@ -60,7 +72,7 @@ fn vertical_worm_benchmark(c: &mut Criterion) {
     let delta = Duration::from_millis(50);
     let mut drops: Vec<rain_drop::RainDrop> = Vec::with_capacity(1000);
     {
-        let mut rng = rand::rng();
+        let mut rng = fresh_rng("rain_bench");
         for index in 1..=1000 {
             drops.push(rain_drop::RainDrop::new(
                 (80, 40),
@@ -76,7 +88,7 @@ fn vertical_worm_benchmark(c: &mut Criterion) {
         // how much randomness the previous iteration happened to consume.
         b.iter_batched(
             || {
-                let mut rng = rand::rng();
+                let mut rng = fresh_rng("rain_bench");
                 let mut fresh: Vec<rain_drop::RainDrop> = Vec::with_capacity(1000);
                 for index in 1..=1000 {
                     fresh.push(rain_drop::RainDrop::new(
@@ -89,7 +101,7 @@ fn vertical_worm_benchmark(c: &mut Criterion) {
                 fresh
             },
             |mut drops| {
-                let mut rng = rand::rng();
+                let mut rng = fresh_rng("rain_bench");
                 for drop in drops.iter_mut() {
                     drop.update((80, 40), &options, delta, &mut rng);
                 }

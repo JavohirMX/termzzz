@@ -1,11 +1,10 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 const STAR_GLYPHS: [char; 4] = ['○', '◦', '*', '✦'];
-const DT: f64 = 1.0 / 60.0;
 
 const PALETTE: [(u8, u8, u8); 4] = [
     (110, 150, 240),
@@ -27,6 +26,9 @@ pub struct ConstellationOptions {
     pub twinkle: bool,
     pub min_speed: f64,
     pub max_speed: f64,
+    /// Seed for the star field. Fixes positions, speeds, glyphs and twinkle
+    /// phases, so the whole sky is reproducible.
+    pub seed: u64,
 }
 
 impl Default for ConstellationOptions {
@@ -43,6 +45,7 @@ impl Default for ConstellationOptions {
             twinkle: true,
             min_speed: 0.3,
             max_speed: 1.5,
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -76,15 +79,68 @@ impl TerminalEffect for Constellation {
     }
 
     fn update(&mut self) {
+        // Nominal frame time, so an effect driven through the plain `update`
+        // path still moves at the rate it was tuned for.
+        self.step(1.0 / 60.0);
+    }
+
+    fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
+        // Capped so a stall does not teleport every star across the screen.
+        self.step(context.delta.as_secs_f64().min(0.1));
+    }
+
+    fn update_size(&mut self, width: u16, height: u16) {
+        self.screen_size = (width, height);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.buffer =
+            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        self.connect_dist = Self::calc_connect_dist(
+            self.screen_size.0,
+            self.screen_size.1,
+            self.options.connect_radius,
+        );
+
+        self.stars.clear();
+        self.stars.reserve(self.options.star_count);
+        let mut rng = seeded_rng(self.options.seed, "constellation");
+        for _ in 0..self.options.star_count {
+            self.stars.push(Self::random_star(
+                &self.screen_size,
+                &self.options,
+                &mut rng,
+                true,
+            ));
+        }
+    }
+}
+
+impl Constellation {
+    pub fn new(options: ConstellationOptions, screen_size: (u16, u16)) -> Self {
+        let mut effect = Self {
+            screen_size,
+            options,
+            buffer: Buffer::new(screen_size.0 as usize, screen_size.1 as usize),
+            stars: Vec::new(),
+            connect_dist: 0.0,
+        };
+
+        effect.reset();
+        effect
+    }
+
+    fn step(&mut self, dt: f64) {
         let width = self.screen_size.0 as f64;
         let height = self.screen_size.1 as f64;
 
         for star in &mut self.stars {
-            star.x += star.vx * DT;
-            star.y += star.vy * DT;
+            star.x += star.vx * dt;
+            star.y += star.vy * dt;
 
             if self.options.twinkle {
-                star.twinkle += star.twinkle_freq * DT;
+                star.twinkle += star.twinkle_freq * dt;
             }
 
             if star.x < 0.0 {
@@ -105,68 +161,35 @@ impl TerminalEffect for Constellation {
         }
     }
 
-    fn update_size(&mut self, width: u16, height: u16) {
-        self.screen_size = (width, height);
-        self.reset();
-    }
-
-    fn reset(&mut self) {
-        self.buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
-        self.connect_dist = Self::calc_connect_dist(
-            self.screen_size.0,
-            self.screen_size.1,
-            self.options.connect_radius,
-        );
-
-        self.stars.clear();
-        self.stars.reserve(self.options.star_count);
-        for _ in 0..self.options.star_count {
-            self.stars.push(self.random_star(true));
-        }
-    }
-}
-
-impl Constellation {
-    pub fn new(options: ConstellationOptions, screen_size: (u16, u16)) -> Self {
-        let mut effect = Self {
-            screen_size,
-            options,
-            buffer: Buffer::new(screen_size.0 as usize, screen_size.1 as usize),
-            stars: Vec::new(),
-            connect_dist: 0.0,
-        };
-
-        effect.reset();
-        effect
-    }
-
     fn calc_connect_dist(width: u16, height: u16, radius_factor: f64) -> f64 {
         ((width as f64).powi(2) + (height as f64).powi(2)).sqrt() * radius_factor
     }
 
-    fn random_star(&self, scattered: bool) -> Star {
-        let mut rng = rand::rng();
-        let speed =
-            rng.random_range(self.options.min_speed..self.options.max_speed);
+    fn random_star(
+        screen_size: &(u16, u16),
+        options: &ConstellationOptions,
+        rng: &mut EffectRng,
+        scattered: bool,
+    ) -> Star {
+        let speed = rng.random_range(options.min_speed..options.max_speed);
         let angle = rng.random_range(0.0..(std::f64::consts::PI * 2.0));
 
         let (x, y) = if scattered {
             (
-                rng.random_range(0.0..self.screen_size.0 as f64),
-                rng.random_range(0.0..self.screen_size.1 as f64),
+                rng.random_range(0.0..screen_size.0 as f64),
+                rng.random_range(0.0..screen_size.1 as f64),
             )
         } else {
             match rng.random_range(0..4) {
-                0 => (rng.random_range(0.0..self.screen_size.0 as f64), 0.0),
+                0 => (rng.random_range(0.0..screen_size.0 as f64), 0.0),
                 1 => (
-                    rng.random_range(0.0..self.screen_size.0 as f64),
-                    self.screen_size.1.saturating_sub(1) as f64,
+                    rng.random_range(0.0..screen_size.0 as f64),
+                    screen_size.1.saturating_sub(1) as f64,
                 ),
-                2 => (0.0, rng.random_range(0.0..self.screen_size.1 as f64)),
+                2 => (0.0, rng.random_range(0.0..screen_size.1 as f64)),
                 _ => (
-                    self.screen_size.0.saturating_sub(1) as f64,
-                    rng.random_range(0.0..self.screen_size.1 as f64),
+                    screen_size.0.saturating_sub(1) as f64,
+                    rng.random_range(0.0..screen_size.1 as f64),
                 ),
             }
         };
@@ -369,21 +392,6 @@ fn as_rgb(color: style::Color) -> (u8, u8, u8) {
     match color {
         style::Color::Rgb { r, g, b } => (r, g, b),
         _ => (255, 255, 255),
-    }
-}
-
-impl DefaultOptions for Constellation {
-    type Options = ConstellationOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        ConstellationOptions {
-            star_count: 65,
-            connect_radius: 0.18,
-            max_connections: 4,
-            twinkle: true,
-            min_speed: 0.3,
-            max_speed: 1.5,
-        }
     }
 }
 

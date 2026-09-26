@@ -15,6 +15,45 @@ pub const MIN_SPEED: f32 = 0.05;
 pub const MAX_SPEED: f32 = 8.0;
 pub const SPEED_STEP: f32 = 0.1;
 
+/// The generator every effect draws its randomness from.
+///
+/// This is deliberately *not* `ThreadRng`. `ThreadRng` cannot be seeded, so an
+/// effect using it can neither be reproduced from a config value nor compared
+/// against a second instance — which is why `tests/effect_contracts.rs` used to
+/// report nine effects as having an unverifiable timebase. `StdRng` is seedable
+/// and, for the handful of draws an effect makes per frame, costs nothing
+/// measurable beside the per-cell work that dominates the frame.
+pub type EffectRng = rand::rngs::StdRng;
+
+/// The default seed, shared by every effect that has a `seed` field.
+///
+/// A fixed value keeps `termzzz --print-config` stable and makes a default run
+/// reproducible, which is what lets the contract suite compare two instances. It
+/// is not meant to be interesting; `--seed` is how you pick a different one.
+pub const DEFAULT_SEED: u64 = 42;
+
+/// Seeds a generator for one effect.
+///
+/// `salt` keeps two effects configured with the same `seed` from replaying an
+/// identical sequence of numbers, which is not a bug but makes the effects look
+/// implausibly synchronised — the same colour, the same glyph, the same instant
+/// in both.
+pub fn seeded_rng(seed: u64, salt: &str) -> EffectRng {
+    use rand::SeedableRng;
+
+    // FNV-1a rather than `DefaultHasher`: the standard library makes no promise
+    // that `DefaultHasher`'s output is stable across releases, and a seed that
+    // silently changes meaning between Rust versions would make every
+    // "reproducible" run a lie.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in salt.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    EffectRng::seed_from_u64(seed ^ hash)
+}
+
 pub fn normalize_effect_size(size: (u16, u16)) -> (u16, u16) {
     (size.0.max(MIN_EFFECT_SIZE), size.1.max(MIN_EFFECT_SIZE))
 }
@@ -61,12 +100,6 @@ impl TickClock {
         }
         steps
     }
-}
-
-pub trait DefaultOptions {
-    type Options;
-
-    fn default_options(width: u16, height: u16) -> Self::Options;
 }
 
 pub trait TerminalEffect {

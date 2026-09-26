@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::TerminalEffect;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -336,25 +336,6 @@ impl Donut {
                 let color = colors[shade[idx] as usize % colors.len()];
                 buffer.set(x, y, Cell::new(symbol, color, style::Attribute::Bold));
             }
-        }
-    }
-}
-
-impl DefaultOptions for Donut {
-    type Options = DonutOptions;
-
-    fn default_options(width: u16, height: u16) -> Self::Options {
-        DonutOptions {
-            inner_radius: 1.0,
-            outer_radius: 2.0,
-            rotation_speed_a: 0.07,
-            rotation_speed_b: 0.03,
-            distance: 5.5,
-            k1: (width.min(height) as f32) * 0.8,
-            luminance_chars: vec![
-                '.', ',', '-', '~', ':', ';', '=', '!', '*', '#', '$', '@',
-            ],
-            ..Default::default()
         }
     }
 }

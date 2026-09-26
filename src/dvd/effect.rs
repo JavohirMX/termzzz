@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::{DefaultOptions, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ pub struct DvdOptions {
     pub corner_color_change: bool,
     /// Start the logo from a corner instead of the middle.
     pub start_in_corner: bool,
+    /// Seed for the starting corner and colour.
+    pub seed: u64,
 }
 
 impl Default for DvdOptions {
@@ -39,6 +41,7 @@ impl Default for DvdOptions {
             speed: 9.0,
             corner_color_change: true,
             start_in_corner: true,
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -53,6 +56,7 @@ pub struct Dvd {
     vx: f64,
     vy: f64,
     color_index: usize,
+    rng: EffectRng,
 }
 
 impl TerminalEffect for Dvd {
@@ -81,6 +85,11 @@ impl TerminalEffect for Dvd {
             Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
         self.rows = Self::parse_logo(&self.options.logo);
 
+        // Reseeded rather than merely carried over: a resize is a new screen, and
+        // re-rolling the corner and colour is what makes a resize feel like a
+        // fresh run instead of a jump cut.
+        self.rng = seeded_rng(self.options.seed, "dvd");
+
         let logo_width = self.logo_width();
         let logo_height = self.rows.len().max(1) as f64;
         let max_x = (self.screen_size.0 as f64 - logo_width).max(0.0);
@@ -89,7 +98,7 @@ impl TerminalEffect for Dvd {
         let speed = self.options.speed.max(0.1) as f64;
 
         if self.options.start_in_corner {
-            let corner = rand::rng().random_range(0..4);
+            let corner = self.rng.random_range(0..4);
             self.x = if corner & 1 == 0 { 0.0 } else { max_x };
             self.y = if corner & 2 == 0 { 0.0 } else { max_y };
             self.vx = if self.x <= 0.0 { speed } else { -speed };
@@ -100,13 +109,14 @@ impl TerminalEffect for Dvd {
             self.vx = speed;
             self.vy = speed;
         }
-        self.color_index = rand::rng().random_range(0..PALETTE.len());
+        self.color_index = self.rng.random_range(0..PALETTE.len());
     }
 }
 
 impl Dvd {
     pub fn new(options: DvdOptions, screen_size: (u16, u16)) -> Self {
         let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
+        let seed = options.seed;
         let mut effect = Self {
             screen_size,
             buffer: Buffer::new(screen_size.0 as usize, screen_size.1 as usize),
@@ -116,6 +126,8 @@ impl Dvd {
             vx: 1.0,
             vy: 1.0,
             color_index: 0,
+            // Replaced by `reset` below; this only has to be a valid generator.
+            rng: seeded_rng(seed, "dvd"),
             options,
         };
         effect.reset();
@@ -218,19 +230,6 @@ impl Dvd {
         }
 
         next
-    }
-}
-
-impl DefaultOptions for Dvd {
-    type Options = DvdOptions;
-
-    fn default_options(_width: u16, _height: u16) -> Self::Options {
-        DvdOptions {
-            logo: String::from("DVD"),
-            speed: 9.0,
-            corner_color_change: true,
-            start_in_corner: true,
-        }
     }
 }
 

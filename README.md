@@ -42,6 +42,16 @@ termzzz blank
 termzzz ascii
 ```
 
+Every effect that uses randomness is seeded, so a run can be reproduced or shared:
+
+```bash
+termzzz matrix --seed 1234
+termzzz --playlist matrix,dvd,plasma --seed 1234
+```
+
+Omit `--seed` to get the default, which is the same every time. The seed can also
+be set per effect in the config file, for example `[matrix] seed = 7`.
+
 Press `q`, `Esc`, or `Ctrl+C` to exit. `+` and `-` change the global animation speed in every effect. In ASCII mode:
 
 - `r` reseeds the field

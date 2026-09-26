@@ -50,6 +50,21 @@ or by a test, so a new effect cannot be silently half-registered.
 `InputState`, create a `FrameContext`, and pass it to the effect. The effect
 returns changed cells, and `common::write_cells` encodes them.
 
+Effects advance on `context.delta` and draw in `get_diff`, and the split matters.
+An effect that does its simulation inside `get_diff` is stepping once per rendered
+frame, so its speed follows the terminal's refresh rate rather than elapsed time
+and the global speed keys only change how often it is drawn. Effects that produce
+work at a rate rather than a per-frame count — the maze carving a cell, the pipes
+growing a segment — accumulate elapsed time and spend it in whole steps. Both
+halves are covered by a contract test that renders every effect at 60fps and at
+20fps and requires the results to differ.
+
+Randomness comes from `common::EffectRng`, a seeded `StdRng`, never from
+`ThreadRng`, which cannot be seeded and would make an effect impossible to
+reproduce. Each effect exposes a `seed` option and `--seed` overrides all of them
+at once. `common::seeded_rng` folds a per-effect salt into the seed so two
+effects configured identically do not replay the same sequence.
+
 Output encoding is the one place that talks to the terminal, and it is deliberately
 terse. A cursor move is emitted only when a cell is not the one immediately after
 the previous one, so a run along a row costs one move rather than one per cell. A
