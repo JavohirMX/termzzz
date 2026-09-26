@@ -15,6 +15,7 @@
 //! | `crab`   | ASCII crab walking animation             |
 //! | `cube`   | 3D rotating cube in ASCII                |
 //! | `donut`  | 3D rotating donut in ASCII               |
+//! | `dvd`    | Bouncing DVD logo                        |
 //! | `error`  | Error types for the crate                |
 //! | `fire`   | Fire simulation effect                   |
 //! | `life`   | Conway's Game of Life                    |
@@ -36,6 +37,7 @@ pub mod constellation;
 pub mod crab;
 pub mod cube;
 pub mod donut;
+pub mod dvd;
 pub mod error;
 pub mod fire;
 pub mod life;

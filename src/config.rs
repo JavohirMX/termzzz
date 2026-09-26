@@ -6,6 +6,7 @@ use crate::{
     crab::{CrabOptions, CrabOptionsBuilder},
     cube::{CubeOptions, CubeOptionsBuilder},
     donut::{DonutOptions, DonutOptionsBuilder},
+    dvd::{DvdOptions, DvdOptionsBuilder},
     error::{ConfigError, Result, TermzzzError},
     fire::{FireOptions, FireOptionsBuilder},
     life::{ConwayLifeOptions, ConwayLifeOptionsBuilder},
@@ -60,6 +61,8 @@ pub struct Config {
     pub crab: CrabOptions,
     #[serde(default)]
     pub donut: DonutOptions,
+    #[serde(default)]
+    pub dvd: DvdOptions,
     #[serde(default)]
     pub pipes: PipesOptions,
     #[serde(default)]
@@ -186,6 +189,10 @@ impl Config {
         self.constellation.clone()
     }
 
+    pub fn get_dvd_options(&self) -> DvdOptions {
+        self.dvd.clone()
+    }
+
     pub fn get_ascii_options(&self) -> AsciiFieldOptions {
         self.ascii.clone()
     }
@@ -203,6 +210,7 @@ impl Default for Config {
             cube: CubeOptionsBuilder::default().build().unwrap(),
             crab: CrabOptionsBuilder::default().build().unwrap(),
             donut: DonutOptionsBuilder::default().build().unwrap(),
+            dvd: DvdOptionsBuilder::default().build().unwrap(),
             pipes: PipesOptionsBuilder::default().build().unwrap(),
             plasma: PlasmaOptionsBuilder::default().build().unwrap(),
             fire: FireOptionsBuilder::default().build().unwrap(),

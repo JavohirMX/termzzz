@@ -3,8 +3,8 @@ use std::{io, process};
 
 use termzzz::{
     ascii::AsciiField, blank::Blank, boids::Boids, check, common, config::Config,
-    constellation::Constellation, crab::Crab, cube::Cube, donut::Donut, error,
-    fire::Fire, life::ConwayLife, maze::Maze, pipes::Pipes, plasma::Plasma,
+    constellation::Constellation, crab::Crab, cube::Cube, donut::Donut, dvd::Dvd,
+    error, fire::Fire, life::ConwayLife, maze::Maze, pipes::Pipes, plasma::Plasma,
     rain::digital_rain::DigitalRain, terrain::Terrain,
 };
 
@@ -109,6 +109,7 @@ enum AnyEffect {
     Constellation(Constellation),
     Terrain(Terrain),
     Ascii(AsciiField),
+    Dvd(Dvd),
 }
 
 fn build_effect(
@@ -146,6 +147,7 @@ fn build_effect(
         "terrain" => {
             AnyEffect::Terrain(Terrain::new(config.get_terrain_options(), size))
         }
+        "dvd" => AnyEffect::Dvd(Dvd::new(config.get_dvd_options(), size)),
         "ascii" => {
             AnyEffect::Ascii(AsciiField::new(config.get_ascii_options(), size))
         }
@@ -170,6 +172,7 @@ macro_rules! dispatch {
             AnyEffect::Constellation(effect) => effect.$method($($arg),*),
             AnyEffect::Terrain(effect) => effect.$method($($arg),*),
             AnyEffect::Ascii(effect) => effect.$method($($arg),*),
+            AnyEffect::Dvd(effect) => effect.$method($($arg),*),
         }
     };
 }
@@ -285,6 +288,7 @@ fn print_help() {
     println!("EXAMPLES:");
     println!("    termzzz matrix            Run Matrix effect");
     println!("    termzzz ascii             Run interactive ASCII field");
+    println!("    termzzz dvd               Run bouncing DVD logo");
     println!("    termzzz --check            Test with default effect");
     println!("    termzzz --check life       Test Life effect");
     println!("    termzzz --check --frames 100 life");
