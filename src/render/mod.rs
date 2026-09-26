@@ -8,6 +8,8 @@
 //!   foreground and background colours, for 2x vertical resolution in two.
 //! - [`dither`] turns a hard threshold into a gradient.
 //! - [`palette`] holds colour ramps that several effects share.
+//! - [`glyph_ramp`] holds character ramps, for effects that turn a value into
+//!   how much ink to put on the page.
 //!
 //! The two renderers are complements, not alternatives. Braille is 4x the
 //! vertical resolution of half-block but cannot vary hue within a cell;
@@ -19,12 +21,14 @@
 
 pub mod braille;
 pub mod dither;
+pub mod glyph_ramp;
 pub mod halfblock;
 pub mod palette;
 pub mod wipe;
 
 pub use braille::BrailleGrid;
 pub use dither::Dither;
+pub use glyph_ramp::{GlyphRamp, presets as glyph_presets};
 pub use halfblock::HalfBlockField;
 pub use palette::Palette;
 pub use wipe::{apply as apply_wipe, blank_cell};

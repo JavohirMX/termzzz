@@ -7,30 +7,34 @@ use rand::{
     seq::IndexedRandom,
 };
 use std::sync::LazyLock;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
-/// Characters in form of hashmap with label as key
-/// Note that some characters are wide unicode and they will broke
-/// screen in strange way.
-static CHARACTERS_MAP: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    m.insert("digits", "012345789");
-    // m.insert("punctuation", r#":・."=*+-<>"#); // wide character there
-    m.insert("punctuation", r#":."=*+-<>"#);
-    // m.insert("kanji", "日"); // wide character there
-    m.insert("katakana", "ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍ");
-    m.insert("other", "¦çﾘｸ");
-    m
-});
+/// The character pool, in a fixed order.
+///
+/// This was a `HashMap<&str, &str>` flattened into a `Vec<char>`, and that made
+/// `--seed` a lie. `HashMap` iterates in a per-process order, so a uniform index
+/// drawn from the flattened vector landed on a different character in every
+/// process: two runs with the same seed produced different rain. The determinism
+/// contract could not see it, because both instances it compares live in one
+/// process and share the same already-initialised `LazyLock`.
+///
+/// A map was never the right shape here. The labels were never looked up -- the
+/// map existed to be iterated -- and four static sets do not need one.
+///
+/// Wide characters are deliberately absent. `:` and `・` and `日` were all tried
+/// and removed: they occupy two columns in most terminals, which shears the grid.
+/// The katakana are halfwidth (East_Asian_Width = Halfwidth), so they are one
+/// column each and are safe.
+const CHARACTER_SETS: &[&str] = &[
+    "012345789",                        // digits
+    r#":."=*+-<>"#,                     // punctuation
+    "ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍ", // katakana
+    "¦çﾘｸ",                             // other
+];
 
-/// Characters used to form kinda-canonical matrix effect
-static CHARACTERS: LazyLock<Vec<char>> = LazyLock::new(|| {
-    let mut v = Vec::new();
-    for (_, chars) in CHARACTERS_MAP.iter() {
-        v.append(&mut chars.chars().collect());
-    }
-    v
-});
+/// Every character a drop can be made of, in [`CHARACTER_SETS`] order.
+static CHARACTERS: LazyLock<Vec<char>> =
+    LazyLock::new(|| CHARACTER_SETS.concat().chars().collect());
 
 /// How a drop is coloured, which is also how it fades.
 ///
@@ -266,6 +270,61 @@ impl RainDrop {
 mod tests {
     use super::{super::digital_rain::DigitalRainOptions, *};
     use crate::common::seeded_rng;
+
+    /// The character pool has to be assembled in a declared order.
+    ///
+    /// `--seed` is only a promise if a uniform index drawn from this vector lands
+    /// on the same character in every process. It used to be built by iterating a
+    /// `HashMap`, whose order is per-process, so the same seed produced different
+    /// rain on every run and nothing in the test suite could see it -- both
+    /// instances the determinism contract compares share one `LazyLock`.
+    ///
+    /// Reintroducing a map fails here rather than silently unbreaking the seed.
+    #[test]
+    fn the_character_pool_is_flattened_in_the_declared_order() {
+        let expected: Vec<char> = CHARACTER_SETS.concat().chars().collect();
+
+        assert_eq!(
+            *CHARACTERS, expected,
+            "the pool is not the declared concatenation, so a seeded run is not \
+             reproducible across processes"
+        );
+        assert!(
+            CHARACTER_SETS.len() > 1,
+            "the sets were merged into one, which loses the documentation of what \
+             each group is for"
+        );
+    }
+
+    /// Every character must be one column wide.
+    ///
+    /// A double-width glyph occupies two cells, and the drop body is indexed by
+    /// cell, so one shears the grid rather than merely looking wrong. The comment
+    /// on `CHARACTER_SETS` records `・` (U+30FB) and `日` (U+65E5) as having been
+    /// removed for exactly that, so this is the test that keeps them out.
+    ///
+    /// What remains is ASCII, the halfwidth katakana block, and three Latin-1
+    /// supplement characters. The last group is *ambiguous* width rather than
+    /// wide: one column in a Latin-configured terminal, two in a CJK-configured
+    /// one. That is a real but much smaller risk than the wide characters were,
+    /// and the effect has shipped with them, so the assertion is that nothing
+    /// genuinely wide has crept back in.
+    #[test]
+    fn no_character_in_the_pool_is_double_width() {
+        for set in CHARACTER_SETS {
+            for glyph in set.chars() {
+                let ambiguous_or_narrow = glyph.is_ascii()
+                    || ('\u{00A0}'..='\u{00FF}').contains(&glyph)
+                    || ('\u{FF61}'..='\u{FF9F}').contains(&glyph);
+                assert!(
+                    ambiguous_or_narrow,
+                    "{glyph:?} (U+{:04X}) in {set:?} is double-width, and will \
+                     shear the grid",
+                    glyph as u32
+                );
+            }
+        }
+    }
 
     fn get_sane_options() -> DigitalRainOptions {
         DigitalRainOptions {

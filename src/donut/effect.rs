@@ -1,6 +1,7 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
+use crate::render::GlyphRamp;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -74,20 +75,28 @@ static SIN_PHI: LazyLock<Vec<f32>> =
 static COS_PHI: LazyLock<Vec<f32>> =
     LazyLock::new(|| (0..PHI_SAMPLES).map(|i| (i as f32 * 0.01).cos()).collect());
 
-/// Fallback ramp, used when a config file supplies an empty one.
+/// The donut's own glyph ramp, dimmest first.
+///
+/// Deliberately *not* the shared default. This one pairs one-to-one with
+/// [`COLORS`], and the pairing is the point: one shade per colour, so every glyph
+/// has exactly one colour and every colour exactly one glyph. A shorter or longer
+/// set than twelve would break that, which
+/// `the_shade_ramp_spans_every_glyph` checks.
 const DEFAULT_LUMINANCE_CHARS: &[char] =
     &['.', ',', '-', '~', ':', ';', '=', '!', '*', '#', '$', '@'];
 
 /// The glyph ramp, never empty.
 ///
 /// An empty `luminance_chars` used to underflow `len() - 1` and panic, and that is
-/// reachable straight from a user config file.
-fn shade_ramp(configured: &[char]) -> &[char] {
-    if configured.is_empty() {
-        DEFAULT_LUMINANCE_CHARS
+/// reachable straight from a user config file. [`GlyphRamp`] handles that, and
+/// eight effects share it now, so this is a thin wrapper rather than the second
+/// implementation of the same guard.
+fn shade_ramp(configured: &[char]) -> GlyphRamp {
+    GlyphRamp::new(if configured.is_empty() {
+        DEFAULT_LUMINANCE_CHARS.to_vec()
     } else {
-        configured
-    }
+        configured.to_vec()
+    })
 }
 
 /// Gruvbox gradient, darkest first.
@@ -308,7 +317,6 @@ impl Donut {
         // is fixed at twelve, so the shade index is clamped to the glyph ramp's
         // top rather than wrapped: a `min` in the inner loop rather than a
         // modulo by a length the compiler cannot see.
-        let ramp_top = ramp.len().saturating_sub(1);
 
         let scratch = &mut self.scratch;
         let zbuffer = &mut scratch.zbuffer;
@@ -373,7 +381,8 @@ impl Donut {
                 let idx = y_proj * width + x_proj;
                 if z_inv > zbuffer[idx] {
                     zbuffer[idx] = z_inv;
-                    output[idx] = ramp[luminance_index.min(ramp_top)];
+                    // `at` clamps, which is what the `min(ramp_top)` here used to do.
+                    output[idx] = ramp.at(luminance_index);
                     // The shade index travels with the glyph, so the second pass
                     // does not have to search the ramp for a character whose
                     // index it already knew.
