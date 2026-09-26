@@ -11,19 +11,19 @@ cargo build --release
 
 # Run effects
 termzzz matrix      # Matrix digital rain
-termzzz life        # Conway's Game of Life
-termzzz mandelbrot # Escape-time Mandelbrot set, zooming
-termzzz maze        # Maze generation
-termzzz boids       # Boids flocking simulation
-termzzz cube        # 3D cube rotation
-termzzz crab        # ASCII crab animation
+termzzz life        # Conway's Game of Life, cell age in the glyph
+termzzz mandelbrot # Escape-time Mandelbrot set, zooming and panning
+termzzz maze        # Maze generation, held when finished
+termzzz boids       # Boids flocking simulation, with trails
+termzzz cube        # 3D cube rotation, filled and depth-shaded
+termzzz crab        # ASCII crabs scuttling along a seabed
 termzzz donut       # 3D donut rotation
 termzzz pipes       # Pipe maze animation
-termzzz plasma      # Plasma effect
+termzzz plasma      # Plasma effect, value in the glyph
 termzzz fire        # Fire simulation
-termzzz terrain     # Terrain generation
-termzzz constellation # Drifting stars and dotted connections
-termzzz dvd         # Bouncing ASCII logo
+termzzz terrain     # Scrolling terrain with a horizon
+termzzz constellation # Drifting stars and sparse figures
+termzzz dvd         # Bouncing block-letter DVD logo
 termzzz blank       # Blank screen
 termzzz ink         # Interactive generative field you pour ink into
 
@@ -65,14 +65,16 @@ repository and the distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **`mandelbrot` render cost at large sizes.** 11.8 ms per frame at 400x200,
-   which is over half a 60 Hz budget spent before a single byte is written, and
-   it is the only effect still over `frame_times`'s 2 ms budget at that size
-   (`life` is also over, but only on its `update x4` worst case at high speed).
-   The cost is very close to linear in `max_iterations`, because nearly every
-   interior pixel spends the whole budget discovering it never escapes. Lowering
-   the default is the first thing to try; a region-marking rewrite is where the
-   real win is, and that is a rewrite rather than a tweak
+1. **`mandelbrot` render cost at large sizes.** 12.3 ms per frame at 400x200,
+   which is over half a 60 Hz budget spent before a single byte is written. The
+   cost is very close to linear in `max_iterations`, because nearly every interior
+   pixel spends the whole budget discovering it never escapes. Lowering the
+   default is the first thing to try; a region-marking rewrite is where the real
+   win is, and that is a rewrite rather than a tweak.
+   `terrain` is now also over the 2 ms budget at 400x200 (1.3 ms render, 554 KB),
+   which it was not when it drew one frame and then nothing. That is the honest
+   cost of an effect that moves, and it is the same trade `mandelbrot` and
+   `boids` are in. `life` is over on its `update x4` worst case only
 2. **More effects on the sub-cell renderer.** `starfield` and `flow` want
    braille (line art, one colour per cell); `physarum` and a Gray-Scott
    reaction-diffusion want half-block (smooth colour). Each is roughly 150-350
@@ -138,13 +140,30 @@ The `Canvas` work is done: all fifteen effects hold one instead of open-coding
 the double-buffer pattern, and none of them allocates a full-screen `Buffer` per
 frame any more.
 
-The sub-cell renderer is done too, in `src/render/`: `braille` (8x density, one
-colour per cell), `halfblock` (2x vertical, two colours per cell, which is what
-gave `Cell` its background), `dither` and `palette`. Only `halfblock` is in use,
-by `mandelbrot`; `braille` and `dither` have no callers yet. Note the
-aspect-ratio caveat: both sub-cell modes assume a cell about twice as tall as it
-is wide, and DejaVu Sans Mono is nearer 1:1.2, so output looks vertically squashed
-there. That is a property of the technique, not a bug to fix.
+The sub-cell renderers are in `src/render/`: `braille` (8x density, one colour
+per cell), `halfblock` (2x vertical, two colours per cell, which is what gave
+`Cell` its background), `quadrant` (2x on *both* axes, two-tone), plus `dither`
+and `palette`. All four now have callers: `mandelbrot` uses `halfblock`, `cube`
+uses `braille` and `dither`, and `dvd` uses `quadrant`.
+
+Note the aspect-ratio caveat, which applies to all of them: they assume a cell
+about twice as tall as it is wide, and DejaVu Sans Mono is nearer 1:1.2, so output
+looks vertically squashed there. That is a property of the technique, not a bug to
+fix.
+
+`quadrant` exists because `▀` and `▌` cannot be combined -- a cell has one
+foreground and one background, so a vertical split spends both. It is
+deliberately limited to a *two-tone* bitmap, since four arbitrary colours cannot be
+shown in two. Its font risk is local rather than global: a solid interior is `█`
+and stays solid, so a terminal missing `▛▜▙▟` only loses a shape's outline.
+
+There is also a shared `GlyphRamp` in the same directory, and eight effects now
+draw their characters from it. Read its module doc before choosing a set: the
+ORDERING is the whole point, and a ramp that puts the light characters on the ones
+covering most of the screen makes the majority of the frame the brightest thing on
+it. `presets::BLOCKS` is the only set whose ordering Unicode defines rather than
+taste, which makes it the right default for anything using the character as a
+*value* rather than as texture.
 
 Determinism is done: all nine effects that used an unseeded generator now carry a
 `seed` option and a seeded `StdRng`, `--seed <N>` overrides all of them, and

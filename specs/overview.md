@@ -17,7 +17,8 @@
 - `error.rs`: Error types for the crate
 - `registry.rs`: The `EFFECT_SPECS` table, effect ids, and the `AnyEffect` enum used by the CLI
 - `host.rs`: The running effect, the cycle order, and the `n`/`p` transition
-- `render/`: Sub-cell renderers -- braille, half-block, dithering, palettes, wipe
+- `render/`: Sub-cell renderers -- braille, half-block, quadrant, dithering,
+  character ramps, colour palettes, wipe
 - `session.rs`: Terminal setup and teardown, including panic safety
 - `check.rs`: Bounded frame-count test mode
 - `ink/`: Reusable ASCII renderer and interactive generative field
@@ -114,7 +115,7 @@ an effect. Output writes are clipped to the actual terminal dimensions regardles
 
 The ink field is a domain-warped wave field: the sample coordinates are
 displaced by a sine and a cosine before three wave terms and a diagonal ripple are
-summed. That value indexes a narrow ASCII glyph ramp through a bounded palette, and
+summed. That value indexes a character ramp and a bounded colour palette, and
 the pointer injects energy that decays over time. The renderer has no media
 dependencies and only depends on the existing `Buffer`/`Cell` model.
 

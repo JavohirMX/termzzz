@@ -5,6 +5,108 @@ All notable changes to this project will be documented in this file.
 ## [0.2.0] - Unreleased
 
 ### Fixed
+Fourteen effects were audited against what they actually draw. Most of what came
+back was not a matter of taste, and several of these effects had never once shown
+their output to anyone.
+
+- **The donut was drawing a fifth of itself.** The angle tables were built at a
+  fixed 0.02 rad step, which is only correct at one sample count, and indexed
+  absolutely — so any terminal under 50 rows got a strict prefix of the table.
+  At 40x12 it swept 23.6% of a turn, and at the 6-row minimum the screen was
+  *blank*. The missing wedge is fixed in object space, so it was a permanent
+  chunk of the torus that is never drawn and tumbles with it. Now a full turn at
+  every size. Its colours are also a perceptually-uniform ramp rather than a
+  fixed hue set reordered by luminance, which is what scatters hues across the
+  brightness range; four of twelve shades had never been drawn at all
+- **The maze never showed you a finished maze.** It reset on the frame after the
+  carve completed, so a completed maze existed for exactly one frame. Underneath
+  that, the depth-first search popped its stack twice at a dead end and discarded
+  the parent node, so it carved **4 of 200** reachable cells rather than 200.
+  Generation also never finished on a large terminal — five and a half minutes at
+  400x200, longer than its own playlist slot. Now: a six-second hold, a real
+  spanning tree, and a rate that scales with the screen
+- **The mandelbrot was one flat colour.** Its escape counts were mapped onto the
+  ramp with a curve that reached the top at five iterations, and the sampler
+  clamps, so nearly every visible pixel was a single `rgb(16, 8, 40)`. A second
+  bug compounded it: the palette offset grew without bound, so after about seven
+  seconds the entire frame was flat until the camera recentred. It also cut to an
+  unrelated point at the depth limit; it now pans to a nearby coastline and pulls
+  back over 1.5s. `palette = "ember" | "ocean" | "magma" | "contrast"` is new
+- **The matrix grey lines were flashing white**, for two independent reasons. Some
+  drops were drawn "dark grey *and bold*", and bold on a 256-colour palette index
+  is a brightening hint that terminals answer by rendering the bright variant. And
+  the back layer's ramp started at near-white while being indexed by absolute
+  position, so the pale stretch grew with the window — about 20 cells at 200 rows
+  against 2 at 50
+- **`--seed` did not work for the matrix.** The character pool was built by
+  iterating a `HashMap`, whose order is randomised per process, so the same seed
+  produced different rain on every run. The determinism test could not see it,
+  because both instances it compares live in one process
+- **The DVD logo moved on 86 frames in 600** and said `DUD`. The position was
+  integrated correctly in f64 and then thrown away by `as usize` at draw time, so
+  the logo sat still for six frames out of seven and then jumped a whole cell. The
+  middle letter was a `U`. The colour only changed on a corner, which first
+  happens after 97 seconds, so it was effectively one colour forever. Now a
+  five-row block-letter `DVD`, sub-cell placement on both axes, and a recolour on
+  every wall hit
+- **Fading to black was a hard step, not a fade.** `lerp`'s match only handled
+  two `Rgb` values, so `Color::Black` fell into the "endpoints win" fallback and
+  `lerp(Black, ink, 0.2)` returned `Black`. Code that reads exactly like a working
+  gradient and silently did nothing
+- **`cargo clippy --all-features` is now clean**, as is `cargo fmt --check`
+- **A user config can omit any single key**, not just whole sections. Only 2 of
+  17 effect option structs carried `#[serde(default)]`, so a hand-written
+  `[plasma]` section naming one key was a startup error. This mattered more than
+  it sounds: `--print-config` writes every key to disk, so adding any new setting
+  would have broken startup for most users
+- **A playlist no longer swallows names it cannot resolve.** An unresolvable
+  entry was filtered out in silence and the playlist simply came out shorter. It
+  now reports them on stderr with the list of names the build knows
+
+### Changed
+- **Effects were rebuilt for legibility**, and the ones that were quietly broken
+  are the substance of this release:
+  - `life` drew 32 halfwidth katakana, and the glyph was a *uniform random pick
+    redrawn every generation* — it depended on nothing, so the eye had nothing to
+    track but the absence of glyphs. Cells now have an age and both glyph and
+    colour follow it
+  - `boids` had two of its three flocking rules attenuated to ~3% of the
+    separation force by their own normalisation, so it read as a gas; the screen
+    was cleared every frame so there were no trails; and the colour formula
+    could not produce the white its own comment described
+  - `plasma` drew a static `*` on every cell, and its fourth radial term was
+    anchored at the origin, whose vertical gradient is zero at the top and
+    maximal at the bottom — which is why the bottom rows flashed
+  - `terrain` rendered one frame and then returned an empty diff forever, the
+    only fully static effect here, with the shortest playlist slot of the sixteen
+  - `constellation` covered a third of the screen in connection dots and rebuilt
+    its whole graph every frame, so the mesh shimmered; star count was a flat 65
+    at every size, so at 6x6 twenty-nine of sixty-five stars were silently
+    overwritten
+  - `cube` destroyed all eight corners — each of the three edges meeting at a
+    vertex overwrote the other two — and ran off the top and bottom of the screen
+    at some `cube_size` values
+  - `crab` moved one column every 21 frames, had two walk poses, and its
+    left-facing frames were not mirrors
+  - `ink` (see the rename below) drew a top ramp stop that was 6.6% saturated
+    green, so nothing was ever white
+- **A shared `GlyphRamp`** now backs the character sets for eight effects, with
+  named presets. Read its module doc before choosing one: the *ordering* is the
+  whole point, and a ramp that puts the light characters on the ones covering
+  most of the screen makes most of the frame the brightest thing on it
+- **A `QuadrantMask` renderer**, for 2x2 per cell in two colours. `▀` and `▌`
+  cannot be combined — a cell has one foreground and one background, so a vertical
+  split spends both — and this is what a moving logo needs
+- **Every effect's options struct carries `#[serde(default)]`**, so a config file
+  may omit any key and inherit the real default
+- `maze` gained `hold_seconds`; `dvd` gained `slope`, `color_change` and a
+  block-letter default logo; `mandelbrot`, `plasma`, `terrain`, `boids` and
+  `constellation` gained tunable glyph ramps and other options. All are listed in
+  `--print-config`
+- **`Attribute::Bold` is no longer used as decoration.** Eight effects had it,
+  often on every cell. Many terminals treat bold on a foreground as a brightening
+  hint, which pushes a ramp's hot end toward white — the same class of bug that
+  made eleven of the sixteen effects look washed out
 - **The donut now visibly spins.** `rotation_speed_a` and `rotation_speed_b` are
   radians per *second* — the effect multiplies them by the frame delta — but the
   values were the old per-frame numbers, so they were being applied 60× too
@@ -154,7 +256,6 @@ All notable changes to this project will be documented in this file.
   reseeded on reset so a resize starts a fresh run rather than continuing one
 
 ### Upgrade notes
-### Upgrade notes
 Three changes in this release can be silently cancelled or silently lost by a
 config file written by an earlier build. They are collected here because
 `--print-config` writes every default to disk, which means a generated config
@@ -199,7 +300,6 @@ pins whatever the defaults were the day it was generated.
   now carries `#[serde(default)]` too, so a section missing a *key* is no longer
   a startup error either -- only a whole missing section was ever covered before.
 
-### Changed
 - The release profile optimizes for speed rather than size. This is a real-time
   renderer doing per-cell trigonometry sixty times a second, and `opt-level = "s"`
   suppressed the inlining that work depends on. Costs roughly 23% more binary
