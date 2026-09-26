@@ -8,6 +8,7 @@ Terminal screensavers and generative visual effects written in Rust.
 
 - Matrix rain
 - Conway's Game of Life
+- Mandelbrot set (`mandelbrot`)
 - Maze generation
 - Boids flocking
 - 3D cube
@@ -27,6 +28,7 @@ Terminal screensavers and generative visual effects written in Rust.
 ```bash
 termzzz matrix
 termzzz life
+termzzz mandelbrot
 termzzz maze
 termzzz boids
 termzzz cube

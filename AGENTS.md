@@ -12,6 +12,7 @@ cargo build --release
 # Run effects
 termzzz matrix      # Matrix digital rain
 termzzz life        # Conway's Game of Life
+termzzz mandelbrot # Escape-time Mandelbrot set, zooming
 termzzz maze        # Maze generation
 termzzz boids       # Boids flocking simulation
 termzzz cube        # 3D cube rotation
@@ -53,7 +54,7 @@ cargo clippy       # Run linter
 
 ## Project Status
 - **Version**: 0.2.0
-- **Effects**: 15 screensavers and visual effects, plus a playlist mode
+- **Effects**: 16 screensavers and visual effects, plus a playlist mode
 - **Platforms**: macOS and Linux
 - **Configuration**: `~/.config/termzzz.toml`
 
@@ -99,9 +100,15 @@ them advanced by a fixed step per rendered frame — `maze`, `boids`, `crab`,
 `pipes` and `constellation` ignored the speed keys — which is fixed too.
 
 Not worth doing soon: further performance work. Nothing is dropping frames — the
-worst effect uses about 2% of a 60 fps budget at 200x50. `life`, `plasma` and
-`fire` exceed the 2 ms budget at 400x200, and did so before the determinism work
-too.
+worst effect uses about 2% of a 60 fps budget at 200x50. `life`, `plasma`,
+`fire` and `mandelbrot` exceed `frame_times`'s 2 ms budget at 400x200, which is
+an eight-times-heavier terminal than that budget assumes; at 200x50 only
+`mandelbrot` and `plasma` do, and mandelbrot's 2.2 ms is 13% of a 60 fps frame.
+`mandelbrot`'s cost is linear in `max_iterations`, because interior pixels spend
+the whole budget discovering they never escape; the default is 96 and lowering
+it is the first thing to try. Nearly every interior pixel is bounded and pays
+in full, which is where a region-marking rewrite would win, and that is a
+rewrite rather than a tweak.
 
 ## Working Practices
 

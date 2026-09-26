@@ -11,6 +11,7 @@ use crate::donut::Donut;
 use crate::dvd::Dvd;
 use crate::fire::Fire;
 use crate::life::ConwayLife;
+use crate::mandelbrot::Mandelbrot;
 use crate::maze::Maze;
 use crate::pipes::Pipes;
 use crate::plasma::Plasma;
@@ -27,6 +28,7 @@ use std::str::FromStr;
 pub enum EffectId {
     Matrix,
     Life,
+    Mandelbrot,
     Maze,
     Boids,
     Blank,
@@ -82,6 +84,14 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 20.0,
         needs_mouse: false,
         config_section: "life",
+    },
+    EffectSpec {
+        id: EffectId::Mandelbrot,
+        name: "mandelbrot",
+        description: "Escape-time Mandelbrot set, slowly zooming",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "mandelbrot",
     },
     EffectSpec {
         id: EffectId::Maze,
@@ -267,6 +277,7 @@ impl FromStr for EffectId {
 pub enum AnyEffect {
     Matrix(DigitalRain),
     Life(ConwayLife),
+    Mandelbrot(Mandelbrot),
     Maze(Maze),
     Boids(Boids),
     Blank(Blank),
@@ -287,6 +298,7 @@ impl AnyEffect {
         match self {
             Self::Matrix(_) => EffectId::Matrix,
             Self::Life(_) => EffectId::Life,
+            Self::Mandelbrot(_) => EffectId::Mandelbrot,
             Self::Maze(_) => EffectId::Maze,
             Self::Boids(_) => EffectId::Boids,
             Self::Blank(_) => EffectId::Blank,
@@ -311,6 +323,10 @@ impl AnyEffect {
             )),
             EffectId::Life => Self::Life(ConwayLife::new(
                 config.get_life_options(screen_size),
+                screen_size,
+            )),
+            EffectId::Mandelbrot => Self::Mandelbrot(Mandelbrot::new(
+                config.get_mandelbrot_options(),
                 screen_size,
             )),
             EffectId::Maze => Self::Maze(Maze::new(
@@ -425,6 +441,7 @@ macro_rules! impl_terminal_effect_for_any {
 impl_terminal_effect_for_any!(
     Matrix,
     Life,
+    Mandelbrot,
     Maze,
     Boids,
     Blank,
@@ -453,6 +470,7 @@ mod tests {
     const KNOWN_IDS: &[EffectId] = &[
         EffectId::Matrix,
         EffectId::Life,
+        EffectId::Mandelbrot,
         EffectId::Maze,
         EffectId::Boids,
         EffectId::Blank,

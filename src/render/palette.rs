@@ -82,6 +82,20 @@ impl Palette {
         self.stops[index % self.stops.len()]
     }
 
+    /// The colour at `t` in `0.0..=1.0`, as floats in `0.0..=1.0`.
+    ///
+    /// For an effect filling a [`super::HalfBlockField`], which stores floats so
+    /// a slow gradient keeps its steps at the dark end. A ramp whose stops are
+    /// not `Color::Rgb` has no channels to give, and yields white.
+    pub fn sample_rgb(&self, t: f32) -> [f32; 3] {
+        match self.sample(t) {
+            Color::Rgb { r, g, b } => {
+                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+            }
+            _ => [1.0, 1.0, 1.0],
+        }
+    }
+
     /// The anchors, for an effect that wants to reason about them.
     pub fn stops(&self) -> &[Color] {
         &self.stops

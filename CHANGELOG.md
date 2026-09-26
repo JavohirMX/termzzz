@@ -129,6 +129,16 @@ All notable changes to this project will be documented in this file.
   smooth gradients; `dither` turns a hard threshold into a gradient with a
   stable Bayer offset; `palette` holds the colour ramps effects share
 
+### Added
+- `mandelbrot`, an escape-time renderer for the Mandelbrot set that zooms
+  continuously into the boundary and re-picks its coastline by seeded rejection
+  sampling when it gets too deep to resolve. Drawn with half-blocks, so the
+  escape-time bands are read as colour rather than density. `max_iterations` is
+  the quality dial and the dominant cost; the iteration budget also falls
+  automatically as the camera pulls back, since interior pixels are most of the
+  screen when zoomed out and every one of them spends the full budget to
+  discover it never escapes
+
 ### Changed
 - `Cell` carries a background colour. Only the half-block glyph `▀` needs it,
   and `Cell::new` keeps its three arguments and leaves the background at the

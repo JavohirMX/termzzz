@@ -10,6 +10,7 @@ use crate::{
     error::{ConfigError, Result, TermzzzError},
     fire::FireOptions,
     life::ConwayLifeOptions,
+    mandelbrot::MandelbrotOptions,
     maze::MazeOptions,
     pipes::PipesOptions,
     plasma::PlasmaOptions,
@@ -68,6 +69,7 @@ pub struct Config {
     pub global: GlobalOptions,
     pub matrix: DigitalRainOptions,
     pub life: ConwayLifeOptions,
+    pub mandelbrot: MandelbrotOptions,
     pub maze: MazeOptions,
     pub boids: BoidsOptions,
     pub ascii: AsciiFieldOptions,
@@ -145,6 +147,10 @@ impl Config {
         options
     }
 
+    pub fn get_mandelbrot_options(&self) -> MandelbrotOptions {
+        self.mandelbrot.clone()
+    }
+
     pub fn get_maze_options(&self, _screen_size: (u16, u16)) -> MazeOptions {
         self.maze.clone()
     }
@@ -219,9 +225,16 @@ impl Config {
     /// Spelled out field by field on purpose: a `--seed` that quietly skipped a
     /// section would leave that effect unreproducible while appearing to work,
     /// which is the same class of silent gap as an effect missing from the
-    /// registry. The sections listed here are exactly the ones whose options
-    /// carry a `seed`.
+    /// registry.
+    ///
+    /// The list is hand-maintained and that is a real risk, so it is not left to
+    /// review. `seeded_effects_are_reproducible_and_seed_sensitive` overrides
+    /// with two different values and requires every seed-sensitive effect to
+    /// render differently, so a section left off this list fails the test suite
+    /// rather than quietly doing nothing. Adding mandelbrot without adding it
+    /// here is exactly how that was found.
     pub fn override_seed(&mut self, seed: u64) {
+        self.mandelbrot.seed = seed;
         self.matrix.seed = seed;
         self.life.seed = seed;
         self.maze.seed = seed;
@@ -246,6 +259,7 @@ impl Default for Config {
             global: GlobalOptions::default(),
             matrix: DigitalRainOptions::default(),
             life: ConwayLifeOptions::default(),
+            mandelbrot: MandelbrotOptions::default(),
             maze: MazeOptions::default(),
             boids: BoidsOptions::default(),
             ascii: AsciiFieldOptions::default(),

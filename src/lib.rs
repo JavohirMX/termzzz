@@ -51,6 +51,7 @@ pub mod dvd;
 pub mod error;
 pub mod fire;
 pub mod life;
+pub mod mandelbrot;
 pub mod maze;
 pub mod pipes;
 pub mod plasma;
