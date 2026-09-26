@@ -1,7 +1,8 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
-use crate::render::GlyphRamp;
+use crate::render::glyph_ramp::GlyphRamp;
+use crate::render::palette::Palette;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -51,29 +52,16 @@ impl Default for DonutOptions {
 }
 
 /// Number of samples around the cross-section of the torus at full resolution.
+///
+/// Also the reference the terminal-dependent resolution is measured against:
+/// `theta_steps` is this at 50 rows and fewer below that.
 const THETA_SAMPLES: usize = 314;
 /// Number of samples around the centre of revolution, always twice `theta`.
+///
+/// A cap rather than a count now that the angle tables are built per frame: the
+/// sweep is `2pi` either way, so a shorter table means a coarser one, never a
+/// shorter one.
 const PHI_SAMPLES: usize = THETA_SAMPLES * 2;
-
-/// The sampling angles are fixed, so their sines and cosines are constants.
-/// Evaluating them inside the inner loop was the single largest cost here.
-static SIN_THETA: LazyLock<Vec<f32>> = LazyLock::new(|| {
-    (0..THETA_SAMPLES)
-        .map(|i| (i as f32 * 0.02).sin())
-        .collect()
-});
-
-static COS_THETA: LazyLock<Vec<f32>> = LazyLock::new(|| {
-    (0..THETA_SAMPLES)
-        .map(|i| (i as f32 * 0.02).cos())
-        .collect()
-});
-
-static SIN_PHI: LazyLock<Vec<f32>> =
-    LazyLock::new(|| (0..PHI_SAMPLES).map(|i| (i as f32 * 0.01).sin()).collect());
-
-static COS_PHI: LazyLock<Vec<f32>> =
-    LazyLock::new(|| (0..PHI_SAMPLES).map(|i| (i as f32 * 0.01).cos()).collect());
 
 /// The donut's own glyph ramp, dimmest first.
 ///
@@ -99,86 +87,51 @@ fn shade_ramp(configured: &[char]) -> GlyphRamp {
     })
 }
 
-/// Gruvbox gradient, darkest first.
+/// The bottom of the colour ramp, which is magma's first stop with the floor
+/// lifted off black.
 ///
-/// The ramp has to run from dim to bright: the index comes straight from the
-/// brightness of a sample, with no inversion anywhere, so a low index is a dim
-/// glyph and a high one is a bright one. This one ran the other way -- its first
-/// five entries were the two lightest neutrals in the palette and its last two
-/// were orange and red -- which put near-white cream on the `.` and `,` that
-/// cover most of the torus and left the highlights dark, and read to the user as
-/// a white broken doughnut.
-///
-/// Non-decreasing in perceived brightness, which `the_ramp_runs_from_dark_to_light`
-/// pins. The hues are the palette's; only the order is new.
-const COLORS: [style::Color; 12] = [
-    style::Color::Rgb {
-        r: 40,
-        g: 40,
-        b: 40,
-    },
-    style::Color::Rgb {
-        r: 80,
-        g: 73,
-        b: 69,
-    },
-    style::Color::Rgb {
-        r: 204,
-        g: 36,
-        b: 29,
-    },
-    style::Color::Rgb {
-        r: 69,
-        g: 133,
-        b: 136,
-    },
-    style::Color::Rgb {
-        r: 146,
-        g: 131,
-        b: 116,
-    },
-    style::Color::Rgb {
-        r: 104,
-        g: 157,
-        b: 106,
-    },
-    style::Color::Rgb {
-        r: 168,
-        g: 153,
-        b: 132,
-    },
-    style::Color::Rgb {
-        r: 215,
-        g: 153,
-        b: 33,
-    },
-    style::Color::Rgb {
-        r: 184,
-        g: 187,
-        b: 38,
-    },
-    style::Color::Rgb {
-        r: 213,
-        g: 196,
-        b: 161,
-    },
-    style::Color::Rgb {
-        r: 235,
-        g: 219,
-        b: 178,
-    },
-    style::Color::Rgb {
-        r: 251,
-        g: 241,
-        b: 199,
-    },
-];
+/// The ramp runs dark to light, and its dark end is the glyph on the dimmest
+/// part of the torus -- a large fraction of the screen. Magma starts at
+/// `rgb(0, 0, 4)`, which on a dark terminal is indistinguishable from a cell
+/// that was never drawn, so the shading would read as a hole in the torus
+/// rather than as its shadow. This is still the darkest stop in the set; it
+/// just has enough ink to be seen.
+const RAMP_FLOOR: style::Color = style::Color::Rgb {
+    r: 20,
+    g: 16,
+    b: 34,
+};
 
 /// How many shades the brightness term is divided into.
 ///
 /// One per colour, so every glyph in the ramp has exactly one colour and every
 /// colour has exactly one glyph.
-const SHADES: usize = COLORS.len();
+const SHADES: usize = 12;
+
+/// The colour ramp, darkest first, expanded to one colour per glyph.
+///
+/// `magma` is in [`crate::render::palette::presets`] already, and it is the
+/// right ramp for this because it is perceptually *ordered*: its steps are even
+/// in perceived lightness by construction. The ramp this replaces was twelve
+/// Gruvbox entries reordered into monotonic Rec. 601 luminance, and reordering
+/// a fixed set of hues by brightness is a hue roulette -- the sequence ran 4,
+/// 30, 4, 183, 34, 120, 38, 41, 57, 37, 39 and 43 degrees, so the middle of the
+/// brightness range stepped from taupe to sage to gold. Two adjacent pairs were
+/// also within 0.011 of luminance of each other, so a quarter of the ramp was
+/// spent on steps the eye cannot resolve, and that is exactly where the hue
+/// flipped. Expanded to twelve, magma's ascending half has a worst adjacent
+/// step of 0.040 in the same measure.
+///
+/// Built through [`Palette`] rather than written out, so the ramp stays the
+/// shared one and this file does not carry a second copy of it.
+static COLORS: LazyLock<[style::Color; SHADES]> = LazyLock::new(|| {
+    let mut stops = vec![RAMP_FLOOR];
+    stops.extend_from_slice(&crate::render::palette::presets::MAGMA[1..5]);
+    Palette::new(stops)
+        .expand(SHADES)
+        .try_into()
+        .expect("Palette::expand returns exactly the count it was asked for")
+});
 
 /// The largest the brightness term gets.
 ///
@@ -197,10 +150,51 @@ const BRIGHTEST: f32 = std::f32::consts::SQRT_2;
 /// inverts the value, so index 0 is the dimmest thing drawn. Inlined because it
 /// is called once per sample, a few hundred thousand times a frame, and the
 /// scale is a constant division that folds away.
+///
+/// Linear on purpose. The shaping of the brightness term happens in
+/// [`shade_index_for`], at the one call site, so that this stays the plain
+/// proportional map the ramp is defined against.
 #[inline]
 fn shade_index(brightness: f32) -> usize {
     let scale = SHADES as f32 / BRIGHTEST;
     ((brightness * scale) as usize).min(SHADES - 1)
+}
+
+/// The exponent on normalised brightness before the ramp index is taken,
+/// chosen so the twelve shades cover roughly equal screen area.
+///
+/// Measured rather than guessed. The brightness term is the z component of the
+/// surface normal in the rotated frame, so on the visible surface it behaves
+/// like a cosine of the view angle, and the surface area at a given brightness
+/// is not uniform in it. Counting the cells a frame actually draws, over twelve
+/// frames of a tumbling torus at four sizes, the un-shaped term gave a worst
+/// bucket share of 17.1% and a worst smallest share of 1.3% -- a seven-fold
+/// spread, with the darks starved and the brights doing double duty. Sweeping
+/// the exponent put the flattest distribution at 1.5, which through the
+/// renderer reads as 5.0% to 12.0% at 40x12 and 5.2% to 9.9% at 40x20, against
+/// an even ramp's 8.3%. Past 1.6 the top of the ramp starts losing area to the
+/// bottom again, because the curve stops being monotonic in area and becomes
+/// monotonic in the value.
+#[inline]
+fn shape_light(normalised: f32) -> f32 {
+    // `x.powf(1.5)`, written in closed form. `powf` is a logarithm and an
+    // exponential; this is one square root, and it runs on the order of a
+    // hundred thousand samples a frame. Measured at 400x200 the closed form
+    // renders in 0.51 ms against 1.01 ms for `powf`, so the exponent is written
+    // down in a comment rather than in a constant the two could drift apart
+    // from -- and `the_light_curve_is_the_exponent_it_claims_to_be` is what
+    // holds them together.
+    normalised * normalised.sqrt()
+}
+
+/// The ramp index for a sample: the brightness term, shaped, then scaled.
+///
+/// Split in two so the shaping has one home and [`shade_index`] stays the plain
+/// proportional map the glyph ramp is defined against.
+#[inline]
+fn shade_index_for(brightness: f32) -> usize {
+    let normalised = (brightness / BRIGHTEST).clamp(0.0, 1.0);
+    shade_index(shape_light(normalised) * BRIGHTEST)
 }
 
 /// Per-frame scratch, reused across frames so a frame does not allocate.
@@ -209,6 +203,49 @@ struct Scratch {
     zbuffer: Vec<f32>,
     output: Vec<char>,
     shade: Vec<u8>,
+    sin_theta: Vec<f32>,
+    cos_theta: Vec<f32>,
+    sin_phi: Vec<f32>,
+    cos_phi: Vec<f32>,
+    /// What the four angle tables above are currently built for, so the rebuild
+    /// is skipped unless the resolution moved.
+    theta_steps: usize,
+    phi_steps: usize,
+}
+
+impl Scratch {
+    /// The sampling angles, for whichever resolution this frame resolved to.
+    ///
+    /// These used to be four shared tables built once, at a fixed step of 0.02
+    /// radians, and indexed absolutely. That step is only correct when the
+    /// table is indexed by 314 entries, and `theta_steps` follows the terminal:
+    /// `min_dimension * 314 / 50`, clamped to at most 314. So on any terminal
+    /// shorter than 50 rows the index range is a strict *prefix* of the table
+    /// and the torus is swept through `(theta_steps - 1) * 0.02` radians rather
+    /// than a whole turn -- 79.6% at 40 rows, 47.4% at 24, 23.6% at the 12 rows
+    /// the tests use, 15% at the 6-row minimum. The missing wedge is fixed in
+    /// object space, so it is a permanent lump of torus that is never drawn and
+    /// tumbles with it, and at 6x6 it leaves the screen blank.
+    ///
+    /// The invariant is `theta_i = i * 2pi / theta_steps`, which a table shared
+    /// across resolutions cannot express, so the tables live here and are
+    /// rebuilt when the step count changes. That is 1884 sin/cos pairs on a
+    /// resize, not on a frame, so the cost that made these a `LazyLock` in the
+    /// first place -- evaluating them in the inner loop -- is still gone.
+    fn ensure_angles(&mut self, theta_steps: usize, phi_steps: usize) {
+        if self.theta_steps == theta_steps && self.phi_steps == phi_steps {
+            return;
+        }
+        let theta =
+            |i: usize| i as f32 * std::f32::consts::TAU / theta_steps as f32;
+        let phi = |i: usize| i as f32 * std::f32::consts::TAU / phi_steps as f32;
+        self.sin_theta = (0..theta_steps).map(|i| theta(i).sin()).collect();
+        self.cos_theta = (0..theta_steps).map(|i| theta(i).cos()).collect();
+        self.sin_phi = (0..phi_steps).map(|i| phi(i).sin()).collect();
+        self.cos_phi = (0..phi_steps).map(|i| phi(i).cos()).collect();
+        self.theta_steps = theta_steps;
+        self.phi_steps = phi_steps;
+    }
 }
 
 pub struct Donut {
@@ -217,7 +254,6 @@ pub struct Donut {
     canvas: Canvas,
     rotation_a: f32,
     rotation_b: f32,
-    colors: &'static [style::Color; 12],
     scratch: Scratch,
 }
 
@@ -271,7 +307,6 @@ impl Donut {
             canvas,
             rotation_a: 0.0,
             rotation_b: 0.0,
-            colors: &COLORS,
             scratch: Scratch::default(),
         }
     }
@@ -309,7 +344,7 @@ impl Donut {
         let inner_radius = self.options.inner_radius;
         let distance = self.options.distance;
         let k1 = self.options.k1;
-        let colors = self.colors;
+        let colors = &*COLORS;
         let half_width = width as f32 / 2.0;
         let half_height = height as f32 / 2.0;
         let ramp = shade_ramp(&self.options.luminance_chars);
@@ -318,11 +353,6 @@ impl Donut {
         // top rather than wrapped: a `min` in the inner loop rather than a
         // modulo by a length the compiler cannot see.
 
-        let scratch = &mut self.scratch;
-        let zbuffer = &mut scratch.zbuffer;
-        let output = &mut scratch.output;
-        let shade = &mut scratch.shade;
-
         // Resolution follows the terminal, so a small window does not pay for a
         // large one. `min_dimension * 314 / 50` reproduces the previous fixed 314
         // samples at the reference size of 50 rows.
@@ -330,10 +360,22 @@ impl Donut {
         let theta_steps =
             ((min_dimension * THETA_SAMPLES) / 50).clamp(48, THETA_SAMPLES);
         let phi_steps = (theta_steps * 2).min(PHI_SAMPLES);
+        self.scratch.ensure_angles(theta_steps, phi_steps);
+
+        let Scratch {
+            zbuffer,
+            output,
+            shade,
+            sin_theta,
+            cos_theta,
+            sin_phi,
+            cos_phi,
+            ..
+        } = &mut self.scratch;
 
         for theta_index in 0..theta_steps {
-            let sin_theta = SIN_THETA[theta_index];
-            let cos_theta = COS_THETA[theta_index];
+            let sin_theta = sin_theta[theta_index];
+            let cos_theta = cos_theta[theta_index];
 
             // Invariant with respect to phi, but the old code recomputed it
             // once per phi sample rather than once per theta sample.
@@ -350,8 +392,8 @@ impl Donut {
             let x_circle_term = circle_y * cos_a * sin_b;
 
             for phi_index in 0..phi_steps {
-                let sin_phi = SIN_PHI[phi_index];
-                let cos_phi = COS_PHI[phi_index];
+                let sin_phi = sin_phi[phi_index];
+                let cos_phi = cos_phi[phi_index];
 
                 let x = circle_x * (cos_b * cos_phi + sin_a * sin_b * sin_phi)
                     - x_circle_term;
@@ -369,7 +411,7 @@ impl Donut {
                     continue;
                 }
 
-                let luminance_index = shade_index(l);
+                let luminance_index = shade_index_for(l);
 
                 let x_proj = (half_width + k1 * z_inv * x) as usize;
                 let y_proj = (half_height + k1 * z_inv * y * 0.8) as usize;
@@ -399,10 +441,18 @@ impl Donut {
                     continue;
                 }
                 let color = colors[shade[idx] as usize % colors.len()];
+                // Not bold. Bold is a *brightening hint* on most terminals, so
+                // asking for it on every cell added a second, unaccounted-for
+                // term to the brightness this ramp is trying to encode -- and
+                // it added it most to the cells that needed it least, since the
+                // top of the ramp is already 0.86 to 0.94 in luminance and
+                // brightening those is what compresses them together. It also
+                // widened every glyph, which shears a grid that is indexed by
+                // cell. The glyph's own ink already carries the value.
                 self.canvas.set(
                     x,
                     y,
-                    Cell::new(symbol, color, style::Attribute::Bold),
+                    Cell::new(symbol, color, style::Attribute::NormalIntensity),
                 );
             }
         }
@@ -608,34 +658,288 @@ mod tests {
         }
     }
 
-    #[test]
-    fn zz_probe_histogram() {
-        use std::collections::BTreeMap;
-        for size in [(40u16, 12u16), (40, 20), (80, 40)] {
-            let mut donut = Donut::new(DonutOptions::default(), size);
-            let mut histogram: BTreeMap<char, usize> = BTreeMap::new();
-            let mut total = 0usize;
-            for step in 0..12u64 {
-                donut.update_with_context(&crate::runtime::FrameContext::new(
-                    size,
-                    step,
-                    Duration::ZERO,
-                    Duration::from_secs_f64(1.0 / 30.0),
-                    crate::runtime::InputState::default(),
-                ));
-                for (_, _, cell) in donut.get_diff() {
-                    *histogram.entry(cell.symbol).or_default() += 1;
-                    total += 1;
+    /// The fraction of screen directions around the centre that the drawn
+    /// torus reaches, as a count of `BINS` equal slices.
+    fn polar_coverage(size: (u16, u16), diff: &[(usize, usize, Cell)]) -> f64 {
+        const BINS: usize = 16;
+        let mut hit = [false; BINS];
+        for (x, y, _) in diff {
+            let dx = *x as f64 + 0.5 - f64::from(size.0) / 2.0;
+            let dy = *y as f64 + 0.5 - f64::from(size.1) / 2.0;
+            let angle = dy.atan2(dx).rem_euclid(std::f64::consts::TAU);
+            let bin = (angle / (std::f64::consts::TAU / BINS as f64)) as usize;
+            hit[bin.min(BINS - 1)] = true;
+        }
+        hit.iter().filter(|reached| **reached).count() as f64 / BINS as f64
+    }
+
+    /// How much of the screen each shade of the ramp covers, over several
+    /// frames of a tumbling torus.
+    ///
+    /// Twelve frames rather than one because a single frame can miss a shade
+    /// that the next one reaches, and the question is whether the ramp is
+    /// reachable at all rather than whether one instant happens to use it.
+    fn shade_histogram(size: (u16, u16), resize: bool) -> [f64; SHADES] {
+        let ramp = shade_ramp(&DonutOptions::default().luminance_chars);
+        let mut counts = [0usize; SHADES];
+        let mut donut = Donut::new(DonutOptions::default(), size);
+        if resize {
+            // What the run loop does immediately after building, so the
+            // measurement is the projection scale a real run actually uses.
+            donut.update_size(size.0, size.1);
+        }
+        for step in 0..12u64 {
+            donut.update_with_context(&crate::runtime::FrameContext::new(
+                size,
+                step,
+                Duration::ZERO,
+                Duration::from_secs_f64(1.0 / 30.0),
+                crate::runtime::InputState::default(),
+            ));
+            for (_, _, cell) in donut.get_diff() {
+                if let Some(index) =
+                    ramp.glyphs().iter().position(|g| *g == cell.symbol)
+                {
+                    counts[index] += 1;
                 }
             }
-            let ramp: String = DEFAULT_LUMINANCE_CHARS
-                .iter()
-                .map(|g| {
-                    let n = histogram.get(g).copied().unwrap_or(0);
-                    format!("{}:{:.1}% ", g, 100.0 * n as f32 / total as f32)
-                })
-                .collect();
-            println!("PROBE {size:?} k1={} cells={total} {ramp}", donut.options.k1);
+        }
+        let total: usize = counts.iter().sum();
+        std::array::from_fn(|index| counts[index] as f64 / total as f64)
+    }
+
+    /// The torus has to be swept through a whole turn at every size.
+    ///
+    /// The angle tables were built once at a step of 0.02 radians, which is
+    /// only correct when they are indexed by 314 entries, while `theta_steps`
+    /// is a function of the terminal: `min_dimension * 314 / 50`. On anything
+    /// shorter than 50 rows the index range is therefore a strict *prefix* of
+    /// the table, and the sampled sweep is `(theta_steps - 1) * 0.02` radians
+    /// rather than a whole turn -- 79.6% at 40 rows, 47.4% at 24, 23.6% at the
+    /// 12 rows the other tests here use, 15% at the 6-row minimum.
+    ///
+    /// The missing wedge is fixed in object space, so it is a permanent lump of
+    /// torus that is never drawn and tumbles with it. At 40x12 it left 11 lit
+    /// cells and at 6x6 it left the screen blank. Any judgement about the
+    /// colour ramp made against that shape is a judgement about a torus with
+    /// most of itself missing.
+    #[test]
+    fn the_torus_is_swept_all_the_way_round() {
+        for size in [(6u16, 6u16), (12, 12), (40, 12), (40, 20), (80, 50)] {
+            let mut donut = Donut::new(DonutOptions::default(), size);
+            donut.update_size(size.0, size.1);
+            donut.get_diff();
+
+            let steps = donut.scratch.theta_steps;
+            assert!(steps > 0, "at {size:?} no angles were sampled at all");
+
+            // The invariant, `theta_i = i * 2pi / theta_steps`, checked against
+            // the table the renderer will actually index rather than against a
+            // helper that restates it. Both ends and the middle, because a table
+            // that is right at the ends and wrong between them is a table built
+            // for a different step count.
+            for index in [0, 1, steps / 3, steps / 2, steps - 1] {
+                let expected = index as f32 * std::f32::consts::TAU / steps as f32;
+                assert!(
+                    (donut.scratch.sin_theta[index] - expected.sin()).abs() < 1e-6
+                        && (donut.scratch.cos_theta[index] - expected.cos()).abs()
+                            < 1e-6,
+                    "at {size:?} sample {index} of {steps} is not 2pi*{index}/{steps}"
+                );
+            }
+
+            // A whole turn less the gap after the last sample.
+            let covered = (steps as f64 - 1.0) * std::f64::consts::TAU
+                / steps as f64
+                / std::f64::consts::TAU;
+            assert!(
+                covered >= 0.95,
+                "at {size:?} the {steps} sampled cross-section angles cover \
+                 {covered:.1}% of a turn, so the rest of the torus is never \
+                 drawn"
+            );
+        }
+    }
+
+    /// The same invariant, seen from outside: the drawn torus has to reach
+    /// every direction from the centre of the screen, rather than a wedge of
+    /// directions being empty because the samples that would land there were
+    /// never taken.
+    ///
+    /// Measured after a moment's rotation rather than at rest. At rest the
+    /// torus is exactly edge-on, and on a 12-row screen the edge-on projection
+    /// is a ring six rows tall -- which leaves a handful of directions
+    /// unsampled for want of anywhere to put a cell, independently of how much
+    /// of the torus was sampled. A general pose is both fairer and closer to
+    /// what anyone watching sees.
+    #[test]
+    fn the_drawn_torus_reaches_every_direction() {
+        for size in [(40u16, 12u16), (40, 20), (80, 50)] {
+            let mut donut = Donut::new(DonutOptions::default(), size);
+            donut.update_size(size.0, size.1);
+            donut.advance(0.7);
+            let diff = donut.get_diff();
+            assert!(!diff.is_empty(), "at {size:?} nothing was drawn at all");
+
+            let coverage = polar_coverage(size, &diff);
+            assert!(
+                coverage >= 0.95,
+                "at {size:?} the {} drawn cells reach only {:.1}% of the \
+                 directions around the centre, so a wedge of the screen is \
+                 never lit",
+                diff.len(),
+                coverage * 100.0
+            );
+        }
+    }
+
+    /// Every shade of a twelve-entry ramp has to reach the screen.
+    ///
+    /// The bright end is what a viewer notices, and it is the end the geometry
+    /// decides: the brightness term is the z component of the surface normal,
+    /// so only the few samples facing the camera ever get near the top of it.
+    /// At 40x12 that was not a subtle imbalance -- `#`, `$` and `@` were never
+    /// drawn at all, so the highlights were missing from the screen entirely
+    /// and the torus had no specular anywhere.
+    #[test]
+    fn every_shade_of_the_ramp_reaches_the_screen() {
+        for size in [(40u16, 12u16), (40, 20), (80, 50)] {
+            for resize in [true, false] {
+                let histogram = shade_histogram(size, resize);
+                let unused: Vec<usize> = histogram
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, share)| **share == 0.0)
+                    .map(|(shade, _)| shade)
+                    .collect();
+                assert!(
+                    unused.is_empty(),
+                    "at {size:?} (resized: {resize}) shades {unused:?} of the \
+                     twelve were never drawn; the ramp has {SHADES} colours and \
+                     {SHADES} glyphs, and an unreachable colour is an \
+                     unreachable glyph"
+                );
+            }
+        }
+    }
+
+    /// The ramp should be spread across the torus, not bunched at one end.
+    ///
+    /// An even spread would be `1 / SHADES`, so the bounds here are 2.4x that
+    /// at the top and 0.36x at the bottom. Measured with the shape fixed and the
+    /// term un-shaped, the shades ran from 2.1% of the surface at the dark end
+    /// to 15.8% at the bright one, a 7.5-fold spread at 40x20; the curve in
+    /// [`shape_light`] brings the same measurement to 5.2% and 9.9%, a 1.9-fold
+    /// spread, and holds every size measured to within 2.4x.
+    ///
+    /// Only the resized case, because that is the projection a run actually
+    /// uses. `Donut::new` leaves `k1` at the option default of 25, which on a
+    /// 12-row screen crops the ring to a patch of the tube's near side: the
+    /// visible surface is then a bright patch rather than the torus, and how
+    /// its area is spread across the ramp says nothing about the exponent.
+    #[test]
+    fn the_ramp_is_spread_across_the_drawn_surface() {
+        for size in [(40u16, 12u16), (40, 20), (80, 50)] {
+            let histogram = shade_histogram(size, true);
+            let darkest = histogram.iter().cloned().fold(f64::MAX, f64::min);
+            let brightest = histogram.iter().cloned().fold(0.0f64, f64::max);
+            let even = 1.0 / SHADES as f64;
+            assert!(
+                darkest >= even * 0.36 && brightest <= even * 2.4,
+                "at {size:?} the shades run from {darkest:.1}% to \
+                 {brightest:.1}% of the surface, and an even ramp would be \
+                 {even:.1}%; measured: {histogram:?}"
+            );
+        }
+    }
+
+    /// The shaping has to be the exponent it says it is.
+    ///
+    /// It is written in closed form rather than as `powf`, because `powf` is a
+    /// logarithm and an exponential and this runs on the order of a hundred
+    /// thousand samples a frame, so the exponent and the code are two things
+    /// that can disagree. The exponent is written out here rather than shared
+    /// as a constant, so that this test is the oracle: change `shape_light`
+    /// without changing this and the test says so.
+    #[test]
+    fn the_light_curve_is_the_exponent_it_claims_to_be() {
+        const EXPONENT: f32 = 1.5;
+        for step in 0..=20 {
+            let x = step as f32 / 20.0;
+            let expected = x.powf(EXPONENT);
+            assert!(
+                (shape_light(x) - expected).abs() < 1e-6,
+                "shape_light({x:.2}) is {} and {x:.2}^{EXPONENT} is {expected:.6}",
+                shape_light(x)
+            );
+        }
+    }
+
+    /// Shaping the brightness term must not disturb the ramp's own linearity.
+    ///
+    /// `shade_index` is the map the glyph ramp is defined against, and
+    /// `the_shade_ramp_spans_every_glyph` pins that it is proportional. The
+    /// curve lives in `shade_index_for` precisely so that it stays so, and this
+    /// is the assertion that the two are wired together in the right order
+    /// rather than composed twice.
+    #[test]
+    fn the_shaped_index_still_reaches_both_ends_of_the_ramp() {
+        assert_eq!(shade_index_for(0.0), 0);
+        assert_eq!(shade_index_for(BRIGHTEST), SHADES - 1);
+        // Monotone, which is the whole reason a ramp can be indexed.
+        let mut previous = 0;
+        for step in 0..=200 {
+            let brightness = BRIGHTEST * step as f32 / 200.0;
+            let index = shade_index_for(brightness);
+            assert!(index >= previous, "the shaped index went backwards");
+            previous = index;
+        }
+    }
+
+    /// Bold is a brightening hint, so nothing here should ask for it.
+    ///
+    /// Every cell used to be `Attribute::Bold`, on a ramp whose top three
+    /// entries are already 0.86 to 0.94 in luminance. On a terminal that honours
+    /// the hint that is a second brightness term added on top of the one the
+    /// ramp encodes, applied most strongly to the cells that are already
+    /// brightest -- which is what compresses the top of a ramp into one
+    /// indistinguishable band. It also widens every glyph, and a widened glyph
+    /// shears a grid indexed by cell.
+    #[test]
+    fn no_cell_is_drawn_bold() {
+        for size in [(40u16, 20u16), (80, 40)] {
+            let mut donut = Donut::new(DonutOptions::default(), size);
+            donut.update_size(size.0, size.1);
+            let diff = donut.get_diff();
+            assert!(!diff.is_empty(), "at {size:?} nothing was drawn");
+            for (x, y, cell) in &diff {
+                assert!(
+                    cell.attr != style::Attribute::Bold,
+                    "the cell at {x},{y} is drawn bold"
+                );
+            }
+        }
+    }
+
+    /// No two adjacent entries may be a step the eye cannot see.
+    ///
+    /// Twelve entries over a luma span of 0.82 is 0.075 per step if the ramp is
+    /// even, so 0.03 -- two fifths of an even step -- is the point below which a
+    /// step is not doing any work. The ramp this replaced had two adjacent
+    /// pairs within 0.011 of each other, a quarter of the ramp spent on
+    /// invisible steps, and that is precisely where its hue flipped from taupe
+    /// to sage to gold. The twelve here step by at least 0.040.
+    #[test]
+    fn no_two_adjacent_ramp_entries_are_indistinguishable() {
+        let colors = &*COLORS;
+        for (index, pair) in colors.windows(2).enumerate() {
+            let gap = brightness(&pair[1]) - brightness(&pair[0]);
+            assert!(
+                gap >= 0.03,
+                "COLORS[{index}] and COLORS[{}] are only {gap:.3} apart in \
+                 luminance, so one of them is never visible",
+                index + 1
+            );
         }
     }
 
