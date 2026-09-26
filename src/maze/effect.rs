@@ -87,8 +87,22 @@ const WALLS_MOTTLED_PER_FRAME: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PathColor {
-    /// The default. No green in it, and a red above any the walls can have.
+    /// The default, and what this effect used to be before a contrast fix
+    /// overrode it.
+    ///
+    /// **It is invisible on a light terminal profile.** A white corridor on a
+    /// white background is the failure this palette was introduced to prevent, and
+    /// the reason it stopped being the default. It is the default again because
+    /// that is what was asked for, and because the walls are green-dominant and
+    /// dim, against which white reads better than any of the alternatives on a
+    /// dark profile -- which is the overwhelmingly common case.
+    ///
+    /// The caveat is on the option rather than hidden, and
+    /// `every_path_colour_reads_on_a_light_and_on_a_dark_profile` exempts it with
+    /// the reason recorded, so the exemption cannot quietly become an oversight.
     #[default]
+    White,
+    /// No green in it, and a red above any the walls can have.
     Magenta,
     /// Deeper and redder. Sits closer to the middle of the contrast band, so it is
     /// the most balanced of these on a light profile.
@@ -108,6 +122,7 @@ pub enum PathColor {
 impl PathColor {
     /// Every variant, so a test can check all of them.
     pub const ALL: &'static [PathColor] = &[
+        PathColor::White,
         PathColor::Magenta,
         PathColor::Rose,
         PathColor::Pink,
@@ -124,6 +139,11 @@ impl PathColor {
     /// drawn with red and blue both capped below 120.
     pub const fn color(self) -> style::Color {
         match self {
+            PathColor::White => style::Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
             PathColor::Magenta => style::Color::Rgb {
                 r: 220,
                 g: 0,
@@ -766,17 +786,26 @@ mod tests {
 
     /// Every path colour has to read on both a light and a dark profile.
     ///
-    /// The reason this is a named choice rather than "whatever looked nice": a
-    /// terminal profile is whichever of white or black the user happens to run,
-    /// and a path that vanishes on one of them is a bug rather than a preference.
-    /// This is what rules white out, and it is what constrains every variant to
-    /// relative luminance 0.10 to 0.30.
+    /// The reason the alternatives are a named choice rather than "whatever looked
+    /// nice": a terminal profile is whichever of white or black the user happens to
+    /// run, and a path that vanishes on one of them is a bug rather than a
+    /// preference. This is what constrains every non-white variant to relative
+    /// luminance 0.10 to 0.30.
     ///
-    /// Checked for *every* variant, so adding one that fails is caught here
-    /// rather than by a user on a light background.
+    /// Checked for *every* non-white variant, so adding one that fails is caught
+    /// here rather than by a user on a light background.
     #[test]
     fn every_path_colour_reads_on_a_light_and_on_a_dark_profile() {
         for choice in PathColor::ALL {
+            // White is exempt, and not because it passes. WCAG contrast is defined
+            // between two colours: white clears 21:1 against black and is *exactly*
+            // the colour of a light background, so the measurement reports 21:1
+            // and the screen reports nothing at all. It is exempt deliberately, it
+            // is the default, and the reason is recorded on the variant where a
+            // user choosing it will see it.
+            if *choice == PathColor::White {
+                continue;
+            }
             let style::Color::Rgb { r, g, b } = choice.color() else {
                 unreachable!("PathColor::color is defined as an Rgb");
             };
@@ -798,23 +827,27 @@ mod tests {
         }
     }
 
-    /// No variant may be white or near-white, however good its contrast maths.
+    /// Every non-white variant has to be dark enough to read on white, and no
+    /// variant may be a *near*-white.
     ///
-    /// `Color::White` clears 21:1 on black and is *identical* to a white
-    /// background, which is the original bug this palette exists to avoid. The
-    /// contrast test cannot catch it: WCAG contrast is defined between two
-    /// colours, and white-on-white is not a low-contrast pair, it is an invisible
-    /// one.
+    /// This replaced a test that asserted no variant could be white at all, on the
+    /// grounds that a white corridor is invisible on a light profile. That is
+    /// true, and it is why white was not the default for a while -- but white is
+    /// the default again now, so the assertion was reversed rather than kept.
+    ///
+    /// What survives is the part that still matters: nothing may be *near* white.
+    /// `rgb(240, 240, 240)` is not white, passes every contrast test, and is just as
+    /// invisible on a light background, so the near-white case is the one worth
+    /// guarding and the pure-white case is a choice.
     #[test]
-    fn no_path_colour_is_white_or_near_white() {
+    fn no_path_colour_is_near_white() {
         for choice in PathColor::ALL {
             let style::Color::Rgb { r, g, b } = choice.color() else {
                 unreachable!("PathColor::color is defined as an Rgb");
             };
-            assert!(
-                !(r == 255 && g == 255 && b == 255),
-                "{choice:?} is pure white, which is the bug this palette replaced"
-            );
+            if *choice == PathColor::White {
+                continue;
+            }
             let luminance =
                 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
             assert!(
@@ -823,6 +856,22 @@ mod tests {
                  wash out on a light profile"
             );
         }
+    }
+
+    /// White is the default, and it is the default knowingly.
+    ///
+    /// Pinned because it is the one thing here that a user is likely to have an
+    /// opinion about, and because the caveat attached to it lives in a doc comment
+    /// that nothing checks.
+    #[test]
+    fn the_path_is_white_by_default() {
+        assert_eq!(
+            MazeOptions::default().path_color,
+            PathColor::White,
+            "the default path colour changed; if that was deliberate, this test \
+             and the caveat on PathColor::White both need updating"
+        );
+        assert_eq!(PathColor::default(), PathColor::White);
     }
 
     /// The configured choice has to reach the screen, and survive the config

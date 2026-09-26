@@ -23,9 +23,14 @@ use crossterm::style::Attribute;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
-/// Zoom factor per second. Small enough that the approach reads as motion
-/// rather than a cut.
-const DEFAULT_ZOOM_RATE: f32 = 0.35;
+/// Zoom factor per second, in e-folds.
+///
+/// This is the "how endless does it feel" control. The camera crosses its whole
+/// depth range -- about 6.1 e-folds -- in 6.1 / rate seconds, so 0.35 put a whole
+/// tour at 17 seconds, which reads as a loop rather than as travel. At 0.15 a
+/// coastline gets about 40 seconds, and combined with a slow move between
+/// them the effect stops feeling like it is restarting.
+const DEFAULT_ZOOM_RATE: f32 = 0.15;
 
 /// The view the camera sits at after construction and restarts at after a
 /// recentre. The iteration budget is measured against this, so it is the
@@ -141,6 +146,16 @@ pub struct MandelbrotOptions {
     /// about 16 the banding starts reading as contour lines, which is a legitimate
     /// look and not the one this effect defaults to.
     pub color_bands: u16,
+    /// Seconds the camera takes to move from a deep coastline to the next one.
+    ///
+    /// This used to not exist: reaching the depth limit teleported the camera to
+    /// an unrelated point and reset the scale in a single frame, so the picture
+    /// went from a deep zoom somewhere to a wide shot somewhere else entirely.
+    /// The move is now continuous, and this is how long it takes.
+    ///
+    /// Zero restores the old hard cut, which is a legitimate thing to want on a
+    /// terminal where a smooth move reads as drift.
+    pub transition_seconds: f32,
     /// Which ramp to colour the escape bands with.
     ///
     /// A name rather than a list of colours, because an inline list in TOML is
@@ -168,6 +183,7 @@ impl Default for MandelbrotOptions {
             max_iterations: 96,
             zoom_rate: DEFAULT_ZOOM_RATE,
             color_speed: 0.05,
+            transition_seconds: 1.5,
             color_bands: 32,
             palette: String::from("depth"),
             seed: DEFAULT_SEED,
@@ -182,8 +198,79 @@ pub struct Mandelbrot {
     field: HalfBlockField,
     center: (f64, f64),
     scale: f64,
+    /// In flight, or `None` while the camera is zooming.
+    ///
+    /// This is what replaced a hard cut. `recentre` used to assign a fresh
+    /// centre and reset `scale` to the widest view in the tour in the same frame,
+    /// so the picture went from a deep zoom somewhere to a wide shot somewhere
+    /// entirely unrelated, instantly: a 450x zoom-out and a teleport at once.
+    transition: Option<Transition>,
     time: f32,
     rng: crate::common::EffectRng,
+}
+
+/// A camera move from a deep coastline to the next one.
+///
+/// Two phases, and the split matters. The centre is interpolated linearly while
+/// the scale is held at the deep value, and only then does the scale interpolate
+/// back out -- logarithmically, because the whole trip is 6.1 e-folds and a
+/// linear ramp through that spends most of its time in the last decade, which
+/// looks like a sudden zoom.
+///
+/// Interpolating both at once would be simpler and much worse: the straight line
+/// between two points on the boundary routinely crosses open exterior, and open
+/// exterior renders as a flat wash. Panning first keeps the camera on the
+/// coastline for the whole of the first phase.
+struct Transition {
+    from_center: (f64, f64),
+    to_center: (f64, f64),
+    from_scale: f64,
+    to_scale: f64,
+    elapsed: f64,
+    duration: f64,
+    /// Fraction of the duration spent panning before the pull-back starts.
+    pan_fraction: f64,
+}
+
+impl Transition {
+    /// Where the camera is at `elapsed` seconds in, as `(centre, scale)`.
+    fn at(&self, elapsed: f64) -> ((f64, f64), f64) {
+        let p = if self.duration <= 0.0 {
+            1.0
+        } else {
+            (elapsed / self.duration).clamp(0.0, 1.0)
+        };
+
+        if p < self.pan_fraction {
+            // Hold the deep scale and slide along the coastline.
+            let t = p / self.pan_fraction;
+            let centre = (
+                lerp(self.from_center.0, self.to_center.0, t),
+                lerp(self.from_center.1, self.to_center.1, t),
+            );
+            (centre, self.from_scale)
+        } else {
+            // Pull back. `exp(ln(x))` is not `x` in f64 -- it lands about one part
+            // in 10^16 away -- so the end of the move assigns the target outright
+            // rather than interpolating onto it. Two tests compare the resting
+            // scale against `STARTING_SCALE` exactly, and they are right to.
+            let q = (p - self.pan_fraction) / (1.0 - self.pan_fraction);
+            let scale = if q >= 1.0 {
+                self.to_scale
+            } else {
+                lerp(self.from_scale.ln(), self.to_scale.ln(), q).exp()
+            };
+            (self.to_center, scale)
+        }
+    }
+
+    fn done(&self, elapsed: f64) -> bool {
+        self.duration <= 0.0 || elapsed >= self.duration
+    }
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    a + (b - a) * t
 }
 
 impl TerminalEffect for Mandelbrot {
@@ -298,6 +385,7 @@ impl Mandelbrot {
             ),
             center: (0.0, 0.0),
             scale: STARTING_SCALE,
+            transition: None,
             time: 0.0,
             rng: seeded_rng(options.seed, "mandelbrot"),
             options,
@@ -305,10 +393,11 @@ impl Mandelbrot {
         effect.canvas.clear();
 
         // Seeded from the outset, so the very first frame is on the coastline
-        // rather than a centred disc of empty interior. `recentre` leaves the
-        // scale at the restart view, which is where the first frame wants to
-        // be anyway.
-        effect.recentre();
+        // rather than a centred disc of empty interior. The sampler returns the
+        // point rather than assigning it, so the first frame is placed directly
+        // and the scale is left at the restart view -- which is where the first
+        // frame wants to be anyway, and where a transition will put it back to.
+        effect.center = effect.sample_boundary_point(None);
 
         effect
     }
@@ -387,10 +476,54 @@ impl Mandelbrot {
         self.time += dt as f32;
         // `exp`, not `powf`: the zoom factor is e^(-rate * dt), and
         // 1.0f64.powf(anything) is exactly 1.0, so the camera never moved.
+        // A transition owns the camera while it runs. The depth check is skipped
+        // because the scale is being driven, not accumulated, and the pull-back
+        // takes the camera *out* past the limit anyway.
+        if let Some(transition) = self.transition.as_mut() {
+            transition.elapsed += dt;
+            let ((re, im), scale) = transition.at(transition.elapsed);
+            self.center = (re, im);
+            self.scale = scale;
+            if transition.done(transition.elapsed) {
+                self.transition = None;
+            }
+            return;
+        }
+
         self.scale *= (-self.options.zoom_rate as f64 * dt).exp();
         if self.scale < self.depth_limit() {
-            self.recentre();
+            self.begin_transition();
         }
+    }
+
+    /// Starts a move to a nearby coastline and back out to the restart view.
+    ///
+    /// The new centre is sampled from a small disc *around the current one*
+    /// rather than from the whole set, which is the difference between panning
+    /// along a coastline and teleporting. Falls back to the old global search if
+    /// the neighbourhood has nothing in the set, which happens when the camera
+    /// has reached a point whose surroundings are all exterior.
+    fn begin_transition(&mut self) {
+        let aspect = self.field.row_width() as f64 / self.field.row_height() as f64;
+        // A couple of view widths, so the new view overlaps the old one and the
+        // pan has something to show.
+        let radius = self.scale * aspect.max(1.0) * 2.5;
+        let nearby = self.sample_boundary_point(Some((self.center, radius)));
+
+        self.transition = Some(Transition {
+            from_center: self.center,
+            to_center: nearby,
+            from_scale: self.scale,
+            to_scale: STARTING_SCALE,
+            elapsed: 0.0,
+            duration: f64::from(self.options.transition_seconds),
+            pan_fraction: 0.45,
+        });
+
+        // Re-seed so the next tour is a different walk. Done here rather than at
+        // the end of the move, so the draw during the transition is already
+        // deterministic per cycle.
+        self.rng = seeded_rng(self.rng.random::<u64>(), "mandelbrot");
     }
 
     /// Jumps to a fresh point on the boundary and pulls back to the restart
@@ -418,7 +551,10 @@ impl Mandelbrot {
     /// contour the renderer draws -- where `escaped` flips -- rather than on
     /// the boundary of the true set, which needs far more iterations to find and
     /// would then be a contour the renderer disagrees with.
-    fn recentre(&mut self) {
+    fn sample_boundary_point(
+        &mut self,
+        near: Option<((f64, f64), f64)>,
+    ) -> (f64, f64) {
         // A generous budget here regardless of zoom: the whole point of this
         // function is to decide whether a point is in the set at all, and a
         // shallow budget would call a slow-escaping boundary point interior.
@@ -426,14 +562,45 @@ impl Mandelbrot {
         // of zero nothing escapes, so the first sample would be accepted and
         // the walk would never leave the set.
         let probe = self.iteration_budget();
+
+        // How far the walk out from a sample may go, bounded by the neighbourhood
+        // radius when there is one.
+        //
+        // This was `EDGE_SEARCH_LIMIT` unconditionally -- 8.0 in absolute complex
+        // units -- which is fine when sampling the whole set and catastrophic when
+        // sampling near the camera. At the depth limit the view is about 1e-3 wide,
+        // so a target 8.0 away is eight *thousand* screen widths, and interpolating
+        // towards it is a whip pan rather than a move. `the_camera_never_jumps`
+        // measured 9.5 view widths in a single frame, which is exactly that.
+        let walk_limit = match near {
+            Some((_, radius)) => radius.min(EDGE_SEARCH_LIMIT),
+            None => EDGE_SEARCH_LIMIT,
+        };
         let mut found = None;
         for _ in 0..SAMPLE_ATTEMPTS {
             // Rejection sampling in the disc of radius 2, which is where the set
             // lives; a square would waste most of its samples on empty corners.
+            // `near` restricts the search to a disc around the current centre, so
+            // the next view is somewhere the camera has just been looking. Falls
+            // back to the whole set of radius 2 on every failed attempt, because
+            // the neighbourhood is not guaranteed to contain any of the set.
             let (x, y) = loop {
-                let x = self.rng.random_range(-2.0f64..2.0);
-                let y = self.rng.random_range(-2.0f64..2.0);
-                if x * x + y * y <= 4.0 {
+                let (x, y) = match near {
+                    Some(((cx, cy), radius)) => (
+                        cx + self.rng.random_range(-radius..radius),
+                        cy + self.rng.random_range(-radius..radius),
+                    ),
+                    None => (
+                        self.rng.random_range(-2.0f64..2.0),
+                        self.rng.random_range(-2.0f64..2.0),
+                    ),
+                };
+                let in_disc = x * x + y * y <= 4.0;
+                let in_neighbourhood = near.is_none_or(|((cx, cy), radius)| {
+                    let (dx, dy) = (x - cx, y - cy);
+                    dx * dx + dy * dy <= radius * radius
+                });
+                if in_disc && in_neighbourhood {
                     break (x, y);
                 }
             };
@@ -462,7 +629,7 @@ impl Mandelbrot {
         let mut inside = 0.0f64;
         let mut outside = None;
         let mut step = EDGE_SEARCH_STEP;
-        while step <= EDGE_SEARCH_LIMIT {
+        while step <= walk_limit {
             if escaped(step) {
                 outside = Some(step);
                 break;
@@ -471,7 +638,7 @@ impl Mandelbrot {
             step *= 2.0;
         }
 
-        self.center = match outside {
+        match outside {
             None => (x0, y0),
             Some(outside) => {
                 let (mut lo, mut hi) = (inside, outside);
@@ -485,12 +652,7 @@ impl Mandelbrot {
                 }
                 (x0 + dx * 0.5 * (lo + hi), y0 + dy * 0.5 * (lo + hi))
             }
-        };
-
-        // Back to the restart view rather than the widest one, so the boundary
-        // is across the screen at the top of the next cycle.
-        self.scale = STARTING_SCALE;
-        self.rng = seeded_rng(self.rng.random::<u64>(), "mandelbrot");
+        }
     }
 }
 
@@ -845,6 +1007,139 @@ mod tests {
         }
     }
 
+    /// Drives the camera until any transition in flight has finished.
+    fn settle(effect: &mut Mandelbrot) {
+        for _ in 0..100_000 {
+            if effect.transition.is_none() {
+                return;
+            }
+            effect.advance(0.05);
+        }
+        panic!("a transition never finished");
+    }
+
+    /// The camera must never jump.
+    ///
+    /// This is the complaint: "it zooms in until a point, then cuts to a new
+    /// view". Reaching the depth limit used to assign a fresh centre and reset the
+    /// scale to the widest view in the tour in the same frame, so the picture went
+    /// from a deep zoom somewhere to a wide shot somewhere else entirely -- a
+    /// 450x zoom-out and a teleport at once, and it read as a glitch rather than
+    /// as travel.
+    ///
+    /// Measured as the largest single-frame move, as a fraction of the view
+    /// width. A cut to an unrelated point is a move of order 1 or more; a pan
+    /// along a coastline is a small fraction of a frame. The bound is loose on
+    /// purpose -- what it rules out is teleportation, not ordinary motion.
+    #[test]
+    fn the_camera_never_jumps() {
+        for seed in [3u64, 11, 42] {
+            let mut effect =
+                Mandelbrot::new(MandelbrotOptions::default(), (60, 30));
+            let mut previous = effect.center;
+            let mut worst: f64 = 0.0;
+
+            // Three full tours at a fine step, so the worst frame is very likely
+            // to be sampled.
+            for _ in 0..3 * 20_000 {
+                effect.advance(0.01);
+                let aspect = effect.field.row_width() as f64
+                    / effect.field.row_height() as f64;
+                let view_width = effect.scale * aspect.max(1.0);
+                let moved = ((effect.center.0 - previous.0).powi(2)
+                    + (effect.center.1 - previous.1).powi(2))
+                .sqrt();
+                if view_width > 0.0 {
+                    worst = worst.max(moved / view_width);
+                }
+                previous = effect.center;
+            }
+
+            assert!(
+                worst < 0.25,
+                "seed {seed}: the camera moved {worst:.2} of a view width in a \
+                 single frame, which is a cut rather than a move"
+            );
+        }
+    }
+
+    /// The scale must be continuous too, not just the centre.
+    ///
+    /// The other half of the same jump: even with a smooth centre, resetting the
+    /// scale in one frame is a 450x zoom-out between two consecutive frames.
+    #[test]
+    fn the_zoom_is_continuous_across_the_transition() {
+        let mut effect = Mandelbrot::new(MandelbrotOptions::default(), (60, 30));
+        let mut previous = effect.scale;
+        let mut worst = 0.0f64;
+
+        for _ in 0..2 * 20_000 {
+            effect.advance(0.01);
+            // Ratio rather than difference, because the scale spans five orders of
+            // magnitude over a tour and a ratio is the scale-invariant statement.
+            if previous > 0.0 {
+                worst = worst.max(
+                    (effect.scale / previous).abs().max(previous / effect.scale),
+                );
+            }
+            previous = effect.scale;
+        }
+
+        assert!(
+            worst < 1.15,
+            "the scale changed by a factor of {worst:.2} in one frame, so the \
+             pull-back is a jump rather than a move"
+        );
+    }
+
+    /// A tour has to come back to the restart view, so the next one starts wide.
+    #[test]
+    fn a_tour_returns_to_the_restart_view() {
+        let mut effect = Mandelbrot::new(MandelbrotOptions::default(), (60, 30));
+        for _ in 0..20_000 {
+            effect.advance(0.1);
+            if effect.transition.is_none() && effect.scale > STARTING_SCALE * 0.999
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            effect.scale, STARTING_SCALE,
+            "after a completed transition the scale should be back at the restart \
+             view, so the next tour starts wide"
+        );
+        assert!(
+            effect.transition.is_none(),
+            "a transition was left in flight"
+        );
+    }
+
+    /// A tour has to last long enough to be worth watching.
+    ///
+    /// The zoom rate is the "how endless does this feel" control. At the old
+    /// default of 0.35 e-folds per second the camera crossed its whole depth
+    /// range in about 17 seconds, which reads as a loop rather than as travel.
+    /// Slower, and each coastline gets half a minute.
+    #[test]
+    fn a_tour_lasts_long_enough_to_be_worth_watching() {
+        let options = MandelbrotOptions::default();
+        let mut effect = Mandelbrot::new(options, (60, 30));
+
+        let mut elapsed = 0.0f64;
+        for _ in 0..40_000 {
+            effect.advance(0.1);
+            elapsed += 0.1;
+            if effect.scale < effect.depth_limit() {
+                break;
+            }
+        }
+        assert!(
+            elapsed > 25.0,
+            "a tour took only {elapsed:.0}s to reach the depth limit, so this \
+             reads as a loop rather than as travel"
+        );
+    }
+
     /// Steps the camera until it recentres, returning the scale and centre at
     /// the deepest point before it did.
     ///
@@ -854,9 +1149,20 @@ mod tests {
         let mut deepest = (effect.scale, effect.center);
         for _ in 0..20_000 {
             let before = effect.scale;
+            let was_transitioning = effect.transition.is_some();
             effect.advance(0.1);
-            if effect.scale < deepest.0 {
+            if !was_transitioning
+                && effect.transition.is_none()
+                && effect.scale < deepest.0
+            {
                 deepest = (effect.scale, effect.center);
+            }
+            // A transition *raises* the scale as it pulls back, so "the scale went
+            // up" no longer means "the tour ended" -- it means the tour is being
+            // wound up. Waiting for the transition to clear is the correct signal.
+            if effect.transition.is_some() {
+                settle(effect);
+                return deepest;
             }
             if effect.scale > before {
                 return deepest;
@@ -980,20 +1286,36 @@ mod tests {
     }
 
     #[test]
-    fn going_past_the_depth_limit_picks_a_new_centre() {
+    fn going_past_the_depth_limit_starts_a_move_rather_than_a_cut() {
         let mut effect = Mandelbrot::new(MandelbrotOptions::default(), (40, 12));
         let limit = effect.depth_limit();
+        let before = effect.center;
         effect.scale = limit * 0.5;
         effect.advance(1.0 / 60.0);
 
+        // The camera has not teleported. It is mid-move: still at the deep scale,
+        // partway along a pan towards a new coastline.
+        assert!(
+            effect.transition.is_some(),
+            "reaching the depth limit should start a move, not assign a new centre"
+        );
+        let moved = ((effect.center.0 - before.0).powi(2)
+            + (effect.center.1 - before.1).powi(2))
+        .sqrt();
+        let view = effect.scale * 2.0;
+        assert!(
+            moved < view * 0.25,
+            "the first frame of the move shifted the centre by {moved:.2e}, which \
+             is a quarter of the view width and reads as a cut"
+        );
+
+        // And the move ends at the restart view, so the next tour starts wide.
+        settle(&mut effect);
         assert_eq!(
             effect.scale, STARTING_SCALE,
-            "the camera did not pull back out to the restart view"
+            "the move did not pull back out to the restart view"
         );
-        assert!(
-            effect.scale > limit,
-            "and it is still below the depth limit"
-        );
+        assert!(effect.scale > limit);
     }
 
     #[test]
@@ -1145,7 +1467,12 @@ mod tests {
                 ..Default::default()
             };
             let mut effect = Mandelbrot::new(options, (40, 16));
-            effect.recentre();
+            // Drive it out to the depth limit and let the move finish, rather than
+            // asking for a new point directly: the constructor already placed the
+            // camera on a coastline, and this is about what the *next* one looks
+            // like.
+            zoom_to_the_depth_limit(&mut effect);
+            settle(&mut effect);
             assert_eq!(effect.scale, STARTING_SCALE);
 
             let (interior, exterior) =
