@@ -1,5 +1,4 @@
 use crate::{
-    ascii::AsciiFieldOptions,
     blank::BlankOptions,
     boids::BoidsOptions,
     constellation::ConstellationOptions,
@@ -9,6 +8,7 @@ use crate::{
     dvd::DvdOptions,
     error::{ConfigError, Result, TermzzzError},
     fire::FireOptions,
+    ink::AsciiFieldOptions,
     life::ConwayLifeOptions,
     mandelbrot::MandelbrotOptions,
     maze::MazeOptions,
@@ -110,7 +110,7 @@ pub struct Config {
     pub mandelbrot: MandelbrotOptions,
     pub maze: MazeOptions,
     pub boids: BoidsOptions,
-    pub ascii: AsciiFieldOptions,
+    pub ink: AsciiFieldOptions,
     pub blank: BlankOptions,
     pub cube: CubeOptions,
     pub crab: CrabOptions,
@@ -203,8 +203,8 @@ impl Config {
         options
     }
 
-    pub fn get_ascii_options(&self) -> AsciiFieldOptions {
-        self.ascii.clone()
+    pub fn get_ink_options(&self) -> AsciiFieldOptions {
+        self.ink.clone()
     }
 
     pub fn get_blank_options(&self) -> BlankOptions {
@@ -277,7 +277,7 @@ impl Config {
         self.life.seed = seed;
         self.maze.seed = seed;
         self.boids.seed = seed;
-        self.ascii.seed = seed;
+        self.ink.seed = seed;
         self.crab.seed = seed;
         self.dvd.seed = seed;
         self.pipes.seed = seed;
@@ -300,7 +300,7 @@ impl Default for Config {
             mandelbrot: MandelbrotOptions::default(),
             maze: MazeOptions::default(),
             boids: BoidsOptions::default(),
-            ascii: AsciiFieldOptions::default(),
+            ink: AsciiFieldOptions::default(),
             blank: BlankOptions::default(),
             cube: CubeOptions::default(),
             crab: CrabOptions::default(),

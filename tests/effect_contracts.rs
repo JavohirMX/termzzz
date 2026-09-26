@@ -122,6 +122,55 @@ fn every_effect_has_usable_metadata() {
     }
 }
 
+/// The effect is called `ink`, and the old name is gone with no alias.
+///
+/// `ascii` named the medium rather than the effect -- eleven other effects draw
+/// characters -- and the thing you actually interact with is ink poured into a
+/// field. It was renamed deliberately, and deliberately *without* a deprecated
+/// alias, so these are the consequences rather than accidents:
+///
+/// - `termzzz ascii` is now an unknown effect, and the CLI says so.
+/// - an old `[ascii]` config section is silently ignored, because serde has no
+///   `deny_unknown_fields` and inventing a hard failure there would break anyone
+///   carrying a stale key from any earlier rename.
+/// - an old `effect = "ascii"` playlist entry no longer resolves, which is the
+///   one that loses data, so `Playlist::build_slots` reports it rather than
+///   shortening the playlist in silence.
+///
+/// That last one is not hypothetical: the crate's own playlist test named
+/// `"ascii"` and started failing the moment the rename landed, which is how the
+/// reporting was found to be worth having.
+#[test]
+fn the_field_is_called_ink_and_ascii_is_gone() {
+    assert!("ink".parse::<EffectId>().is_ok());
+    assert_eq!("ink".parse::<EffectId>().unwrap(), EffectId::Ink);
+
+    // No alias. If this ever starts passing, someone has added a compatibility
+    // shim that was not asked for and that hides the rename from users.
+    assert!(
+        "ascii".parse::<EffectId>().is_err(),
+        "'ascii' parses again, so a deprecated alias has been added"
+    );
+
+    // The config section followed the name, as `registry.rs` requires of every
+    // effect -- so `[ink]` is the section and `[ascii]` is inert.
+    let config = Config::default();
+    assert_eq!(config.get_ink_options().seed, 42);
+    let renamed: Config =
+        toml::from_str("[ink]\ntime_scale = 2.0\n").expect("[ink] parses");
+    assert_eq!(renamed.ink.time_scale, 2.0);
+    let stale: Config = toml::from_str("[ascii]\ntime_scale = 2.0\n")
+        .expect("a stale section is ignored");
+    assert_eq!(
+        stale.ink.time_scale, 1.0,
+        "a stale [ascii] section was honoured, so the rename did not take"
+    );
+
+    // And it is still the only effect that wants the mouse, which is the reason
+    // mouse capture is enabled for the whole session.
+    assert!(EffectId::Ink.needs_mouse());
+}
+
 #[test]
 fn unknown_effect_names_are_rejected() {
     assert!("not-an-effect".parse::<EffectId>().is_err());

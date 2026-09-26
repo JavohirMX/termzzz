@@ -173,11 +173,15 @@ impl Playlist {
     }
 
     fn build_slots(options: &PlaylistOptions) -> Vec<Slot> {
+        let mut unresolvable: Vec<&str> = Vec::new();
         let mut slots: Vec<Slot> = options
             .effects
             .iter()
             .filter_map(|entry| {
-                let id = entry.effect.parse::<EffectId>().ok()?;
+                let Ok(id) = entry.effect.parse::<EffectId>() else {
+                    unresolvable.push(entry.effect.as_str());
+                    return None;
+                };
                 Some(Slot {
                     id,
                     duration: entry
@@ -187,6 +191,31 @@ impl Playlist {
                 })
             })
             .collect();
+
+        // A name this code cannot resolve used to be dropped in silence, which
+        // shortens the playlist with no indication that anything was wrong. That
+        // is how a renamed effect takes a user's playlist apart without them
+        // finding out until the run looks wrong: `effect = "ascii"` in a file
+        // written before the rename to `ink` is now a name that parses to nothing,
+        // and the entry simply vanishes.
+        //
+        // Not an error -- a playlist naming an effect that does not exist is a
+        // config mistake, not a crash, and the rest of the playlist is still
+        // perfectly playable. But it is reported, because a silent shortening is
+        // the worst of the three outcomes.
+        if !unresolvable.is_empty() {
+            eprintln!(
+                "termzzz: ignoring {} playlist entr{} this build cannot resolve: {}",
+                unresolvable.len(),
+                if unresolvable.len() == 1 { "y" } else { "ies" },
+                unresolvable.join(", ")
+            );
+            let known: Vec<&str> = EffectId::all().map(|id| id.as_str()).collect();
+            eprintln!(
+                "termzzz: the effects this build knows are: {}",
+                known.join(", ")
+            );
+        }
 
         if slots.is_empty() {
             slots = EffectId::all()
@@ -694,9 +723,9 @@ mod tests {
 
     #[test]
     fn input_is_forwarded_to_the_active_effect() {
-        let mut playlist = playlist_with(&[("ascii", Some(5.0))], 0.6, false);
+        let mut playlist = playlist_with(&[("ink", Some(5.0))], 0.6, false);
         let is_paused = |playlist: &mut Playlist| match &playlist.current {
-            AnyEffect::Ascii(field) => field.paused,
+            AnyEffect::Ink(field) => field.paused,
             _ => false,
         };
         assert!(!is_paused(&mut playlist));

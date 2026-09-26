@@ -25,7 +25,7 @@ termzzz terrain     # Terrain generation
 termzzz constellation # Drifting stars and dotted connections
 termzzz dvd         # Bouncing ASCII logo
 termzzz blank       # Blank screen
-termzzz ascii       # Interactive generative ASCII field
+termzzz ink         # Interactive generative field you pour ink into
 
 # Run a timed playlist of effects
 termzzz --playlist matrix,dvd,plasma
@@ -101,7 +101,7 @@ Effect switching is done: `n` and `p` walk the catalogue behind a diagonal wipe,
 via `EffectHost` and the `FrameTarget` seam in the frame loop. A repeat is
 dropped at the key handler, so a held key advances one effect per transition
 rather than strobing. Note the mouse decision recorded in `main.rs` -- capture is
-enabled for the whole session because `n` can bring up the ASCII field at any
+enabled for the whole session because `n` can bring up the ink field at any
 moment.
 
 Effects also throttle to `[global] idle_fps` while the terminal is unfocused,

@@ -395,12 +395,8 @@ mod tests {
     #[test]
     fn parses_speed_override() {
         let args = parse_args_from(
-            [
-                "--speed".to_string(),
-                "0.5".to_string(),
-                "ascii".to_string(),
-            ]
-            .into_iter(),
+            ["--speed".to_string(), "0.5".to_string(), "ink".to_string()]
+                .into_iter(),
         )
         .unwrap();
 

@@ -40,7 +40,7 @@ Run representative effects manually in a real terminal:
 
 ```bash
 ./target/release/termzzz matrix
-./target/release/termzzz ascii
+./target/release/termzzz ink
 ./target/release/termzzz terrain
 ```
 

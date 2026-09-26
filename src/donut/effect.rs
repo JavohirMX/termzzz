@@ -608,6 +608,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn zz_probe_histogram() {
+        use std::collections::BTreeMap;
+        for size in [(40u16, 12u16), (40, 20), (80, 40)] {
+            let mut donut = Donut::new(DonutOptions::default(), size);
+            let mut histogram: BTreeMap<char, usize> = BTreeMap::new();
+            let mut total = 0usize;
+            for step in 0..12u64 {
+                donut.update_with_context(&crate::runtime::FrameContext::new(
+                    size,
+                    step,
+                    Duration::ZERO,
+                    Duration::from_secs_f64(1.0 / 30.0),
+                    crate::runtime::InputState::default(),
+                ));
+                for (_, _, cell) in donut.get_diff() {
+                    *histogram.entry(cell.symbol).or_default() += 1;
+                    total += 1;
+                }
+            }
+            let ramp: String = DEFAULT_LUMINANCE_CHARS
+                .iter()
+                .map(|g| {
+                    let n = histogram.get(g).copied().unwrap_or(0);
+                    format!("{}:{:.1}% ", g, 100.0 * n as f32 / total as f32)
+                })
+                .collect();
+            println!("PROBE {size:?} k1={} cells={total} {ramp}", donut.options.k1);
+        }
+    }
+
     /// End to end: a dim glyph is painted a dimmer colour than a bright one.
     #[test]
     fn a_drawn_frame_gets_brighter_with_its_glyphs() {

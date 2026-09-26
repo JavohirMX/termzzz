@@ -4,7 +4,7 @@
 //!
 //! | Module   | Description                              |
 //! |----------|------------------------------------------|
-//! | `ascii`  | Interactive generative ASCII field         |
+//! | `ink`    | Interactive generative field you pour ink into |
 //! | `blank`  | Blank screen — no-op placeholder         |
 //! | `boids`  | Boids flocking simulation                |
 //! | `buffer` | Terminal cell buffer for colored output  |
@@ -36,7 +36,6 @@
 //! is [`registry::EFFECT_SPECS`]. It is not repeated here or in the docs,
 //! because a second copy is a second thing to forget to update.
 
-pub mod ascii;
 pub mod blank;
 pub mod boids;
 pub mod buffer;
@@ -52,6 +51,7 @@ pub mod dvd;
 pub mod error;
 pub mod fire;
 pub mod host;
+pub mod ink;
 pub mod life;
 pub mod mandelbrot;
 pub mod maze;

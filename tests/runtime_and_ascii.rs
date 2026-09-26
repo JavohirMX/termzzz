@@ -1,12 +1,12 @@
 use std::process::Command;
 use std::time::Duration;
 
-use termzzz::ascii::{AsciiField, AsciiFieldOptions, GlyphPalette};
 use termzzz::buffer::Cell;
 use termzzz::common::{
     self, TerminalEffect, TickClock, run_loop_with_source_and_size,
 };
 use termzzz::config::Config;
+use termzzz::ink::{AsciiField, AsciiFieldOptions, GlyphPalette};
 use termzzz::registry::{AnyEffect, EffectId};
 use termzzz::runtime::{
     FrameContext, InputEvent, InputSource, InputState, Key, KeyPhase,
@@ -954,10 +954,10 @@ fn unknown_effect_reports_the_name_exactly_once() {
 #[test]
 fn partial_ascii_config_uses_defaults() {
     let config: termzzz::config::Config =
-        toml::from_str("[ascii]\ntime_scale = 2.0\n").unwrap();
+        toml::from_str("[ink]\ntime_scale = 2.0\n").unwrap();
 
-    assert_eq!(config.ascii.time_scale, 2.0);
-    assert_eq!(config.ascii.seed, 42);
+    assert_eq!(config.ink.time_scale, 2.0);
+    assert_eq!(config.ink.seed, 42);
 }
 
 #[test]
@@ -966,7 +966,7 @@ fn global_speed_defaults_to_one_and_is_configurable() {
 
     let config: Config = toml::from_str("[global]\nspeed = 0.4\n").unwrap();
     assert_eq!(config.global.speed, 0.4);
-    assert_eq!(config.get_ascii_options().seed, 42);
+    assert_eq!(config.get_ink_options().seed, 42);
 }
 
 #[test]
@@ -1018,7 +1018,7 @@ fn dvd_is_registered_with_a_distinct_name() {
     assert_eq!(dvd, "dvd");
     assert!(EffectId::all().any(|id| id == EffectId::Dvd));
     assert!(!EffectId::Dvd.needs_mouse());
-    assert!(EffectId::Ascii.needs_mouse());
+    assert!(EffectId::Ink.needs_mouse());
 }
 
 #[test]
@@ -1268,7 +1268,7 @@ fn unhandled_keys_still_reach_the_effect_through_the_host() {
 
     let frames = |keys: Vec<InputEvent>, count: usize| -> usize {
         let mut source = BatchInput::with(keys);
-        let mut host = EffectHost::new(EffectId::Ascii, Config::default(), (20, 8));
+        let mut host = EffectHost::new(EffectId::Ink, Config::default(), (20, 8));
         let mut output = Vec::new();
         common::run_loop_with_source_and_size_and_target(
             &mut output,

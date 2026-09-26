@@ -2,7 +2,7 @@
 
 Terminal screensavers and generative visual effects written in Rust.
 
-`termzzz` is a collection of memory-safe terminal effects: a set of classic screensavers plus a new interactive ASCII field, playlist mode, and global speed control.
+`termzzz` is a collection of memory-safe terminal effects: a set of classic screensavers plus a new interactive ink field, playlist mode, and global speed control.
 
 ## Effects
 
@@ -21,7 +21,7 @@ Terminal screensavers and generative visual effects written in Rust.
 - Terrain
 - Bouncing DVD logo (`dvd`)
 - Blank screen
-- Interactive generative ASCII field (`ascii`)
+- Interactive generative field you pour ink into (`ink`)
 
 ## Usage
 
@@ -41,7 +41,7 @@ termzzz plasma
 termzzz constellation
 termzzz terrain
 termzzz blank
-termzzz ascii
+termzzz ink
 ```
 
 Every effect that uses randomness is seeded, so a run can be reproduced or shared:
@@ -57,7 +57,7 @@ be set per effect in the config file, for example `[matrix] seed = 7`.
 Press `q`, `Esc`, or `Ctrl+C` to exit. `+` and `-` change the global animation speed
 in every effect. `n` and `p` move to the next and previous effect, behind the same
 diagonal wipe the playlist uses, so you can walk the whole catalogue without
-restarting. In ASCII mode:
+restarting. In ink mode:
 
 - `r` reseeds the field
 - `Space` pauses and resumes the animation

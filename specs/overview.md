@@ -20,7 +20,7 @@
 - `render/`: Sub-cell renderers -- braille, half-block, dithering, palettes, wipe
 - `session.rs`: Terminal setup and teardown, including panic safety
 - `check.rs`: Bounded frame-count test mode
-- `ascii/`: Reusable ASCII renderer and interactive generative field
+- `ink/`: Reusable ASCII renderer and interactive generative field
 - `dvd/`: Bouncing ASCII logo with a configurable logo
 - `playlist/`: Timed effect queue with blank-wipe transitions and shuffle ordering
 
@@ -112,7 +112,7 @@ Effects are initialized with a safe minimum simulation size of 6x6
 (`common::MIN_EFFECT_SIZE`), which the runtime enforces before handing a size to
 an effect. Output writes are clipped to the actual terminal dimensions regardless.
 
-The ASCII field is a domain-warped wave field: the sample coordinates are
+The ink field is a domain-warped wave field: the sample coordinates are
 displaced by a sine and a cosine before three wave terms and a diagonal ripple are
 summed. That value indexes a narrow ASCII glyph ramp through a bounded palette, and
 the pointer injects energy that decays over time. The renderer has no media

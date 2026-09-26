@@ -1,4 +1,3 @@
-use crate::ascii::AsciiField;
 use crate::blank::Blank;
 use crate::boids::Boids;
 use crate::buffer::Cell;
@@ -10,6 +9,7 @@ use crate::cube::Cube;
 use crate::donut::Donut;
 use crate::dvd::Dvd;
 use crate::fire::Fire;
+use crate::ink::AsciiField;
 use crate::life::ConwayLife;
 use crate::mandelbrot::Mandelbrot;
 use crate::maze::Maze;
@@ -40,7 +40,7 @@ pub enum EffectId {
     Plasma,
     Fire,
     Constellation,
-    Ascii,
+    Ink,
     Terrain,
 }
 
@@ -182,12 +182,18 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         config_section: "constellation",
     },
     EffectSpec {
-        id: EffectId::Ascii,
-        name: "ascii",
-        description: "Interactive generative ASCII field",
+        id: EffectId::Ink,
+        // Was "ascii", which named the medium rather than the effect: it draws
+        // characters, but so do eleven others, and the thing you interact with is
+        // ink poured into a field. Renamed with no alias, so an old `[ascii]`
+        // config section is ignored and an old `effect = "ascii"` playlist entry
+        // is dropped -- see `build_slots`, which now reports the latter rather
+        // than swallowing it.
+        name: "ink",
+        description: "Interactive generative field you pour ink into",
         default_duration: 20.0,
         needs_mouse: true,
-        config_section: "ascii",
+        config_section: "ink",
     },
     EffectSpec {
         id: EffectId::Terrain,
@@ -289,7 +295,7 @@ pub enum AnyEffect {
     Plasma(Plasma),
     Fire(Fire),
     Constellation(Constellation),
-    Ascii(AsciiField),
+    Ink(AsciiField),
     Terrain(Terrain),
 }
 
@@ -310,7 +316,7 @@ impl AnyEffect {
             Self::Plasma(_) => EffectId::Plasma,
             Self::Fire(_) => EffectId::Fire,
             Self::Constellation(_) => EffectId::Constellation,
-            Self::Ascii(_) => EffectId::Ascii,
+            Self::Ink(_) => EffectId::Ink,
             Self::Terrain(_) => EffectId::Terrain,
         }
     }
@@ -366,10 +372,9 @@ impl AnyEffect {
                 config.get_constellation_options(),
                 screen_size,
             )),
-            EffectId::Ascii => Self::Ascii(AsciiField::new(
-                config.get_ascii_options(),
-                screen_size,
-            )),
+            EffectId::Ink => {
+                Self::Ink(AsciiField::new(config.get_ink_options(), screen_size))
+            }
             EffectId::Terrain => Self::Terrain(Terrain::new(
                 config.get_terrain_options(),
                 screen_size,
@@ -453,7 +458,7 @@ impl_terminal_effect_for_any!(
     Plasma,
     Fire,
     Constellation,
-    Ascii,
+    Ink,
     Terrain,
 );
 
@@ -482,7 +487,7 @@ mod tests {
         EffectId::Plasma,
         EffectId::Fire,
         EffectId::Constellation,
-        EffectId::Ascii,
+        EffectId::Ink,
         EffectId::Terrain,
     ];
 
