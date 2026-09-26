@@ -1,5 +1,6 @@
 use crate::common::TerminalEffect;
 use crate::error::Result;
+use crate::runtime::{FrameContext, InputState};
 use crossterm::{
     cursor,
     event::{self, Event},
@@ -9,6 +10,55 @@ use crossterm::{
 };
 use std::io::{self, Write};
 use std::time::Duration;
+
+struct CheckTerminal {
+    stdout: io::Stdout,
+    active: bool,
+}
+
+impl CheckTerminal {
+    fn new() -> io::Result<Self> {
+        let mut stdout = io::stdout();
+        terminal::enable_raw_mode()?;
+        if let Err(error) = execute!(
+            stdout,
+            terminal::EnterAlternateScreen,
+            cursor::Hide,
+            terminal::Clear(terminal::ClearType::All)
+        ) {
+            let _ = execute!(
+                stdout,
+                cursor::Show,
+                terminal::Clear(terminal::ClearType::All),
+                terminal::LeaveAlternateScreen,
+            );
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self {
+            stdout,
+            active: true,
+        })
+    }
+
+    fn stdout(&mut self) -> &mut io::Stdout {
+        &mut self.stdout
+    }
+}
+
+impl Drop for CheckTerminal {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = execute!(
+                self.stdout,
+                cursor::Show,
+                terminal::Clear(terminal::ClearType::All),
+                terminal::LeaveAlternateScreen,
+            );
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
 
 /// Runs a terminal screensaver effect for a limited number of frames to validate its functionality.
 ///
@@ -32,21 +82,21 @@ use std::time::Duration;
 /// test_effect(&mut effect, 100)?;
 /// ```
 pub fn test_effect<T: TerminalEffect>(effect: &mut T, frames: usize) -> Result<()> {
-    let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
-    terminal::enable_raw_mode()?;
+    let mut terminal = CheckTerminal::new()?;
+    let size = crate::common::normalize_effect_size(terminal::size()?);
+    let mut input = InputState::default();
+    input.set_size(size);
+    let delta = Duration::from_secs_f64(1.0 / 60.0);
 
     for frame in 1..=frames {
-        // Clear the screen
-        execute!(stdout, Clear(ClearType::All))?;
+        let context =
+            FrameContext::new(size, frame as u64, delta, delta, input.clone());
+        execute!(terminal.stdout(), Clear(ClearType::All))?;
+        let diff = effect.get_diff_with_context(&context);
 
-        // Get the diff for the current frame
-        let diff = effect.get_diff();
-
-        // Render the frame
         for (x, y, cell) in diff {
             execute!(
-                stdout,
+                terminal.stdout(),
                 cursor::MoveTo(x as u16, y as u16),
                 crossterm::style::PrintStyledContent(
                     cell.symbol.with(cell.color).attribute(cell.attr)
@@ -54,20 +104,15 @@ pub fn test_effect<T: TerminalEffect>(effect: &mut T, frames: usize) -> Result<(
             )?;
         }
 
-        // Print frame number
         execute!(
-            stdout,
+            terminal.stdout(),
             cursor::MoveTo(0, 0),
             crossterm::style::Print(format!("Frame: {}", frame))
         )?;
-
-        stdout.flush()?;
-
-        // Update the effect for the next frame
-        effect.update();
+        terminal.stdout().flush()?;
+        effect.update_with_context(&context);
     }
 
-    // Wait for any key press
     loop {
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(_) = event::read()?
@@ -76,59 +121,19 @@ pub fn test_effect<T: TerminalEffect>(effect: &mut T, frames: usize) -> Result<(
         }
     }
 
-    execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
-    terminal::disable_raw_mode()?;
-
     Ok(())
 }
 
 /// Run appropriate effect till frame number
-pub fn run_test_for_effect(effect_name: &str, frames: usize) -> Result<()> {
-    match effect_name {
-        "matrix" => {
-            let options =
-                crate::rain::digital_rain::DigitalRainOptionsBuilder::default()
-                    .drops_range((120, 240))
-                    .speed_range((2, 16))
-                    .build()
-                    .unwrap();
-            let mut digital_rain = crate::rain::digital_rain::DigitalRain::new(
-                options,
-                terminal::size()?,
-            );
-            test_effect(&mut digital_rain, frames)
-        }
-        "life" => {
-            let options = crate::life::ConwayLifeOptionsBuilder::default()
-                .build()
-                .unwrap();
-            let mut conway_life =
-                crate::life::ConwayLife::new(options, terminal::size()?);
-            test_effect(&mut conway_life, frames)
-        }
-        "maze" => {
-            let options =
-                crate::maze::MazeOptionsBuilder::default().build().unwrap();
-            let mut maze = crate::maze::Maze::new(options, terminal::size()?);
-            test_effect(&mut maze, frames)
-        }
-        "constellation" => {
-            let options =
-                crate::constellation::ConstellationOptionsBuilder::default()
-                    .build()
-                    .unwrap();
-            let mut constellation = crate::constellation::Constellation::new(
-                options,
-                terminal::size()?,
-            );
-            test_effect(&mut constellation, frames)
-        }
-        _ => {
-            println!(
-                "Unknown effect: {}. Available effects are: matrix, life, maze, constellation",
-                effect_name
-            );
-            Ok(())
-        }
-    }
+pub fn run_test_for_effect(
+    effect_name: &str,
+    frames: usize,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let effect_id = effect_name
+        .parse::<crate::registry::EffectId>()
+        .map_err(crate::error::TermzzzError::UnsupportedEffect)?;
+    let size = crate::common::normalize_effect_size(terminal::size()?);
+    let mut effect = crate::registry::AnyEffect::build(effect_id, config, size);
+    test_effect(&mut effect, frames)
 }

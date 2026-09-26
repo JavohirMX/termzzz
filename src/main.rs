@@ -2,10 +2,10 @@ use crossterm::{self, cursor, execute, terminal};
 use std::{io, process};
 
 use termzzz::{
-    ascii::AsciiField, blank::Blank, boids::Boids, check, common, config::Config,
-    constellation::Constellation, crab::Crab, cube::Cube, donut::Donut, dvd::Dvd,
-    error, fire::Fire, life::ConwayLife, maze::Maze, pipes::Pipes, plasma::Plasma,
-    rain::digital_rain::DigitalRain, terrain::Terrain,
+    check, common,
+    config::Config,
+    error,
+    registry::{AnyEffect, EffectId},
 };
 
 #[derive(Debug)]
@@ -73,18 +73,27 @@ fn main() -> Result<(), error::TermzzzError> {
         }
     };
 
+    let (config, config_status) = Config::load()?;
+
     if args.check {
         let effect = check_effect(&args);
         let frames = args.frames.unwrap_or(1);
-        return check::run_test_for_effect(&effect, frames);
+        return check::run_test_for_effect(&effect, frames, &config);
     }
-
-    let (config, config_status) = Config::load()?;
     let size = common::normalize_effect_size(terminal::size()?);
+
+    let effect_id = match args.screen_saver.parse::<EffectId>() {
+        Ok(effect_id) => effect_id,
+        Err(error) => {
+            println!("Unknown screen saver: {error}");
+            print_help();
+            return Ok(());
+        }
+    };
 
     let fps = {
         let mut guard = TerminalGuard::new()?;
-        let mut effect = build_effect(&args.screen_saver, &config, size)?;
+        let mut effect = AnyEffect::build(effect_id, &config, size);
 
         common::run_loop(guard.get_stdout(), &mut effect, None)?
     };
@@ -92,107 +101,6 @@ fn main() -> Result<(), error::TermzzzError> {
     println!("{}", config_status);
     println!("Frames per second: {:.1}", fps);
     Ok(())
-}
-
-enum AnyEffect {
-    Matrix(DigitalRain),
-    Life(ConwayLife),
-    Maze(Maze),
-    Boids(Boids),
-    Blank(Blank),
-    Cube(Cube),
-    Crab(Crab),
-    Donut(Donut),
-    Pipes(Pipes),
-    Plasma(Plasma),
-    Fire(Fire),
-    Constellation(Constellation),
-    Terrain(Terrain),
-    Ascii(AsciiField),
-    Dvd(Dvd),
-}
-
-fn build_effect(
-    name: &str,
-    config: &Config,
-    size: (u16, u16),
-) -> Result<AnyEffect, error::TermzzzError> {
-    let unknown = || error::TermzzzError::UnsupportedEffect(name.to_string());
-
-    Ok(match name {
-        "matrix" => AnyEffect::Matrix(DigitalRain::new(
-            config.get_matrix_options(size),
-            size,
-        )),
-        "life" => {
-            AnyEffect::Life(ConwayLife::new(config.get_life_options(size), size))
-        }
-        "maze" => AnyEffect::Maze(Maze::new(config.get_maze_options(size), size)),
-        "boids" => AnyEffect::Boids(Boids::new(config.get_boids_options(size))),
-        "blank" => AnyEffect::Blank(Blank::new(config.get_blank_options(), size)),
-        "cube" => AnyEffect::Cube(Cube::new(config.get_cube_options(), size)),
-        "crab" => AnyEffect::Crab(Crab::new(config.get_crab_options(size), size)),
-        "donut" => {
-            AnyEffect::Donut(Donut::new(config.get_donut_options(size), size))
-        }
-        "pipes" => AnyEffect::Pipes(Pipes::new(config.get_pipes_options(), size)),
-        "plasma" => {
-            AnyEffect::Plasma(Plasma::new(config.get_plasma_options(), size))
-        }
-        "fire" => AnyEffect::Fire(Fire::new(config.get_fire_options(), size)),
-        "constellation" => AnyEffect::Constellation(Constellation::new(
-            config.get_constellation_options(),
-            size,
-        )),
-        "terrain" => {
-            AnyEffect::Terrain(Terrain::new(config.get_terrain_options(), size))
-        }
-        "dvd" => AnyEffect::Dvd(Dvd::new(config.get_dvd_options(), size)),
-        "ascii" => {
-            AnyEffect::Ascii(AsciiField::new(config.get_ascii_options(), size))
-        }
-        _ => return Err(unknown()),
-    })
-}
-
-macro_rules! dispatch {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            AnyEffect::Matrix(effect) => effect.$method($($arg),*),
-            AnyEffect::Life(effect) => effect.$method($($arg),*),
-            AnyEffect::Maze(effect) => effect.$method($($arg),*),
-            AnyEffect::Boids(effect) => effect.$method($($arg),*),
-            AnyEffect::Blank(effect) => effect.$method($($arg),*),
-            AnyEffect::Cube(effect) => effect.$method($($arg),*),
-            AnyEffect::Crab(effect) => effect.$method($($arg),*),
-            AnyEffect::Donut(effect) => effect.$method($($arg),*),
-            AnyEffect::Pipes(effect) => effect.$method($($arg),*),
-            AnyEffect::Plasma(effect) => effect.$method($($arg),*),
-            AnyEffect::Fire(effect) => effect.$method($($arg),*),
-            AnyEffect::Constellation(effect) => effect.$method($($arg),*),
-            AnyEffect::Terrain(effect) => effect.$method($($arg),*),
-            AnyEffect::Ascii(effect) => effect.$method($($arg),*),
-            AnyEffect::Dvd(effect) => effect.$method($($arg),*),
-        }
-    };
-}
-
-impl common::TerminalEffect for AnyEffect {
-    fn get_diff(&mut self) -> Vec<(usize, usize, termzzz::buffer::Cell)> {
-        dispatch!(self, get_diff)
-    }
-
-    fn update(&mut self) {
-        dispatch!(self, update)
-    }
-
-    fn update_size(&mut self, width: u16, height: u16) {
-        dispatch!(self, update_size, width, height)
-    }
-
-    fn reset(&mut self) {
-        dispatch!(self, reset)
-    }
 }
 
 fn check_effect(args: &AppArgs) -> String {
@@ -271,6 +179,11 @@ fn print_help() {
     println!("USAGE:");
     println!("    termzzz [EFFECT] [OPTIONS]");
     println!();
+    println!("EFFECTS:");
+    for effect in EffectId::ALL {
+        println!("    {:<14}{}", effect.as_str(), effect.description());
+    }
+    println!();
     println!("OPTIONS:");
     println!("    -h, --help              Show help");
     println!("    -v, --version           Show version");
@@ -286,9 +199,6 @@ fn print_help() {
     );
     println!();
     println!("EXAMPLES:");
-    println!("    termzzz matrix            Run Matrix effect");
-    println!("    termzzz ascii             Run interactive ASCII field");
-    println!("    termzzz dvd               Run bouncing DVD logo");
     println!("    termzzz --check            Test with default effect");
     println!("    termzzz --check life       Test Life effect");
     println!("    termzzz --check --frames 100 life");
@@ -329,10 +239,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(check_effect(&args), "life");
-    }
-
-    #[test]
-    fn build_effect_rejects_unknown_names() {
-        assert!(build_effect("nope", &Config::default(), (20, 10)).is_err());
     }
 }
