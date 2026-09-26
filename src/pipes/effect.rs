@@ -25,6 +25,7 @@ static LINE_CHARS: LazyLock<Vec<Vec<char>>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PipesOptions {
     pub turn_probability: f64,
     pub line_type: usize,

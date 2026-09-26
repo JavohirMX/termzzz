@@ -27,6 +27,7 @@ struct Edge {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CubeOptions {
     pub cube_size: f32,
     pub rotation_speed_x: f32,

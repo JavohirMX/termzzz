@@ -20,6 +20,7 @@ const DIM_PALETTE: [(u8, u8, u8); 4] =
 const BRIGHT: (u8, u8, u8) = (238, 243, 255);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConstellationOptions {
     pub star_count: usize,
     pub connect_radius: f64,

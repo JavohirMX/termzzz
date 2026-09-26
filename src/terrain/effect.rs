@@ -6,6 +6,7 @@ use crossterm::style;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TerrainOptions {
     pub seed: u64,
     pub scale: f64,

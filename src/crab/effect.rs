@@ -66,6 +66,7 @@ struct CrabEntity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CrabOptions {
     #[serde(skip)]
     pub crab_count: u16,

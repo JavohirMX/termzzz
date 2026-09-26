@@ -41,6 +41,7 @@ const PALETTE: [(u8, u8, u8); 6] = [
 const DT: f64 = 1.0 / 60.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DvdOptions {
     /// Logo to bounce around the screen. Use `\n` for multi-line logos.
     pub logo: String,

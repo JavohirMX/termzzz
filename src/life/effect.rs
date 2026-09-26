@@ -31,6 +31,7 @@ static DEAD_CELLS_CHARS: LazyLock<Vec<char>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct ConwayLifeOptions {
     #[serde(skip)]
     pub initial_cells: u32,

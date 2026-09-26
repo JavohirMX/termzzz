@@ -36,6 +36,7 @@ struct Boid {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BoidsOptions {
     #[serde(skip)]
     pub screen_size: (u16, u16),

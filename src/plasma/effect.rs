@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PlasmaOptions {
     pub time_scale: f64,
     pub spatial_scale: f64,

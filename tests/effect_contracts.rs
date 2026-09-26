@@ -187,6 +187,117 @@ fn omitting_any_single_config_section_preserves_real_defaults() {
     );
 }
 
+/// A section that names only *some* of its keys must still load.
+///
+/// This is the other half of `omitting_any_single_config_section_preserves_real_
+/// defaults`, and it is the one that bites when a knob is added. `Config` carries
+/// a container-level `#[serde(default)]`, which covers a missing section but not
+/// a missing key inside a section that is present -- so without the same
+/// attribute on each effect's own options struct, a hand-written
+///
+/// ```toml
+/// [plasma]
+/// time_scale = 2.0
+/// ```
+///
+/// is a startup deserialisation error rather than "the other plasma settings at
+/// their defaults".
+///
+/// It matters more than it looks, because `--print-config` writes every key to
+/// disk. A generated config is therefore pinned to whatever the defaults were the
+/// day it was generated, which means every future knob arrives as "a key the
+/// user's file does not have" -- this is the normal case, not the exotic one.
+#[test]
+fn omitting_any_single_key_keeps_its_real_default() {
+    let full = default_config_toml();
+    let sections = split_toml_sections(&full);
+
+    let mut broken: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for (section, body) in &sections {
+        let lines: Vec<&str> = body.lines().collect();
+
+        // A key is `name = ...` at bracket depth zero. Depth matters because
+        // `luminance_chars` serialises as a multi-line array, and without this
+        // each of its element lines reads as a key of its own.
+        let mut entries: Vec<(&str, usize, usize)> = Vec::new();
+        let mut depth: i32 = 0;
+        let mut start: Option<usize> = None;
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if depth == 0
+                && let Some((name, _)) = trimmed.split_once('=')
+                && !name.trim().is_empty()
+                && name.trim().chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                start = Some(index);
+            }
+            depth += trimmed.matches(['[', '{']).count() as i32
+                - trimmed.matches([']', '}']).count() as i32;
+            if depth == 0
+                && let Some(begin) = start.take()
+            {
+                entries.push((
+                    trimmed.split('=').next().unwrap_or("").trim(),
+                    begin,
+                    index,
+                ));
+            }
+        }
+
+        for (key, begin, end) in entries {
+            checked += 1;
+
+            let mut partial = String::new();
+            for (name, other) in &sections {
+                partial.push_str(&format!("[{name}]\n"));
+                if name == section {
+                    for (index, line) in other.lines().enumerate() {
+                        if index < begin || index > end {
+                            partial.push_str(line);
+                            partial.push('\n');
+                        }
+                    }
+                } else {
+                    partial.push_str(other);
+                }
+            }
+
+            // A missing key must fall back to the real default, which means the
+            // round trip has to come back out identical to the full config.
+            let parsed: Config = match toml::from_str(&partial) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    broken
+                        .push(format!("{section}.{key} failed to parse: {error}"));
+                    continue;
+                }
+            };
+            let reserialized =
+                toml::to_string_pretty(&parsed).expect("re-serializes");
+            if reserialized != full {
+                broken.push(format!(
+                    "{section}.{key} did not fall back to its default \
+                     (the file is missing that key's real default)"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked > 40,
+        "only {checked} keys were exercised, so this test is not covering the config"
+    );
+    assert!(
+        broken.is_empty(),
+        "these keys cannot be left out of a user's config file, so adding any one \
+         of them as a new setting would break startup for anyone with a \
+         hand-edited config:\n{}",
+        broken.join("\n")
+    );
+}
+
 #[test]
 fn an_empty_config_file_yields_real_defaults() {
     let parsed: Config = toml::from_str("").expect("empty config parses");

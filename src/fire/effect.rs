@@ -70,6 +70,7 @@ const PALETTE_GAIN: f32 = 4.047619;
 const HOTTEST: usize = 187;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FireOptions {
     pub use_colors: bool,
     /// Seed for the combustion noise that seeds new fires along the bottom row.

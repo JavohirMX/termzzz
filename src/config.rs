@@ -80,6 +80,27 @@ impl Default for GlobalOptions {
 /// to that field type's derived `Default`, and those disagree with the real
 /// defaults, so a partial user config would silently zero out every section the
 /// user did not mention.
+///
+/// Every effect's own options struct carries the same attribute, and it is
+/// needed for the other half of the same problem: a *present* section that names
+/// only some of its keys. `Config`'s attribute covers a missing section but not a
+/// missing key inside one that is there, so without it a user who wrote
+///
+/// ```toml
+/// [plasma]
+/// time_scale = 2.0
+/// ```
+///
+/// gets a deserialisation error at startup rather than the other plasma settings
+/// at their defaults. That matters more than it sounds, because `--print-config`
+/// writes every key out, so a generated config is pinned to whatever the defaults
+/// were when it was generated -- which means "add a new knob" and "add a key
+/// nobody's file has yet" are the same situation. `omitting_any_single_key_keeps
+/// _its_real_default` in `tests/effect_contracts.rs` is the guard.
+///
+/// Deliberately *not* `deny_unknown_fields`. A stale key from a removed setting
+/// would then be a hard startup failure, and an ignored key is a much better
+/// failure than a refusal to launch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {

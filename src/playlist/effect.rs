@@ -17,6 +17,7 @@ pub struct PlaylistEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PlaylistOptions {
     /// Effects to play, in order. Empty means every registered effect.
     pub effects: Vec<PlaylistEntry>,

@@ -107,6 +107,7 @@ fn palette() -> Palette {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MandelbrotOptions {
     /// Iteration ceiling, and the effect's dominant cost by a wide margin.
     ///

@@ -28,6 +28,7 @@ static CHARACTERS: LazyLock<Vec<char>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MazeOptions {
     /// Seed for the wall texture, the start cell and the carve order.
     pub seed: u64,

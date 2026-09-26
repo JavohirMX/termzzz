@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DonutOptions {
     pub inner_radius: f32,
     pub outer_radius: f32,

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DigitalRainOptions {
     /// Derived from the terminal size by the config layer, so not persisted.
     #[serde(skip)]

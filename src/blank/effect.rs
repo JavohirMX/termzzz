@@ -12,6 +12,7 @@ fn fill() -> Cell {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BlankOptions {}
 
 impl Default for BlankOptions {
