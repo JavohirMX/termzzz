@@ -337,6 +337,18 @@ fn cli_help_uses_termzzz_identity() {
 }
 
 #[test]
+fn unknown_effect_reports_the_name_exactly_once() {
+    let output = Command::new(env!("CARGO_BIN_EXE_termzzz"))
+        .arg("notaneffect")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("Unknown screen saver: notaneffect"));
+    assert!(!stdout.contains("Unknown screen saver: Unknown effect"));
+}
+
+#[test]
 fn partial_ascii_config_uses_defaults() {
     let config: termzzz::config::Config =
         toml::from_str("[ascii]\ntime_scale = 2.0\n").unwrap();
@@ -388,6 +400,13 @@ fn registry_ids_round_trip_through_strings() {
         assert_eq!(text.parse::<EffectId>().unwrap(), *id);
     }
     assert!("nope".parse::<EffectId>().is_err());
+}
+
+#[test]
+fn unknown_effect_errors_carry_only_the_rejected_name() {
+    let error = "nope".parse::<EffectId>().unwrap_err();
+
+    assert_eq!(error, "nope");
 }
 
 #[test]

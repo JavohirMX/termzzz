@@ -8,7 +8,7 @@ pub enum TermzzzError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Unsupported check effect: {0}")]
+    #[error("Unknown effect: {0}")]
     UnsupportedEffect(String),
 }
 

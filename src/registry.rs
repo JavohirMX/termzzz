@@ -137,12 +137,14 @@ impl TryFrom<String> for EffectId {
 impl FromStr for EffectId {
     type Err = String;
 
+    /// The error is the rejected name, so callers can phrase their own context
+    /// without duplicating the "unknown effect" wording.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .iter()
             .copied()
             .find(|id| id.as_str() == value)
-            .ok_or_else(|| format!("Unknown effect: {value}"))
+            .ok_or_else(|| value.to_string())
     }
 }
 

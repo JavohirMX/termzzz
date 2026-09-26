@@ -99,7 +99,13 @@ fn main() -> Result<(), error::TermzzzError> {
     if args.check {
         let effect = check_effect(&args);
         let frames = args.frames.unwrap_or(1);
-        return check::run_test_for_effect(&effect, frames, &config, speed);
+        if let Err(error) =
+            check::run_test_for_effect(&effect, frames, &config, speed)
+        {
+            eprintln!("Error: {error}");
+            process::exit(1);
+        }
+        return Ok(());
     }
 
     if args.playlist.is_some() || args.shuffle {
@@ -151,8 +157,8 @@ fn main() -> Result<(), error::TermzzzError> {
 
     let effect_id = match args.screen_saver.parse::<EffectId>() {
         Ok(effect_id) => effect_id,
-        Err(error) => {
-            println!("Unknown screen saver: {error}");
+        Err(name) => {
+            println!("Unknown screen saver: {name}");
             print_help();
             return Ok(());
         }
