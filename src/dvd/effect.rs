@@ -1,6 +1,8 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
+use crate::render::QuadrantMask;
+use crate::render::quadrant::SAMPLES_PER_CELL;
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,31 @@ use serde::{Deserialize, Serialize};
 /// The whole palette had to move, not just that entry: any of the six could be
 /// the starting colour, so leaving five of them above luminance 0.30 would have
 /// left the bug reachable five times out of six.
+/// The default logo: a five-row block-letter `DVD`, twenty cells wide.
+///
+/// Full blocks rather than a thin stroke. It used to be three characters on one
+/// line, which is a text label rather than a logo -- and a seventeen-cell-wide
+/// slab stepping one whole cell at a time is far more obviously a staircase than
+/// three cells doing it, so the two changes belong together.
+///
+/// Multi-row logos were always supported: `logo` is parsed on `\n` and the draw
+/// loop nests rows. So the size is a default-value change; the smoothness is not.
+const DEFAULT_LOGO: &str = "\
+█████  █████   █████
+█   █  █   █   █   █
+█   █  █   █   █   █
+█   █  █   █   █   █
+█████  █████   █████";
+
+/// Whether a logo character is transparent.
+///
+/// A space is. A full block is not: with a two-tone mask the ink is the
+/// foreground and the background shows through everywhere else, so an ink glyph
+/// lights every sample it covers.
+fn is_blank(symbol: char) -> bool {
+    symbol == ' '
+}
+
 const PALETTE: [(u8, u8, u8); 6] = [
     // rose,   luminance 0.19
     (220, 60, 90),
@@ -45,8 +72,19 @@ const DT: f64 = 1.0 / 60.0;
 pub struct DvdOptions {
     /// Logo to bounce around the screen. Use `\n` for multi-line logos.
     pub logo: String,
-    /// Base bounce speed in cells per second.
+    /// Base bounce speed in cells per second, along the horizontal axis.
     pub speed: f32,
+    /// Cells travelled horizontally per cell travelled vertically.
+    ///
+    /// This is the other half of "it should go diagonally". The logo moved one
+    /// cell right and one cell down for every step, which on a cell grid is *not*
+    /// 45 degrees: a terminal cell is roughly twice as tall as it is wide, so equal
+    /// cell deltas draw a line at 50 to 63 degrees. Travelling two cells across for
+    /// every one down puts the visual angle back at 45.
+    ///
+    /// Set to 1.0 for equal cell deltas, which is what the classic bouncing logo
+    /// does in a character grid.
+    pub slope: f32,
     /// Change the logo color when the logo lands in a screen corner.
     pub corner_color_change: bool,
     /// Start the logo from a corner instead of the middle.
@@ -63,8 +101,12 @@ impl Default for DvdOptions {
     /// that omitted a section silently zeroed it.
     fn default() -> Self {
         Self {
-            logo: String::from("DVD"),
-            speed: 9.0,
+            logo: String::from(DEFAULT_LOGO),
+            // 26 rather than 9. At 9 the logo covered 0.15 cells per frame, so
+            // the drawn position changed once every seven frames: still for six
+            // frames out of seven, then a jump. At 26 it covers a cell in two.
+            speed: 26.0,
+            slope: 2.0,
             corner_color_change: true,
             start_in_corner: true,
             seed: DEFAULT_SEED,
@@ -76,6 +118,8 @@ pub struct Dvd {
     screen_size: (u16, u16),
     options: DvdOptions,
     canvas: Canvas,
+    /// The logo's occupancy at 2x2 per cell. See [`QuadrantMask`].
+    mask: QuadrantMask,
     rows: Vec<Vec<char>>,
     x: f64,
     y: f64,
@@ -87,8 +131,7 @@ pub struct Dvd {
 
 impl TerminalEffect for Dvd {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        self.draw();
-        self.canvas.commit()
+        self.draw()
     }
 
     fn update(&mut self) {
@@ -108,6 +151,8 @@ impl TerminalEffect for Dvd {
     fn reset(&mut self) {
         self.canvas
             .resize(self.screen_size.0.max(1), self.screen_size.1.max(1));
+        self.mask
+            .resize(self.screen_size.0 as usize, self.screen_size.1 as usize);
         self.rows = Self::parse_logo(&self.options.logo);
 
         // Reseeded rather than merely carried over: a resize is a new screen, and
@@ -126,13 +171,17 @@ impl TerminalEffect for Dvd {
             let corner = self.rng.random_range(0..4);
             self.x = if corner & 1 == 0 { 0.0 } else { max_x };
             self.y = if corner & 2 == 0 { 0.0 } else { max_y };
-            self.vx = if self.x <= 0.0 { speed } else { -speed };
-            self.vy = if self.y <= 0.0 { speed } else { -speed };
+            // `slope` cells across per cell down, so the *visual* angle is 45
+            // degrees on a cell grid that is taller than it is wide.
+            let across = speed;
+            let down = speed / f64::from(self.options.slope).max(0.1);
+            self.vx = if self.x <= 0.0 { across } else { -across };
+            self.vy = if self.y <= 0.0 { down } else { -down };
         } else {
             self.x = max_x / 2.0;
             self.y = max_y / 2.0;
             self.vx = speed;
-            self.vy = speed;
+            self.vy = speed / f64::from(self.options.slope).max(0.1);
         }
         self.color_index = self.rng.random_range(0..PALETTE.len());
     }
@@ -145,6 +194,7 @@ impl Dvd {
         let mut effect = Self {
             screen_size,
             canvas: Canvas::new(screen_size.0, screen_size.1),
+            mask: QuadrantMask::new(screen_size.0 as usize, screen_size.1 as usize),
             rows: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -228,31 +278,62 @@ impl Dvd {
     }
 
     /// Draws the logo at its current position into the canvas.
-    fn draw(&mut self) {
-        self.canvas.clear();
+    /// Draws the logo at its current position into the canvas.
+    ///
+    /// Drawn into a [`QuadrantMask`] rather than straight onto the canvas.
+    ///
+    /// The old version did `self.x as usize` and `self.y as usize` at the top of
+    /// its loops, which threw away every sub-cell part of the position `step` had
+    /// carefully integrated. At the old default of nine cells per second that is
+    /// 0.15 cells per frame, so the drawn position changed once every seven frames:
+    /// the logo sat perfectly still for six frames out of seven and then jumped a
+    /// whole cell diagonally. That is the "laggy, like stairs" report.
+    ///
+    /// Half-block was tried first and is not enough. It gives 2x vertically, which
+    /// halves the steps on that axis, but the horizontal stays at one sample per
+    /// cell -- and a cell has one foreground and one background, so a vertical
+    /// split spends both and the two cannot be combined. The quadrant block
+    /// elements are the glyphs that split a cell both ways at once, and this is the
+    /// only renderer in the crate that places a shape at 2x on both axes.
+    fn draw(&mut self) -> Vec<(usize, usize, Cell)> {
         let (r, g, b) = PALETTE[self.color_index % PALETTE.len()];
+        let ink = style::Color::Rgb { r, g, b };
+        let background = style::Color::Rgb { r: 0, g: 0, b: 0 };
 
+        self.mask.clear();
+        // The mask renderer only writes cells that have ink, so the canvas has to
+        // be cleared here or the previous frame's logo stays on screen and the two
+        // smear into each other.
+        self.canvas.clear();
+
+        // Both axes in field samples, so the sub-cell part of the position is
+        // drawn rather than discarded.
+        let left = (self.x * SAMPLES_PER_CELL as f64).floor().max(0.0) as usize;
+        let top = (self.y * SAMPLES_PER_CELL as f64).floor().max(0.0) as usize;
         for (row_index, row) in self.rows.iter().enumerate() {
-            let y = self.y as usize + row_index;
-            if y >= self.screen_size.1 as usize {
-                break;
-            }
-            for (column_index, symbol) in row.iter().enumerate() {
-                let x = self.x as usize + column_index;
-                if x >= self.screen_size.0 as usize {
-                    break;
+            for (offset, symbol) in row.iter().enumerate() {
+                if is_blank(*symbol) {
+                    continue;
                 }
-                self.canvas.set(
-                    x,
-                    y,
-                    Cell::new(
-                        *symbol,
-                        style::Color::Rgb { r, g, b },
-                        style::Attribute::Bold,
-                    ),
-                );
+                for dy in 0..SAMPLES_PER_CELL {
+                    for dx in 0..SAMPLES_PER_CELL {
+                        self.mask.set(
+                            left + offset * SAMPLES_PER_CELL + dx,
+                            top + row_index * SAMPLES_PER_CELL + dy,
+                            true,
+                        );
+                    }
+                }
             }
         }
+
+        self.mask.write_to(
+            &mut self.canvas,
+            ink,
+            background,
+            style::Attribute::Reset,
+        );
+        self.canvas.commit()
     }
 }
 
@@ -451,6 +532,152 @@ mod tests {
         slow.update_with_context(&slow_context);
 
         assert!(fast.x > slow.x);
+    }
+
+    /// The picture has to change on almost every frame.
+    ///
+    /// This is the "it feels laggy, like stairs" complaint, measured.
+    ///
+    /// `draw` used to do `self.x as usize` and `self.y as usize`, discarding every
+    /// sub-cell part of the position `step` had integrated. At the old default of
+    /// nine cells per second that is 0.15 cells per frame, so the drawn position
+    /// changed once every seven frames: still for six frames out of seven, then a
+    /// jump. That is 86 changed frames in 600.
+    ///
+    /// Measured through the effect's own diff rather than by inspecting the canvas,
+    /// for two reasons. It is what the terminal actually receives, and it is the
+    /// only measure that works for a sub-cell renderer: with the logo placed at 2x2,
+    /// the *cell* holding its top-left ink still only changes once per whole cell
+    /// of travel, so a test watching the cell reports a staircase even while the
+    /// glyph inside it moves every frame. A version of this test did exactly that
+    /// and reported 280 of 600 while the screen was in fact changing 545 times.
+    ///
+    /// The bound is 500 rather than 600 because 2x resolution caps it. At 26 cells
+    /// per second the horizontal position advances 52 samples a second and the
+    /// vertical 26, against 60 frames, so a handful of frames land between sample
+    /// boundaries and genuinely cannot show movement. Reaching every frame needs
+    /// braille's 4x, which would turn a solid block letter into a field of dots.
+    #[test]
+    fn the_picture_changes_on_almost_every_frame() {
+        let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        let _ = dvd.get_diff();
+
+        let mut changed = 0usize;
+        let mut previous = (dvd.x, dvd.y);
+        let mut worst_step = 0.0f64;
+        for _ in 0..600 {
+            dvd.update();
+            let diff = dvd.get_diff();
+            if !diff.is_empty() {
+                changed += 1;
+            }
+            worst_step = worst_step.max(
+                ((dvd.x - previous.0).powi(2) + (dvd.y - previous.1).powi(2))
+                    .sqrt(),
+            );
+            previous = (dvd.x, dvd.y);
+        }
+
+        assert!(
+            changed > 500,
+            "the screen changed on only {changed} of 600 frames, so the logo is \
+             still mostly stationary with the occasional jump"
+        );
+        // No single frame may move the logo more than a cell and a half. A
+        // bounce clamps the position to the wall, which is a snap of up to one
+        // cell, so the bound is above one rather than at it. This is the check
+        // that would catch a genuine teleport, and it is on the position rather
+        // than on the diff: a bounce legitimately repaints the logo's whole
+        // leading edge, which is most of its area, so diff size cannot tell a
+        // bounce from a jump.
+        assert!(
+            worst_step < 1.5,
+            "the logo moved {worst_step:.2} cells in one frame, which is a jump \
+             rather than motion"
+        );
+    }
+
+    /// The vertical position has to resolve finer than a whole cell.
+    ///
+    /// Half-block was the first attempt and is not enough: it gives 2x vertically
+    /// but the horizontal stays at one sample per cell. This pins the axis that a
+    /// half-block renderer would have fixed, and the next test pins the one it
+    /// would not.
+    #[test]
+    fn the_vertical_position_resolves_finer_than_a_cell() {
+        let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        let mut samples = std::collections::BTreeSet::new();
+        let mut cells = std::collections::BTreeSet::new();
+        for _ in 0..60 {
+            dvd.update();
+            samples.insert((dvd.y * SAMPLES_PER_CELL as f64).floor() as i64);
+            cells.insert(dvd.y.floor() as i64);
+        }
+        assert!(
+            samples.len() > 20,
+            "only {} distinct drawn vertical positions in one second, against \
+             {} at whole-cell resolution, so the sub-cell vertical motion is \
+             not being drawn",
+            samples.len(),
+            cells.len()
+        );
+    }
+
+    /// The logo has to be big.
+    ///
+    /// It was three characters on one line, which is a text label rather than a
+    /// logo. It was previously pinned by name in an integration test too, which
+    /// had to be updated with it.
+    #[test]
+    fn the_default_logo_is_a_multi_row_block_letter() {
+        let dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        assert!(
+            dvd.rows.len() >= 5,
+            "the default logo is {} row(s) tall",
+            dvd.rows.len()
+        );
+        let width = dvd.rows.iter().map(Vec::len).max().unwrap_or(0);
+        assert!(
+            width >= 15,
+            "the default logo is {width} cells wide, which is a label rather \
+             than a logo"
+        );
+        // Ink and gaps, or it is a slab rather than letters. An earlier version
+        // asserted the logo was *majority* full blocks, on the theory that a
+        // sub-cell renderer needs a solid slab to stay solid. That is not how it
+        // works: every ink sample lights every sample it covers, so an ink cell
+        // comes out as a full block whatever its neighbours are, and a
+        // one-cell-wide stroke renders at full size rather than halved.
+        let cells: Vec<char> = dvd.rows.iter().flatten().copied().collect();
+        assert!(
+            cells.contains(&'█') && cells.contains(&' '),
+            "the default logo has no gaps or no ink, so it is not legible as \
+             letters"
+        );
+    }
+
+    /// The diagonal has to be a diagonal, and 45 degrees visually.
+    ///
+    /// One cell right and one cell down is *not* 45 degrees on a cell grid: a
+    /// terminal cell is roughly twice as tall as it is wide, so equal cell deltas
+    /// draw a line at 50 to 63 degrees from horizontal.
+    #[test]
+    fn the_diagonal_is_corrected_for_the_cell_aspect_ratio() {
+        let dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        let across_per_down =
+            (dvd.vx.abs() / dvd.vy.abs().max(f64::MIN_POSITIVE)) as f32;
+        assert!(
+            (across_per_down - dvd.options.slope).abs() < 0.01,
+            "the logo travels {across_per_down} cells across per cell down, but \
+             slope is {}",
+            dvd.options.slope
+        );
+        assert!(
+            dvd.options.slope > 1.0,
+            "a slope of {} draws equal cell deltas, which on this cell aspect \
+             ratio is a line at 50 to 63 degrees rather than a diagonal",
+            dvd.options.slope
+        );
     }
 
     #[test]

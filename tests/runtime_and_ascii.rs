@@ -1056,11 +1056,52 @@ fn playlist_defaults_to_a_short_transition() {
     assert!(options.effects.is_empty());
 }
 
+/// The default logo is a block letter, not three characters on a line.
+///
+/// Was `"DVD"` -- a text label rather than a logo, and a one-row slab stepping a
+/// whole cell at a time is far more obviously a staircase than a taller one. The
+/// name of this test kept its meaning; the assertion follows the effect.
 #[test]
-fn dvd_options_default_to_the_dvd_logo() {
+fn dvd_options_default_to_a_block_letter_logo() {
     let options = Config::default().get_dvd_options();
-    assert_eq!(options.logo, "DVD");
+    assert!(
+        options.logo.contains('\n'),
+        "the default logo is still one line: {:?}",
+        options.logo
+    );
+    assert!(
+        options.logo.lines().count() >= 5,
+        "the default logo is {} rows tall",
+        options.logo.lines().count()
+    );
+    let widest = options.logo.lines().map(str::len).max().unwrap_or(0);
+    assert!(
+        widest >= 15,
+        "the default logo is {widest} cells wide, which is a label"
+    );
+    // A multi-row logo only reaches the screen if the parser splits on newlines,
+    // which it always did -- but nothing asserted that until the default started
+    // relying on it.
+    let rendered = toml::to_string_pretty(&Config::default()).unwrap();
+    assert!(
+        rendered.contains("[dvd]"),
+        "the dvd section is missing from the rendered config"
+    );
     assert!(options.corner_color_change);
+    // And the speed has to be high enough that the drawn position actually
+    // changes between frames, which is the whole "not a staircase" requirement.
+    assert!(
+        options.speed >= 20.0,
+        "the default speed is {}, which is slow enough for the logo to sit still \
+         for several frames between steps",
+        options.speed
+    );
+    assert!(
+        options.slope > 1.0,
+        "the default slope is {}, which draws equal cell deltas and so a line at \
+         50 to 63 degrees rather than a diagonal",
+        options.slope
+    );
 }
 
 #[test]

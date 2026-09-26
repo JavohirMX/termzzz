@@ -224,8 +224,19 @@ fn omitting_any_single_key_keeps_its_real_default() {
         let mut entries: Vec<(&str, usize, usize)> = Vec::new();
         let mut depth: i32 = 0;
         let mut start: Option<usize> = None;
+        // TOML multi-line strings span lines, and a value inside one is not a key.
+        // `dvd.logo` is a five-row block letter, so the serialised config contains
+        // one, and without this the scanner treats each row of the letter as a key
+        // of its own -- which it did, until this test caught it.
+        let mut in_multiline = false;
         for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
+            if in_multiline {
+                if trimmed.contains("\"\"\"") {
+                    in_multiline = false;
+                }
+                continue;
+            }
             if depth == 0
                 && let Some((name, _)) = trimmed.split_once('=')
                 && !name.trim().is_empty()
@@ -233,9 +244,21 @@ fn omitting_any_single_key_keeps_its_real_default() {
             {
                 start = Some(index);
             }
-            depth += trimmed.matches(['[', '{']).count() as i32
-                - trimmed.matches([']', '}']).count() as i32;
+            if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+                // A multi-line string opened and closed on one line is a single
+                // line entry; one that opened here continues, and `start` stays put
+                // so the entry ends at its closing delimiter.
+                if trimmed.matches("\"\"\"").count() % 2 == 1
+                    || trimmed.matches("'''").count() % 2 == 1
+                {
+                    in_multiline = true;
+                }
+            } else {
+                depth += trimmed.matches(['[', '{']).count() as i32
+                    - trimmed.matches([']', '}']).count() as i32;
+            }
             if depth == 0
+                && !in_multiline
                 && let Some(begin) = start.take()
             {
                 entries.push((
