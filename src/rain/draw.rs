@@ -123,8 +123,16 @@ fn head_color() -> style::Color {
 /// washed out, and it is why only the first few cells of a drop are bold.
 pub fn pick_style(vw_style: &RainDropStyle, pos: usize) -> style::Attribute {
     match vw_style {
-        RainDropStyle::Front | RainDropStyle::Middle => match pos {
-            0..=HEAD_BOLD_CELLS => style::Attribute::Bold,
+        // `Front` only. `Middle` used to be in this group, and that was the
+        // white flash: `Middle` and `Fading` are both `style::Color::DarkGrey`,
+        // which crossterm encodes as `ESC[38;5;8m` -- a 256-colour palette index,
+        // not a truecolor triple. Most terminals treat bold on a palette index as
+        // a request for the bright variant, so the code asked for "bold dark
+        // grey" and got white. `Fading` never flashed because it was never bold,
+        // and `Middle` did, which is why it looked intermittent: `Middle` is 10%
+        // of drops and the band travels, so it is a moving highlight.
+        RainDropStyle::Front => match pos {
+            0..HEAD_BOLD_CELLS => style::Attribute::Bold,
             _ => style::Attribute::NormalIntensity,
         },
         _ => style::Attribute::NormalIntensity,
@@ -168,7 +176,25 @@ pub fn pick_color(
                 }
             }
         }
-        RainDropStyle::Back => ramp_at(ramp, pos),
+        // A dim green, roughly half the brightness of a `Gradient` tail. `Middle`
+        // used to fall through to the same `DarkGrey` as `Fading`, which made the
+        // two indistinguishable and left the enum promising a three-layer
+        // brightness structure that only two of the layers had.
+        RainDropStyle::Middle => style::Color::Rgb {
+            r: 0,
+            g: (f32::from(fade_green(pos, len, Fade::Linear)) * 0.45) as u8,
+            b: 0,
+        },
+        // The back layer gets the same spring-green head as the bright drops, so
+        // every drop has a bright head and the layers differ in how far their
+        // tails fall rather than in whether they have a head at all.
+        RainDropStyle::Back => {
+            if pos == 0 {
+                head_color()
+            } else {
+                ramp_at(ramp, pos)
+            }
+        }
         _ => style::Color::DarkGrey,
     }
 }
@@ -229,8 +255,13 @@ mod tests {
     /// the layering is the thing being protected here.
     #[test]
     fn only_the_bright_drops_have_a_bold_head() {
-        for style in [RainDropStyle::Front, RainDropStyle::Middle] {
-            for pos in 0..=HEAD_BOLD_CELLS {
+        // `Middle` was in this list and is the white flash: it is
+        // `style::Color::DarkGrey`, a 256-colour palette index, and bold on a
+        // palette index is a brightening hint that most terminals answer by
+        // rendering the bright variant. It is now a dim green of its own, so it
+        // separates from the front drop by colour rather than by boldness.
+        for style in [RainDropStyle::Front] {
+            for pos in 0..HEAD_BOLD_CELLS {
                 assert_eq!(
                     pick_style(&style, pos),
                     style::Attribute::Bold,
@@ -241,6 +272,7 @@ mod tests {
         }
 
         for style in [
+            RainDropStyle::Middle,
             RainDropStyle::Back,
             RainDropStyle::Fading,
             RainDropStyle::Gradient,
@@ -271,6 +303,114 @@ mod tests {
             "the bold head is {HEAD_BOLD_CELLS} cells of a drop that can be \
              {longest_drop} long, so most of the drop would be brightened"
         );
+    }
+
+    /// No cell may be bold on top of a 256-colour palette index.
+    ///
+    /// This is the white flash. `Middle` and `Fading` drops are drawn
+    /// `style::Color::DarkGrey`, which crossterm encodes as `ESC[38;5;8m` -- a
+    /// *palette index*, not a truecolor triple -- and `Middle` additionally drew its
+    /// head cells `Attribute::Bold`.
+    ///
+    /// Most terminals treat bold on a palette index as a request for the bright
+    /// variant of that index, so bold + index 8 arrives as light grey. The code
+    /// asked for "bold dark grey" and the terminal delivered white. `Fading` did
+    /// not flash because it was never bold, and `Middle` did, which is why it
+    /// looked intermittent: `Middle` is 10% of drops, and the bold band is five
+    /// cells travelling down at two to twenty cells a second, so it is a moving
+    /// highlight rather than a static one.
+    ///
+    /// The rule, and the reason it is a rule rather than a preference: the
+    /// encoder's whole job is to emit the colour that was asked for, and a
+    /// terminal that overrides it makes the effect's output depend on the user's
+    /// configuration. Plasma, fire, mandelbrot, maze and ink all had this same
+    /// problem and all now use `Attribute::Reset`.
+    #[test]
+    fn no_cell_is_bold_on_top_of_a_palette_index() {
+        let ramp = DigitalRain::build_ramp(50);
+        for style in RainDropStyle::ALL {
+            for pos in 0..40 {
+                let attribute = pick_style(style, pos);
+                if attribute == style::Attribute::Bold {
+                    let color = pick_color(style, pos, 12, &ramp);
+                    assert!(
+                        matches!(color, style::Color::Rgb { .. }),
+                        "{style:?} cell {pos} is bold on top of {color:?}, which is \
+                         not a truecolor value. Bold on a 256-colour palette index \
+                         is a brightening hint, and most terminals answer it by \
+                         rendering the bright variant -- which is how a grey line \
+                         flashes white."
+                    );
+                }
+            }
+        }
+    }
+
+    /// The back layer must not be pale at the top.
+    ///
+    /// `Back` drops are coloured by `ramp_at`, indexed by *absolute* position in
+    /// the drop rather than by a fraction of it, and `build_ramp` started the ramp
+    /// at `rgb(200, 200, 200)` -- a light grey at 78% luminance. So the first
+    /// stretch of every back drop was near-white, and the stretch grew with the
+    /// terminal: about 20 cells at 200 rows, against 2 at 50.
+    ///
+    /// That is a non-head cell rendering as near-white, which is the other half of
+    /// "the gray lines flash white". A drop's head is allowed to be bright; its
+    /// second cell is not.
+    #[test]
+    fn the_back_layer_is_green_rather_than_pale() {
+        for height in [6u16, 24, 50, 100, 200, 400] {
+            let ramp = DigitalRain::build_ramp(height);
+            for pos in 1..12 {
+                let style::Color::Rgb { r, g, b } =
+                    pick_color(&RainDropStyle::Back, pos, 12, &ramp)
+                else {
+                    panic!("the back layer stopped being truecolor");
+                };
+                let luminance =
+                    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+                assert!(
+                    luminance < 0.25,
+                    "at height {height}, back cell {pos} is rgb({r},{g},{b}) at \
+                     luminance {luminance:.2}, which reads as pale rather than as \
+                     a receding layer"
+                );
+                assert!(
+                    g > r && g > b,
+                    "at height {height}, back cell {pos} is rgb({r},{g},{b}), which \
+                     is not green-dominant, so it does not read as part of the \
+                     matrix"
+                );
+            }
+        }
+    }
+
+    /// A bold band has to be the length it says it is.
+    ///
+    /// `HEAD_BOLD_CELLS` is 4 and the range was `0..=HEAD_BOLD_CELLS`, so the band
+    /// was five cells. Neither bold test noticed, because both are written in terms
+    /// of the constant rather than in cells.
+    #[test]
+    fn the_bold_band_is_exactly_as_long_as_it_says() {
+        let bold_cells = (0..20)
+            .filter(|pos| {
+                pick_style(&RainDropStyle::Front, *pos) == style::Attribute::Bold
+            })
+            .count();
+        assert_eq!(
+            bold_cells, HEAD_BOLD_CELLS,
+            "the constant says {HEAD_BOLD_CELLS} and the band is {bold_cells} cells"
+        );
+    }
+
+    /// sRGB channel to relative luminance, per WCAG 2.x.
+    fn linear(channel: u8) -> f64 {
+        let c = f64::from(channel) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
     }
 
     fn style_name(style: &RainDropStyle) -> &'static str {
@@ -423,14 +563,17 @@ mod tests {
     fn an_empty_ramp_reads_as_the_terminal_default_rather_than_panicking() {
         // Reachable: `two_step_color_gradient` returns nothing for a zero
         // length, and a drop is drawn before the effect knows the height.
-        assert_eq!(
-            pick_color(&RainDropStyle::Back, 0, 4, &[]),
-            style::Color::Reset
-        );
-        assert_eq!(
-            pick_color(&RainDropStyle::Back, 999, 4, &[]),
-            style::Color::Reset
-        );
+        // Cell 0 is the head, which is a fixed colour and never consults the
+        // ramp. Every other cell does, and has to fall back rather than index an
+        // empty slice.
+        assert_eq!(pick_color(&RainDropStyle::Back, 0, 4, &[]), head_color());
+        for pos in [1usize, 2, 999] {
+            assert_eq!(
+                pick_color(&RainDropStyle::Back, pos, 4, &[]),
+                style::Color::Reset,
+                "cell {pos} of a back drop with no ramp did not fall back"
+            );
+        }
     }
 
     #[test]

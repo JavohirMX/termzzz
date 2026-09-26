@@ -40,13 +40,25 @@ static CHARACTERS: LazyLock<Vec<char>> =
 ///
 /// `Debug` is here so a failing assertion about a drop's colours can name the
 /// style it was about rather than printing an opaque field number.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RainDropStyle {
     Front,
     Middle,
     Back,
     Fading,
     Gradient,
+}
+
+impl RainDropStyle {
+    /// Every variant, so a test can assert a property of all of them at once
+    /// rather than of whichever one it remembered to list.
+    pub const ALL: &'static [RainDropStyle] = &[
+        RainDropStyle::Front,
+        RainDropStyle::Middle,
+        RainDropStyle::Back,
+        RainDropStyle::Fading,
+        RainDropStyle::Gradient,
+    ];
 }
 
 pub struct RainDrop {

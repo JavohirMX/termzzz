@@ -172,20 +172,21 @@ impl DigitalRain {
     /// only thing making `ramp[pos]` safe, and it stopped holding as soon as
     /// the terminal grew past the height the effect was built at. `update_size`
     /// rebuilds the ramp and `draw::ramp_at` clamps as well.
-    fn build_ramp(height: u16) -> Vec<gradient::Color> {
+    pub(crate) fn build_ramp(height: u16) -> Vec<gradient::Color> {
         let height = height as usize;
         gradient::two_step_color_gradient(
-            gradient::Color {
-                r: 200,
-                g: 200,
-                b: 200,
-            },
-            gradient::Color { r: 0, g: 200, b: 0 },
-            gradient::Color {
-                r: 10,
-                g: 10,
-                b: 10,
-            },
+            // Was `rgb(200, 200, 200)` -- a light grey at 78% luminance, and the
+            // ramp is indexed by *absolute* drop position rather than by a
+            // fraction of the drop. So the pale stretch at the top of every back
+            // drop grew with the terminal: about 20 cells at 200 rows, against 2
+            // at 50. Those are non-head cells rendering as near-white, which is
+            // the other half of "the gray lines flash white".
+            //
+            // The back layer now starts as a dim green and recedes to near-black,
+            // so it reads as distance rather than as brightness.
+            gradient::Color { r: 0, g: 80, b: 0 },
+            gradient::Color { r: 0, g: 110, b: 0 },
+            gradient::Color { r: 0, g: 25, b: 0 },
             height / 2,
             3 * height / 2,
         )
