@@ -82,6 +82,7 @@ impl TerminalEffect for AsciiField {
                 button: _,
             } => self.handle_pointer(*position, *phase),
             InputEvent::Resize { .. } => {}
+            InputEvent::FocusGained | InputEvent::FocusLost => {}
             InputEvent::Quit | InputEvent::Ignored => {}
         }
     }

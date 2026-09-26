@@ -65,17 +65,61 @@ repository and the distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **More effects on the sub-cell renderer.** `starfield` and `flow` want
+1. **`mandelbrot` render cost at large sizes.** 11.8 ms per frame at 400x200,
+   which is over half a 60 Hz budget spent before a single byte is written, and
+   it is the only effect still over `frame_times`'s 2 ms budget at that size
+   (`life` is also over, but only on its `update x4` worst case at high speed).
+   The cost is very close to linear in `max_iterations`, because nearly every
+   interior pixel spends the whole budget discovering it never escapes. Lowering
+   the default is the first thing to try; a region-marking rewrite is where the
+   real win is, and that is a rewrite rather than a tweak
+2. **More effects on the sub-cell renderer.** `starfield` and `flow` want
    braille (line art, one colour per cell); `physarum` and a Gray-Scott
    reaction-diffusion want half-block (smooth colour). Each is roughly 150-350
-   lines now that the renderer exists.
+   lines now that the renderer exists. Note that `cell.bg` only reached the
+   terminal very recently, so half-block work is the first thing to have actually
+   exercised that path
+
+The output path was rebuilt recently and is worth knowing before touching it. It
+does not use crossterm's `PrintStyledContent`, because that emits the attributes
+between the colour and the glyph and then follows every styled glyph with a full
+reset — so a style cache is wrong from the second cell of any run, and
+`Attribute::Reset` erases the colour outright. The encoder is hand-built from
+crossterm's individual commands, `Cell::attr` is read as additive-only, and
+`common.rs` carries a terminal model that the output is replayed through. Seven
+tests there fail against the old encoder. If you add a test for this layer,
+check it fails against the old code too.
+
+`EffectHost` and `Playlist` both accumulate a diff into their own frame buffer
+and wipe a copy, because wiping the diff desynchronises the terminal from the
+effect's canvas. Neither can use `Canvas`: `Canvas::commit` swaps its surfaces,
+which is right for an effect that repaints everything each frame and wrong for
+anything that accumulates a delta. There is more on this in
+`specs/overview.md`.
 
 Effect switching is done: `n` and `p` walk the catalogue behind a diagonal wipe,
-via `EffectHost` and the `FrameTarget` seam in the frame loop. Note the mouse
-decision recorded in `main.rs` -- capture is enabled for the whole session
-because `n` can bring up the ASCII field at any moment.
+via `EffectHost` and the `FrameTarget` seam in the frame loop. A repeat is
+dropped at the key handler, so a held key advances one effect per transition
+rather than strobing. Note the mouse decision recorded in `main.rs` -- capture is
+enabled for the whole session because `n` can bring up the ASCII field at any
+moment.
 
-Two smaller things, both optional:
+Effects also throttle to `[global] idle_fps` while the terminal is unfocused,
+and freeze rather than slow down, so nothing jumps on resume. Two things to know
+before touching it: the rate is clamped away from zero on purpose, because a
+terminal that never reports focus changes would otherwise leave the program
+frozen with no way back; and `InputState` has a *hand-written* `Default` solely
+so `focused` starts `true`. The derive would give `false`, and every test,
+`--check`, and the first frame of a real run would then believe nobody was
+watching.
+
+One trap worth repeating: `--print-config` writes every default to disk, so a
+user with a generated `~/.config/termzzz.toml` pins whatever the defaults were
+when they generated it. That is how the donut's 60x-too-slow rotation speed
+survived a default change in this project -- the new default never reached anyone
+with an existing config.
+
+Three smaller things, all optional:
 
 - `AnyEffect` could become `Box<dyn TerminalEffect>` now that the loop is
   dynamic, deleting the enum and its 96 forwarding arms. It is not free: one
@@ -85,6 +129,10 @@ Two smaller things, both optional:
 - The `run_loop*` wrappers still exist as five signatures over one loop. They
   are each three lines, so they are cheap, but they could collapse to one
   function with a small options struct.
+- `transition` means the whole switch for `EffectHost` and each half for
+  `Playlist`, so one `--transition` flag gives two durations. Both readings are
+  pinned by a test; pick one and reconcile them if the two are ever meant to
+  feel the same.
 
 The `Canvas` work is done: all fifteen effects hold one instead of open-coding
 the double-buffer pattern, and none of them allocates a full-screen `Buffer` per
@@ -92,11 +140,11 @@ frame any more.
 
 The sub-cell renderer is done too, in `src/render/`: `braille` (8x density, one
 colour per cell), `halfblock` (2x vertical, two colours per cell, which is what
-gave `Cell` its background), `dither` and `palette`. Nothing uses it yet — the
-new effects are the point of it. Note the aspect-ratio caveat: both sub-cell
-modes assume a cell about twice as tall as it is wide, and DejaVu Sans Mono is
-nearer 1:1.2, so output looks vertically squashed there. That is a property of
-the technique, not a bug to fix.
+gave `Cell` its background), `dither` and `palette`. Only `halfblock` is in use,
+by `mandelbrot`; `braille` and `dither` have no callers yet. Note the
+aspect-ratio caveat: both sub-cell modes assume a cell about twice as tall as it
+is wide, and DejaVu Sans Mono is nearer 1:1.2, so output looks vertically squashed
+there. That is a property of the technique, not a bug to fix.
 
 Determinism is done: all nine effects that used an unseeded generator now carry a
 `seed` option and a seeded `StdRng`, `--seed <N>` overrides all of them, and
@@ -105,16 +153,19 @@ every effect. Because they became comparable, that suite also found that five of
 them advanced by a fixed step per rendered frame — `maze`, `boids`, `crab`,
 `pipes` and `constellation` ignored the speed keys — which is fixed too.
 
-Not worth doing soon: further performance work. Nothing is dropping frames — the
-worst effect uses about 2% of a 60 fps budget at 200x50. `life`, `plasma`,
-`fire` and `mandelbrot` exceed `frame_times`'s 2 ms budget at 400x200, which is
-an eight-times-heavier terminal than that budget assumes; at 200x50 only
-`mandelbrot` and `plasma` do, and mandelbrot's 2.2 ms is 13% of a 60 fps frame.
-`mandelbrot`'s cost is linear in `max_iterations`, because interior pixels spend
-the whole budget discovering they never escape; the default is 96 and lowering
-it is the first thing to try. Nearly every interior pixel is bounded and pays
-in full, which is where a region-marking rewrite would win, and that is a
-rewrite rather than a tweak.
+Not worth doing soon: further performance work at ordinary sizes. Nothing is
+dropping frames at 200x50 — the worst effect there uses about 10% of a 60 fps
+budget, and `frame_times` now passes its own 2 ms check at that size outright.
+At 400x200, which is an eight-times-heavier terminal than that budget assumes,
+`mandelbrot` and `life` are still over; `life` only on its `update x4` worst case
+at high `--speed`, and `mandelbrot` on render, which is item 1 above.
+
+Two numbers in the frame table went *up* in the recent work, and both are
+correct. `mandelbrot` went from 31 KB to 215 KB of escape sequences per frame at
+400x200, and `matrix` from 63 KB to 67 KB. Each was previously cheap because it
+was broken: the mandelbrot was showing a flat wash with no detail to change, and
+the matrix drop tails were all one saturated colour because a truncating cast
+destroyed the fade. A byte count is only meaningful next to what is on screen.
 
 ## Working Practices
 

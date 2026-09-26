@@ -3,7 +3,6 @@ use crate::runtime::{
     CrosstermInput, FrameContext, InputEvent, InputSource, InputState, Key,
     KeyPhase,
 };
-use crossterm::style::Stylize;
 use crossterm::{QueueableCommand, cursor, style, terminal};
 use std::{
     io::{BufWriter, Result, Write},
@@ -14,6 +13,33 @@ pub const MIN_EFFECT_SIZE: u16 = 6;
 pub const MIN_SPEED: f32 = 0.05;
 pub const MAX_SPEED: f32 = 8.0;
 pub const SPEED_STEP: f32 = 0.1;
+
+/// Bounds on the unfocused frame rate.
+///
+/// Zero would mean "stop drawing", which is the cheapest option and the most
+/// dangerous one: a terminal that never reports a focus change would then leave
+/// the program frozen with no way to wake it. So the slowest it will go is one
+/// frame a second, which is slow enough to cost almost nothing and fast enough
+/// that a missing focus event degrades to a quiet screensaver rather than a hung
+/// one.
+pub const MIN_IDLE_FPS: f32 = 1.0;
+pub const MAX_IDLE_FPS: f32 = 30.0;
+
+/// The most a single frame's delta is allowed to claim.
+///
+/// A stall -- a resize, the terminal doing something expensive, the process
+/// being descheduled -- must not teleport a time-integrating effect forward, so
+/// the delta is clamped. Three frames at 60 Hz: long enough that ordinary jitter
+/// never reaches it, short enough that a hitch is a brief pause rather than a
+/// visible jump. It used to be a hundred milliseconds, which is six frames of
+/// motion delivered in one.
+const MAX_FRAME_DELTA: Duration = Duration::from_millis(50);
+
+/// How long check mode waits for input.
+///
+/// Check mode has no frame loop to pace it, so its poll blocks. The screensaver
+/// loop passes [`Duration::ZERO`] instead -- see the comment there.
+const CHECK_MODE_POLL: Duration = Duration::from_millis(10);
 
 /// The generator every effect draws its randomness from.
 ///
@@ -61,11 +87,21 @@ pub fn normalize_effect_size(size: (u16, u16)) -> (u16, u16) {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RuntimeOptions {
     pub speed: f32,
+    /// Whether to slow down while the terminal window is unfocused.
+    pub pause_when_unfocused: bool,
+    /// Frames per second while unfocused. Clamped by [`MIN_IDLE_FPS`] and
+    /// [`MAX_IDLE_FPS`], because zero means "stop" and a large value means "do
+    /// nothing", and both are worse than the plain reading of the number.
+    pub idle_fps: f32,
 }
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        Self { speed: 1.0 }
+        Self {
+            speed: 1.0,
+            pause_when_unfocused: true,
+            idle_fps: 4.0,
+        }
     }
 }
 
@@ -73,7 +109,19 @@ impl RuntimeOptions {
     pub fn new(speed: f32) -> Self {
         Self {
             speed: speed.clamp(MIN_SPEED, MAX_SPEED),
+            ..Self::default()
         }
+    }
+
+    /// Sets what to do while the terminal is unfocused.
+    pub fn with_focus_policy(
+        mut self,
+        pause_when_unfocused: bool,
+        idle_fps: f32,
+    ) -> Self {
+        self.pause_when_unfocused = pause_when_unfocused;
+        self.idle_fps = idle_fps.clamp(MIN_IDLE_FPS, MAX_IDLE_FPS);
+        self
     }
 }
 
@@ -119,7 +167,13 @@ pub trait FrameTarget {
 
     /// A key the loop would not otherwise act on. Returning true consumes it, so
     /// it does not also reach the effect.
-    fn on_global_key(&mut self, _key: Key) -> bool {
+    ///
+    /// The phase is passed through because "the user is holding `n` down" and
+    /// "the user pressed `n` twice" are indistinguishable without it. A target
+    /// that acts on a keypress -- switching effects, say -- needs to tell them
+    /// apart, because a held key arrives as a stream of repeats and acting on
+    /// each one is what turns a transition into a strobe.
+    fn on_global_key(&mut self, _key: Key, _phase: KeyPhase) -> bool {
         false
     }
 
@@ -183,19 +237,90 @@ pub trait TerminalEffect {
     }
 }
 
+/// The attributes a cell turns *on*, as something comparable.
+///
+/// crossterm's `Attribute::Reset` is SGR 0, which clears the colours as well as
+/// the attributes. A cell tagged `Reset` therefore used to have its colour wiped
+/// between the colour being set and the glyph being drawn, and rendered in
+/// whatever the terminal's default foreground happened to be -- usually white.
+/// The mandelbrot tags *every* cell `Reset`, so the whole effect, including its
+/// black interior, came out white.
+///
+/// [`Cell::attr`] is read here as additive only. An attribute is either turned on
+/// or it is not; `Reset` and `NormalIntensity` both mean "nothing is on". An
+/// attribute change is applied with a full reset followed by the attributes that
+/// should be on, and the colours are restated *after* that, never before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AttributesOn {
+    bold: bool,
+}
+
+impl AttributesOn {
+    fn of(attr: style::Attribute) -> Self {
+        Self {
+            bold: matches!(attr, style::Attribute::Bold),
+        }
+    }
+}
+
+/// The style the encoder believes the terminal is currently in.
+///
+/// Tracked so that a run of identically styled cells costs one escape sequence
+/// rather than one per cell. The previous implementation of this tracked
+/// `(colour, attribute)` and skipped the sequence when they matched, which was
+/// wrong in three separate ways; see [`write_cells`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveStyle {
+    fg: style::Color,
+    bg: style::Color,
+    attributes: AttributesOn,
+}
+
+impl Default for ActiveStyle {
+    /// The state a terminal is in after an SGR reset, which is also the state
+    /// this function leaves it in at the end of every frame.
+    fn default() -> Self {
+        Self {
+            fg: style::Color::Reset,
+            bg: style::Color::Reset,
+            attributes: AttributesOn::default(),
+        }
+    }
+}
+
 /// Writes changed cells to the terminal.
 ///
 /// Cells outside `size` are skipped: a diff is compared against the previous
 /// frame, and an effect that has not yet caught up with a resize can report
 /// coordinates derived from the old dimensions.
 ///
-/// Two things keep the output small. A cursor move is only emitted when the cell
-/// is not the one immediately after the previous one, so a run of cells along a
-/// row costs one move rather than one per cell. And a styled glyph is only
-/// emitted when the style actually changes, so a run of identically coloured
-/// cells costs a bare glyph. Without this, repainting a full screen costs a
-/// cursor move and a colour change per cell, which measured at over a megabyte
-/// of escape sequences per frame for the plasma effect on a 400x200 terminal.
+/// # Why this does not use `PrintStyledContent`
+///
+/// It used to. crossterm's `PrintStyledContent` writes the foreground, then the
+/// attributes, then the glyph, and then -- because `write_cells` always attached
+/// an attribute, which puts a bit in a non-empty set -- a full `ResetColor`. So
+/// every styled glyph was followed by `\x1b[0m`, and the style cache that decided
+/// whether to re-state the colour was wrong from the second cell of every run
+/// onwards. Those cells were emitted as bare glyphs and rendered in the
+/// terminal's *default* foreground, which is white on a dark profile. That is
+/// what "the colours show but not fully and clean, with a lot of white mixed in"
+/// was.
+///
+/// So the escape sequences are built here instead, from crossterm's individual
+/// commands, which keeps crossterm's well-tested colour encoding and lets this
+/// function control what is emitted and when:
+///
+/// * a cursor move only when the cell is not the one immediately after the
+///   previous one, so a run along a row costs one move rather than one per cell;
+/// * a foreground colour only when it differs from the one in effect;
+/// * a background colour only when it differs, which is what makes the
+///   half-block glyph `▀` able to carry two colours per cell at all;
+/// * a reset plus the wanted attributes only when the attributes change.
+///
+/// The tracked style is deliberately forgotten between calls, so a frame can
+/// never inherit a stale idea of what the terminal is set to, and each frame
+/// ends by resetting, so what the terminal is left in matches what the next
+/// frame assumes.
 ///
 /// This is a free function rather than an inline loop so the output path can be
 /// measured and tested without running a whole frame loop.
@@ -209,7 +334,7 @@ pub fn write_cells<W: Write>(
     // Where the terminal cursor sits once everything written so far has been
     // drawn, and the style it is currently in.
     let mut cursor: Option<(u16, u16)> = None;
-    let mut active: Option<(style::Color, style::Attribute)> = None;
+    let mut active: Option<ActiveStyle> = None;
 
     for &(x, y, cell) in cells {
         if x >= max_x || y >= max_y {
@@ -222,16 +347,59 @@ pub fn write_cells<W: Write>(
             out.queue(cursor::MoveTo(column, row))?;
         }
 
-        if active == Some((cell.color, cell.attr)) {
-            out.queue(style::Print(cell.symbol))?;
-        } else {
-            out.queue(style::PrintStyledContent(
-                cell.symbol.with(cell.color).attribute(cell.attr),
-            ))?;
-            active = Some((cell.color, cell.attr));
+        let wanted = ActiveStyle {
+            fg: cell.color,
+            bg: cell.bg,
+            attributes: AttributesOn::of(cell.attr),
+        };
+
+        if active.is_none() {
+            // Establish the baseline rather than assume it. Entering the
+            // alternate screen does not reset SGR, so the terminal may still be
+            // wearing whatever style the shell left it in, and a first cell that
+            // asks for the default colours would otherwise inherit them. Once
+            // per frame, so it costs nothing.
+            out.queue(style::ResetColor)?;
         }
 
+        if active != Some(wanted) {
+            // Start from what is in effect, not from a hardcoded default: the
+            // first cell of a frame may be continuing the terminal's real state
+            // rather than the reset state, and a diff can begin mid-screen.
+            let previous = active.unwrap_or_default();
+
+            if previous.attributes != wanted.attributes {
+                // SGR has no cheap "turn bold off and leave the colour alone",
+                // so an attribute change costs a reset plus the attributes that
+                // should be on. The colours are restated below, after it, which
+                // is the whole point: `Attribute::Reset` used to land *before* the
+                // glyph and erase the colour with it.
+                out.queue(style::ResetColor)?;
+                if wanted.attributes.bold {
+                    out.queue(style::SetAttribute(style::Attribute::Bold))?;
+                }
+            }
+            if previous.fg != wanted.fg {
+                out.queue(style::SetForegroundColor(wanted.fg))?;
+            }
+            if previous.bg != wanted.bg {
+                out.queue(style::SetBackgroundColor(wanted.bg))?;
+            }
+
+            active = Some(wanted);
+        }
+
+        out.queue(style::Print(cell.symbol))?;
+
         cursor = Some((column + 1, row));
+    }
+
+    // Leave the terminal in the state `ActiveStyle::default` describes, so the
+    // next frame's assumption holds and the shell the user returns to is not
+    // left wearing whatever colour the last cell happened to be. Once per frame,
+    // so it costs nothing.
+    if active.is_some() {
+        out.queue(style::ResetColor)?;
     }
 
     Ok(())
@@ -265,6 +433,9 @@ where
 }
 
 /// Polls input once, without drawing. Used by check mode.
+///
+/// Check mode has no frame loop pacing it, so the poll is allowed to block:
+/// without a timeout this would spin rather than wait.
 pub fn process_input<TE>(effect: &mut TE) -> Result<bool>
 where
     TE: TerminalEffect,
@@ -281,6 +452,7 @@ where
         &mut input,
         &mut size,
         &mut speed,
+        CHECK_MODE_POLL,
     )
 }
 
@@ -424,23 +596,60 @@ where
     let mut frames_per_second = 0.0;
     let mut speed = options.speed.clamp(MIN_SPEED, MAX_SPEED);
     let mut tick_clock = TickClock::default();
-    let target_frame_duration = Duration::from_secs_f64(1.0 / 60.0);
+    let active_frame_duration = Duration::from_secs_f64(1.0 / 60.0);
+    let idle_frame_duration = Duration::from_secs_f64(
+        1.0 / f64::from(options.idle_fps.clamp(MIN_IDLE_FPS, MAX_IDLE_FPS)),
+    );
+    // Tracks the previous frame's focus, so the transition into focus can reset
+    // the frame clock. Initialised to `true` because `InputState` starts focused,
+    // and a spurious reset on frame one would cost a single frame of delta.
+    let mut was_focused = true;
+    // When the next frame is due, advanced by a fixed step each time rather than
+    // measured from the end of the last one. Sleeping for "the remainder of the
+    // last frame" cannot repay an oversleep, so the period drifts and the delta
+    // handed to every time-integrating effect jitters with it.
+    let mut next_frame_at = started_at;
     let mut buffered_stdout = BufWriter::new(stdout);
 
     while is_running {
         let frame_started_at = Instant::now();
         let delta = frame_started_at
             .saturating_duration_since(previous_frame)
-            .min(Duration::from_millis(100));
+            .min(MAX_FRAME_DELTA);
         let elapsed = frame_started_at.duration_since(started_at);
         previous_frame = frame_started_at;
         input.begin_frame();
 
+        // Non-blocking. This used to wait up to ten milliseconds for input on
+        // every frame, which is most of a 60 Hz frame budget spent asleep, and
+        // it was inside the measured delta, so effects were being told ten
+        // milliseconds had passed while the program did nothing. Polling without
+        // a timeout costs nothing -- the loop already runs sixty times a second,
+        // so the worst a keystroke now waits is one frame, which is better than
+        // the ten milliseconds plus a frame it used to wait.
         if !process_runtime_events(
-            target, source, &mut input, &mut size, &mut speed,
+            target,
+            source,
+            &mut input,
+            &mut size,
+            &mut speed,
+            Duration::ZERO,
         )? {
             break;
         }
+
+        // Resolved after the poll, because a focus change arrives as an event.
+        let focused = !options.pause_when_unfocused || input.is_focused();
+        if focused && !was_focused {
+            // Coming back. The wall clock ran on without the simulation, and
+            // handing the effect the whole absence as one delta would teleport it
+            // forward -- a visible jump on the first frame after an alt-tab. So
+            // the absence is discarded and the effect carries on from where it
+            // stopped, one frame at a time.
+            previous_frame = frame_started_at;
+            next_frame_at = frame_started_at;
+        }
+        was_focused = focused;
 
         let context = FrameContext::new(size, frame, elapsed, delta, input.clone());
         let mut diff = target.effect().get_diff_with_context(&context);
@@ -451,20 +660,45 @@ where
         write_cells(&mut buffered_stdout, size, &diff)?;
         buffered_stdout.flush()?;
 
-        if (speed - 1.0).abs() < f32::EPSILON {
-            target.effect().update_with_context(&context);
-        } else {
-            let steps = tick_clock.advance(delta, speed);
-            let mut tick_context = context.clone();
-            tick_context.delta = Duration::from_secs_f64(TickClock::QUANTUM as f64);
-            for _ in 0..steps {
-                target.effect().update_with_context(&tick_context);
+        if focused {
+            if (speed - 1.0).abs() < f32::EPSILON {
+                target.effect().update_with_context(&context);
+            } else {
+                let steps = tick_clock.advance(delta, speed);
+                let mut tick_context = context.clone();
+                tick_context.delta =
+                    Duration::from_secs_f64(TickClock::QUANTUM as f64);
+                for _ in 0..steps {
+                    target.effect().update_with_context(&tick_context);
+                }
             }
         }
+        // While unfocused the simulation is frozen rather than fed a coarser
+        // delta. At four frames a second a real delta is 250 ms, which
+        // `MAX_FRAME_DELTA` would clamp to 50, so the effect would run at a fifth
+        // of its speed and *stay* there -- and a playlist would stall rather than
+        // keep time. Freezing also means the accumulated time is simply
+        // discarded on resume instead of being paid out in one lurch.
 
-        let frame_duration = frame_started_at.elapsed();
-        if frame_duration < target_frame_duration {
-            std::thread::sleep(target_frame_duration - frame_duration);
+        // Fixed-cadence pacing. A frame that overruns its slot pushes the next
+        // one out rather than compounding the overshoot, and a frame that
+        // finishes early gives the difference back here instead of losing it.
+        // The step is whichever cadence focus calls for; the accumulator does not
+        // care that it changes.
+        next_frame_at += if focused {
+            active_frame_duration
+        } else {
+            idle_frame_duration
+        };
+        let now = Instant::now();
+        if next_frame_at <= now {
+            // Too far behind to repay. Resynchronise rather than accumulate a
+            // debt the loop would spend the rest of the session trying to
+            // settle, which is what makes a loop like this run flat out after
+            // one stall.
+            next_frame_at = now;
+        } else {
+            std::thread::sleep(next_frame_at - now);
         }
 
         let measured_duration =
@@ -486,12 +720,13 @@ fn process_runtime_events<S, T>(
     input: &mut InputState,
     size: &mut (u16, u16),
     speed: &mut f32,
+    poll_timeout: Duration,
 ) -> Result<bool>
 where
     S: InputSource,
     T: FrameTarget + ?Sized,
 {
-    let events = source.poll(Duration::from_millis(10))?;
+    let events = source.poll(poll_timeout)?;
     if events.iter().any(is_quit_event) {
         return Ok(false);
     }
@@ -525,7 +760,7 @@ where
                     *speed = (*speed - SPEED_STEP).max(MIN_SPEED);
                     continue;
                 }
-                key if target.on_global_key(key) => continue,
+                key if target.on_global_key(key, phase) => continue,
                 _ => {}
             }
         }
@@ -557,18 +792,491 @@ mod tests {
     }
 
     /// Counts cursor moves, which are the CSI sequences ending in `H`.
-    ///
-    /// Counting every escape byte is not useful here: crossterm emits three of
-    /// them per styled glyph (colour, attribute, reset), so the number being
-    /// asserted has to be the cursor moves specifically.
     fn count_moves(out: &str) -> usize {
         out.split("\u{1b}[").filter(|seq| seq.contains('H')).count()
+    }
+
+    /// Counts full SGR resets, which is the number that has to stay small.
+    ///
+    /// An attribute change legitimately costs one, because SGR has no cheap
+    /// "turn bold off and leave the colour alone". A *colour* change must not:
+    /// the encoder sets the new colour directly instead.
+    fn count_resets(out: &str) -> usize {
+        out.matches("\u{1b}[0m").count()
     }
 
     fn encoded(size: (u16, u16), cells: &[(usize, usize, Cell)]) -> String {
         let mut out: Vec<u8> = Vec::new();
         write_cells(&mut out, size, cells).expect("writing to a Vec cannot fail");
         String::from_utf8(out).expect("crossterm emits utf8")
+    }
+
+    /// What one cell of the modelled terminal ended up looking like.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Painted {
+        symbol: char,
+        fg: Color,
+        bg: Color,
+        bold: bool,
+    }
+
+    /// A terminal, modelled well enough to check what the encoder did.
+    ///
+    /// This is deliberately written from the SGR semantics rather than from the
+    /// encoder, so the two can disagree. That is the point: the encoder used to
+    /// believe a style stayed in effect after a styled glyph, and every test that
+    /// only counted glyphs and cursor moves was happy with that, because the
+    /// glyph really was emitted -- in the wrong colour, and no test looked.
+    ///
+    /// It understands the subset of SGR the encoder emits, and panics on anything
+    /// else, so an unexpected escape shows up as a failure rather than as a
+    /// silently ignored one.
+    struct Terminal {
+        width: usize,
+        height: usize,
+        painted: Vec<Painted>,
+        cursor: (usize, usize),
+        fg: Color,
+        bg: Color,
+        bold: bool,
+    }
+
+    impl Terminal {
+        fn new(width: usize, height: usize) -> Self {
+            let blank = Painted {
+                symbol: ' ',
+                fg: Color::Reset,
+                bg: Color::Reset,
+                bold: false,
+            };
+            Self {
+                width,
+                height,
+                painted: vec![blank; width * height],
+                cursor: (0, 0),
+                fg: Color::Reset,
+                bg: Color::Reset,
+                bold: false,
+            }
+        }
+
+        fn replay(&mut self, out: &str) {
+            let mut chars = out.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\u{1b}' {
+                    self.draw(c);
+                    continue;
+                }
+                assert_eq!(chars.next(), Some('['), "expected a CSI sequence");
+                let mut sequence = String::new();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        self.control(&sequence, c);
+                        break;
+                    }
+                    sequence.push(c);
+                }
+            }
+        }
+
+        fn control(&mut self, sequence: &str, final_byte: char) {
+            let parts: Vec<&str> = sequence.split(';').collect();
+            let numbers: Vec<u8> = parts
+                .iter()
+                .map(|part| part.parse::<u8>().unwrap_or(0))
+                .collect();
+
+            match final_byte {
+                // Cursor position, one-based, which is what crossterm emits.
+                'H' => {
+                    let row =
+                        numbers.first().copied().unwrap_or(1).max(1) as usize - 1;
+                    let column =
+                        numbers.get(1).copied().unwrap_or(1).max(1) as usize - 1;
+                    self.cursor = (row, column);
+                }
+                'm' => self.select_graphic_rendition(&numbers),
+                other => panic!("the encoder emitted an unhandled escape: {other}"),
+            }
+        }
+
+        fn select_graphic_rendition(&mut self, numbers: &[u8]) {
+            let mut index = 0;
+            while index < numbers.len() {
+                match numbers[index] {
+                    0 => {
+                        self.fg = Color::Reset;
+                        self.bg = Color::Reset;
+                        self.bold = false;
+                        index += 1;
+                    }
+                    1 => {
+                        self.bold = true;
+                        index += 1;
+                    }
+                    22 => {
+                        self.bold = false;
+                        index += 1;
+                    }
+                    39 => {
+                        self.fg = Color::Reset;
+                        index += 1;
+                    }
+                    49 => {
+                        self.bg = Color::Reset;
+                        index += 1;
+                    }
+                    38 | 48 => {
+                        // crossterm encodes a colour as `38;2;r;g;b` (24-bit) or
+                        // `38;5;n` (256-colour index). Only the 24-bit form is
+                        // expected from the effects, which all use truecolor, so
+                        // anything else is a surprise worth failing on.
+                        let target = numbers[index];
+                        let color = match numbers.get(index + 1).copied() {
+                            Some(2) => Color::Rgb {
+                                r: numbers[index + 2],
+                                g: numbers[index + 3],
+                                b: numbers[index + 4],
+                            },
+                            Some(5) => from_ansi_index(numbers[index + 2]),
+                            other => panic!(
+                                "unexpected colour encoding {other:?} in {numbers:?}"
+                            ),
+                        };
+                        if target == 38 {
+                            self.fg = color;
+                        } else {
+                            self.bg = color;
+                        }
+                        index += if numbers[index + 1] == 2 { 5 } else { 3 };
+                    }
+                    other => panic!("unhandled SGR parameter {other}"),
+                }
+            }
+        }
+
+        fn draw(&mut self, symbol: char) {
+            let (row, column) = self.cursor;
+            if row < self.height && column < self.width {
+                self.painted[row * self.width + column] = Painted {
+                    symbol,
+                    fg: self.fg,
+                    bg: self.bg,
+                    bold: self.bold,
+                };
+            }
+            self.cursor = (row, column + 1);
+        }
+
+        fn at(&self, x: usize, y: usize) -> Painted {
+            self.painted[y * self.width + x]
+        }
+    }
+
+    /// The colour a 256-colour SGR index names, in crossterm's own mapping.
+    ///
+    /// That mapping is not the obvious one -- `Red` is 9 and `DarkRed` is 1 --
+    /// so it is transcribed rather than derived. A model that guessed here
+    /// would agree with a wrong encoder, which is the one thing this must not
+    /// do.
+    fn from_ansi_index(index: u8) -> Color {
+        const TABLE: [Color; 16] = [
+            Color::Black,       // 0
+            Color::DarkRed,     // 1
+            Color::DarkGreen,   // 2
+            Color::DarkYellow,  // 3
+            Color::DarkBlue,    // 4
+            Color::DarkMagenta, // 5
+            Color::DarkCyan,    // 6
+            Color::Grey,        // 7
+            Color::DarkGrey,    // 8
+            Color::Red,         // 9
+            Color::Green,       // 10
+            Color::Yellow,      // 11
+            Color::Blue,        // 12
+            Color::Magenta,     // 13
+            Color::Cyan,        // 14
+            Color::White,       // 15
+        ];
+        TABLE
+            .get(index as usize)
+            .copied()
+            .unwrap_or(Color::AnsiValue(index))
+    }
+
+    /// Replays the encoder's output and returns what the terminal would show.
+    fn painted(size: (u16, u16), cells: &[(usize, usize, Cell)]) -> Terminal {
+        let out = encoded(size, cells);
+        let mut terminal = Terminal::new(size.0 as usize, size.1 as usize);
+        terminal.replay(&out);
+        terminal
+    }
+
+    fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color::Rgb { r, g, b }
+    }
+
+    /// The bug this whole model exists for.
+    ///
+    /// The encoder used to skip the colour whenever it matched the previous
+    /// cell's, on the assumption that the style was still in effect. crossterm
+    /// resets it after every styled glyph, so the second cell onwards of any run
+    /// was drawn in the terminal's default foreground -- white, on a dark
+    /// profile. The glyph was always present, which is why every existing test
+    /// passed.
+    #[test]
+    fn every_cell_of_a_uniform_run_lands_in_its_own_colour() {
+        let run: Vec<(usize, usize, Cell)> = (0..8)
+            .map(|x| {
+                (
+                    x,
+                    0,
+                    Cell::new('#', rgb(200, 30, 30), style::Attribute::Bold),
+                )
+            })
+            .collect();
+
+        let terminal = painted((20, 4), &run);
+
+        for x in 0..8 {
+            let cell = terminal.at(x, 0);
+            assert_eq!(cell.symbol, '#', "cell {x} has no glyph");
+            assert_eq!(
+                cell.fg,
+                rgb(200, 30, 30),
+                "cell {x} was painted {:?}, not the colour it asked for -- the \
+                 style did not survive from the previous cell",
+                cell.fg
+            );
+            assert!(cell.bold, "cell {x} lost its bold");
+        }
+    }
+
+    /// The same, for a run with no attributes at all, which is the shape the
+    /// mandelbrot produces.
+    #[test]
+    fn a_run_of_attribute_reset_cells_keeps_its_colour() {
+        let run: Vec<(usize, usize, Cell)> = (0..8)
+            .map(|x| {
+                (
+                    x,
+                    0,
+                    Cell::new('x', rgb(10, 90, 200), style::Attribute::Reset),
+                )
+            })
+            .collect();
+
+        let terminal = painted((20, 4), &run);
+
+        for x in 0..8 {
+            assert_eq!(
+                terminal.at(x, 0).fg,
+                rgb(10, 90, 200),
+                "cell {x} lost its colour: `Attribute::Reset` is SGR 0, which \
+                 clears the colours too, so it has to be applied before the \
+                 colour rather than instead of it"
+            );
+        }
+    }
+
+    /// `Attribute::Reset` after a bold cell has to turn the bold off *and* leave
+    /// the new colour intact.
+    #[test]
+    fn leaving_bold_does_not_take_the_colour_with_it() {
+        let cells = [
+            (
+                0usize,
+                0usize,
+                Cell::new('a', rgb(1, 2, 3), style::Attribute::Bold),
+            ),
+            (1, 0, Cell::new('b', rgb(4, 5, 6), style::Attribute::Reset)),
+            (2, 0, Cell::new('c', rgb(7, 8, 9), style::Attribute::Reset)),
+        ];
+
+        let terminal = painted((10, 3), &cells);
+
+        assert!(terminal.at(0, 0).bold, "the bold cell lost its bold");
+        assert!(!terminal.at(1, 0).bold, "bold survived into a plain cell");
+        assert_eq!(terminal.at(1, 0).fg, rgb(4, 5, 6));
+        assert_eq!(terminal.at(2, 0).fg, rgb(7, 8, 9));
+    }
+
+    /// The half-block glyph is the only reason `Cell` carries a background, and
+    /// it is how the sub-cell renderers get two colours into one cell.
+    #[test]
+    fn the_background_colour_reaches_the_terminal() {
+        let cells = [
+            (
+                0usize,
+                0usize,
+                Cell::with_bg(
+                    crate::render::halfblock::UPPER,
+                    rgb(255, 0, 0),
+                    rgb(0, 0, 255),
+                    style::Attribute::Reset,
+                ),
+            ),
+            (
+                1,
+                0,
+                Cell::with_bg(
+                    crate::render::halfblock::UPPER,
+                    rgb(255, 0, 0),
+                    rgb(0, 255, 0),
+                    style::Attribute::Reset,
+                ),
+            ),
+            (
+                2,
+                0,
+                Cell::with_bg(
+                    crate::render::halfblock::UPPER,
+                    rgb(255, 0, 0),
+                    rgb(0, 255, 0),
+                    style::Attribute::Reset,
+                ),
+            ),
+        ];
+
+        let terminal = painted((10, 3), &cells);
+
+        assert_eq!(terminal.at(0, 0).fg, rgb(255, 0, 0));
+        assert_eq!(terminal.at(0, 0).bg, rgb(0, 0, 255));
+        // The third cell repeats the second's background exactly, so it catches
+        // an encoder that decides the background has not changed and skips it.
+        assert_eq!(
+            terminal.at(1, 0).bg,
+            rgb(0, 255, 0),
+            "a changed background was dropped"
+        );
+        assert_eq!(terminal.at(2, 0).bg, rgb(0, 255, 0));
+    }
+
+    /// A cell that carries no background must actively clear one that a previous
+    /// cell set, or a half-block field bleeds its bottom colour sideways.
+    #[test]
+    fn a_cell_with_no_background_clears_one_that_was_set() {
+        let cells = [
+            (
+                0usize,
+                0usize,
+                Cell::with_bg(
+                    'a',
+                    rgb(9, 9, 9),
+                    rgb(1, 1, 1),
+                    style::Attribute::Reset,
+                ),
+            ),
+            (1, 0, Cell::new('b', rgb(9, 9, 9), style::Attribute::Reset)),
+        ];
+
+        let terminal = painted((10, 3), &cells);
+
+        assert_eq!(terminal.at(1, 0).bg, Color::Reset, "a background leaked");
+    }
+
+    /// Every kind of cell the crate can produce, in one go, checked against the
+    /// diff that produced it.
+    #[test]
+    fn every_cell_of_a_mixed_frame_lands_exactly_as_specified() {
+        let styles = [
+            style::Attribute::Reset,
+            style::Attribute::Bold,
+            style::Attribute::NormalIntensity,
+        ];
+        let colors = [
+            Color::Reset,
+            Color::Red,
+            Color::White,
+            Color::DarkGreen,
+            rgb(1, 2, 3),
+            rgb(250, 240, 230),
+        ];
+
+        let cells: Vec<(usize, usize, Cell)> = (0..60)
+            .map(|i| {
+                let x = i % 10;
+                let y = i / 10;
+                let attr = styles[i % styles.len()];
+                let color = colors[i % colors.len()];
+                // Every third cell carries a background, so runs of identical
+                // foregrounds are interrupted by background changes and back.
+                let cell = if i % 3 == 0 {
+                    Cell::with_bg(
+                        crate::render::halfblock::UPPER,
+                        color,
+                        colors[(i + 2) % colors.len()],
+                        attr,
+                    )
+                } else {
+                    Cell::new('#', color, attr)
+                };
+                (x, y, cell)
+            })
+            .collect();
+
+        let terminal = painted((10, 6), &cells);
+
+        for (x, y, cell) in &cells {
+            let painted_cell = terminal.at(*x, *y);
+            assert_eq!(painted_cell.symbol, cell.symbol, "glyph at ({x},{y})");
+            assert_eq!(painted_cell.fg, cell.color, "foreground at ({x},{y})");
+            assert_eq!(painted_cell.bg, cell.bg, "background at ({x},{y})");
+            assert_eq!(
+                painted_cell.bold,
+                matches!(cell.attr, style::Attribute::Bold),
+                "bold at ({x},{y})"
+            );
+        }
+    }
+
+    /// Cells the diff does not mention must be left exactly as they were, which
+    /// is the whole premise of diffing.
+    #[test]
+    fn untouched_cells_keep_the_style_they_were_drawn_with() {
+        let first: Vec<(usize, usize, Cell)> = (0..10)
+            .map(|x| (x, 0, Cell::new('#', rgb(3, 4, 5), style::Attribute::Bold)))
+            .collect();
+        let second: Vec<(usize, usize, Cell)> =
+            vec![(4, 0, Cell::new('@', rgb(9, 9, 9), style::Attribute::Bold))];
+
+        let mut out = Vec::new();
+        write_cells(&mut out, (20, 3), &first).expect("vec write");
+        write_cells(&mut out, (20, 3), &second).expect("vec write");
+
+        let mut terminal = Terminal::new(20, 3);
+        terminal.replay(&String::from_utf8(out).expect("utf8"));
+
+        for x in 0..10 {
+            if x == 4 {
+                continue;
+            }
+            assert_eq!(terminal.at(x, 0).symbol, '#', "cell {x} was disturbed");
+            assert_eq!(
+                terminal.at(x, 0).fg,
+                rgb(3, 4, 5),
+                "cell {x} was disturbed"
+            );
+        }
+        assert_eq!(terminal.at(4, 0).symbol, '@');
+        assert_eq!(terminal.at(4, 0).fg, rgb(9, 9, 9));
+    }
+
+    /// The style tracker starts every frame from a clean slate, so a frame can
+    /// never inherit a stale idea of what the terminal is in.
+    #[test]
+    fn each_frame_ends_by_resetting_so_the_next_one_can_assume_it() {
+        let out = encoded((10, 3), &[(0, 0, cell('x'))]);
+        assert!(
+            out.ends_with("\u{1b}[0m"),
+            "the frame did not leave the terminal reset, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_diff_emits_nothing_at_all() {
+        // Not even the trailing reset: there was nothing to reset.
+        assert_eq!(encoded((10, 10), &[]), "");
     }
 
     #[test]
@@ -627,12 +1335,15 @@ mod tests {
         assert_eq!(out.matches('#').count(), 100);
     }
 
+    /// A uniform full-screen repaint should cost one style change and one cursor
+    /// move per row, and one byte per glyph otherwise.
+    ///
+    /// This bound used to be satisfied only because the encoder skipped the
+    /// colour on every cell after the first, which is the bug. It passes now for
+    /// the right reason, and `every_cell_of_a_uniform_run_lands_in_its_own_colour`
+    /// is what pins the correctness the byte count no longer implies.
     #[test]
-    fn a_full_screen_diff_stays_within_budget() {
-        // The output path is the one place that talks to the terminal, so its
-        // volume is worth pinning. A full repaint used to cost a cursor move and
-        // a colour change per cell, which measured at over a megabyte per frame
-        // for a 200x50 screen.
+    fn a_full_screen_diff_of_one_style_stays_within_budget() {
         let cells: Vec<(usize, usize, Cell)> = (0..200 * 50)
             .map(|i| (i % 200, i / 200, cell('#')))
             .collect();
@@ -644,6 +1355,72 @@ mod tests {
             "a full-screen repaint of uniformly styled cells encoded to {} bytes, \
              which is more than the two bytes per glyph it needs",
             out.len()
+        );
+        assert_eq!(
+            count_moves(&out),
+            50,
+            "expected one cursor move per row, got {}",
+            count_moves(&out)
+        );
+    }
+
+    /// Changing only the colour must not cost a reset. A reset clears the
+    /// colours, so a stream that leans on one is a stream paying to set a colour
+    /// it has just cleared.
+    #[test]
+    fn a_colour_change_alone_does_not_cost_a_reset() {
+        let cells: Vec<(usize, usize, Cell)> = (0..10)
+            .map(|x| {
+                (
+                    x,
+                    0,
+                    Cell::new('#', rgb(x as u8, 0, 0), style::Attribute::Reset),
+                )
+            })
+            .collect();
+        let out = encoded((20, 5), &cells);
+
+        // Two: one to establish the baseline at the start of the frame, one to
+        // close it. None at all for the nine colour changes in between.
+        assert_eq!(
+            count_resets(&out),
+            2,
+            "colour changes are paying for an SGR reset each, got {out:?}"
+        );
+    }
+
+    /// The first cell of a frame establishes the style rather than assuming it.
+    ///
+    /// Entering the alternate screen does not reset SGR, so a terminal can still
+    /// be wearing whatever style the shell left it in. A frame whose first cell
+    /// wants the default colours has to say so, or it inherits the shell's.
+    #[test]
+    fn the_first_cell_of_a_frame_does_not_assume_the_terminals_style() {
+        // A cell that wants exactly the reset state, so the only way it can come
+        // out right is if the frame established the baseline itself.
+        let out = encoded(
+            (10, 3),
+            &[(2, 1, Cell::new('x', Color::Reset, style::Attribute::Reset))],
+        );
+
+        let mut terminal = Terminal::new(10, 3);
+        terminal.replay(&out);
+        let painted_cell = terminal.at(2, 1);
+
+        assert_eq!(painted_cell.symbol, 'x');
+        assert_eq!(painted_cell.fg, Color::Reset);
+        assert_eq!(painted_cell.bg, Color::Reset);
+
+        // The reset has to land before the glyph, not merely somewhere in the
+        // frame: a reset after the glyph would leave it in the shell's colour.
+        let reset = out
+            .find("\u{1b}[0m")
+            .expect("the frame emitted no baseline");
+        let glyph = out.find('x').expect("the frame emitted no glyph");
+        assert!(
+            reset < glyph,
+            "the baseline reset came after the glyph, so the glyph was drawn in \
+             whatever style the terminal already had: {out:?}"
         );
     }
 

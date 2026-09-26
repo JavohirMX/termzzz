@@ -47,11 +47,28 @@ fn config_path() -> PathBuf {
 #[serde(default)]
 pub struct GlobalOptions {
     pub speed: f32,
+    /// Whether to slow down when the terminal window does not have focus.
+    ///
+    /// A screensaver nobody is looking at should not be costing a core. It
+    /// throttles rather than stops, deliberately: a terminal that never reports
+    /// a focus change would otherwise leave the program frozen with no way to
+    /// wake it, whereas this degrades to a quietly slow screensaver.
+    pub pause_when_unfocused: bool,
+    /// Frames per second while unfocused, when `pause_when_unfocused` is set.
+    ///
+    /// Not zero. Stopping outright is the cheapest option and the most dangerous
+    /// one, for the reason above. Four is a fifteenth of the work and still
+    /// visibly alive if you alt-tab back and watch for a moment.
+    pub idle_fps: f32,
 }
 
 impl Default for GlobalOptions {
     fn default() -> Self {
-        Self { speed: 1.0 }
+        Self {
+            speed: 1.0,
+            pause_when_unfocused: true,
+            idle_fps: 4.0,
+        }
     }
 }
 

@@ -6,7 +6,6 @@ use crossterm::{
     cursor,
     event::{self, Event},
     execute,
-    style::Stylize,
     terminal::{self, Clear, ClearType},
 };
 use std::io::Write;
@@ -51,16 +50,12 @@ pub fn test_effect<T: TerminalEffect>(
         execute!(session.stdout(), Clear(ClearType::All))?;
         let diff = effect.get_diff_with_context(&context);
 
-        for (x, y, cell) in diff {
-            execute!(
-                session.stdout(),
-                cursor::MoveTo(x as u16, y as u16),
-                crossterm::style::PrintStyledContent(
-                    cell.symbol.with(cell.color).attribute(cell.attr)
-                )
-            )?;
-        }
-
+        // The screensaver loop's encoder, not a second copy of it. This used to
+        // open-code `PrintStyledContent` per cell, which is the encoding that
+        // drops the background colour entirely and resets the style after every
+        // glyph -- so check mode and the real loop showed different colours for
+        // the same frame.
+        crate::common::write_cells(session.stdout(), size, &diff)?;
         execute!(
             session.stdout(),
             cursor::MoveTo(0, 0),

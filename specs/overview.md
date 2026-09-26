@@ -67,14 +67,41 @@ reproduce. Each effect exposes a `seed` option and `--seed` overrides all of the
 at once. `common::seeded_rng` folds a per-effect salt into the seed so two
 effects configured identically do not replay the same sequence.
 
-Output encoding is the one place that talks to the terminal, and it is deliberately
-terse. A cursor move is emitted only when a cell is not the one immediately after
-the previous one, so a run along a row costs one move rather than one per cell. A
-styled glyph is emitted only when the colour or attributes actually change. Without
-this, repainting a full screen costs a cursor move and a colour change per cell,
-which measured at over a megabyte of escape sequences per frame for the plasma
-effect on a 400x200 terminal. The change cut ANSI volume per frame by 18% to 62%
-depending on the effect.
+Output encoding is the one place that talks to the terminal, and it is built from
+crossterm's individual commands rather than from `PrintStyledContent`. That is
+not a style choice. `PrintStyledContent` writes the colours, then the attributes,
+then the glyph, and then a full reset whenever an attribute is attached -- which
+it always is, because attaching one puts a bit in a non-empty set. So every
+styled glyph was followed by `\x1b[0m`, and any attempt to skip re-stating the
+style for a run of identically styled cells was wrong from the second cell
+onwards: those cells were emitted as bare glyphs and painted in the terminal's
+default foreground, which is white on a dark profile. `Attribute::Reset` was
+worse, because it is SGR 0 and so cleared the colour that had just been set,
+before the glyph was drawn -- and the mandelbrot tags every cell `Reset`, so it
+came out entirely white.
+
+So the encoder tracks `(foreground, background, attributes)` itself and emits a
+cursor move only on a position break, a colour only when it differs, and a reset
+only when the attributes change -- with the colours restated after that reset,
+never before. The tracked style is forgotten between frames, and each frame ends
+by resetting, so what the terminal is left in matches what the next frame assumes.
+`Cell::attr` is read as additive only: `Reset` and `NormalIntensity` both mean
+"nothing is turned on". The background is on the wire, which is what lets the
+half-block glyph carry two colours in one cell.
+
+The tests in `common.rs` include a small terminal model, written from the SGR
+semantics rather than from the encoder, and the output is replayed through it.
+That is the only kind of test that could have caught the above. The old suite
+counted glyphs and cursor moves, and the broken encoder really was emitting every
+glyph -- just in the wrong colour, which no count can see.
+
+Two cells of one style now cost one style change rather than one per cell, and a
+colour change costs one colour sequence and no reset. Measured at 400x200, that
+plus the effect-side palette work took plasma from 824 KB to 483 KB per frame and
+fire from 153 KB to 106 KB. Two effects went the other way -- mandelbrot from
+31 KB to 215 KB, and matrix from 63 KB to 67 KB -- because they were previously
+cheap by being broken: the mandelbrot was showing a flat wash with no detail to
+change, and the matrix drop tails were all one saturated colour.
 
 `Buffer::diff` derives cell coordinates from the frame being produced, not from the
 previous frame. Deriving them from the previous one meant that a buffer left over
@@ -91,6 +118,33 @@ summed. That value indexes a narrow ASCII glyph ramp through a bounded palette, 
 the pointer injects energy that decays over time. The renderer has no media
 dependencies and only depends on the existing `Buffer`/`Cell` model.
 
+## Focus
+
+The loop asks the terminal for focus events (`EnableFocusChange` on enter,
+`DisableFocusChange` on restore) because focus reporting is off by default, and
+without it there is no way to know whether anyone is watching. The events used to
+be folded into `InputEvent::Ignored` and discarded.
+
+Focus is latched in `InputState` rather than read per frame. A window stays
+focused across every frame in which no focus event arrives, so a per-frame
+reading would be wrong almost always. `InputState` has a hand-written `Default`
+because the derive would give `focused` the value `false`, and a screensaver
+that believes nobody is watching throttles itself.
+
+While unfocused the loop drops to `idle_fps` and **freezes the simulation**
+rather than feeding it a coarser delta. At four frames a second a real delta is
+250 ms, which the frame-delta clamp would cut to 50, so the effect would run at a
+fifth of its speed and stay there, and a playlist would stall rather than keep
+time. Freezing also means the elapsed time is simply discarded: on regaining
+focus the loop resets its frame clock, so the first frame back carries one frame
+of delta instead of the whole absence. That is what stops the effect jumping.
+
+Throttling rather than stopping is deliberate. A terminal that never reports a
+focus change would, under a hard pause, leave the program frozen with no way to
+wake it. Throttled, the same failure degrades to a quiet screensaver. The rate is
+therefore clamped to `MIN_IDLE_FPS..=MAX_IDLE_FPS`, and a config of `0` does not
+mean "stop".
+
 ## Terminal Safety
 
 `session::TerminalSession` owns raw mode, the alternate screen, cursor visibility
@@ -105,9 +159,71 @@ prompt to return to.
 
 `RuntimeOptions` carries a global speed multiplier clamped to `MIN_SPEED..=MAX_SPEED`. At `1.0` each effect updates once per frame with its real frame delta. Below `1.0`, `TickClock` accumulates scaled time and only runs whole 1/60s simulation quanta, so effects slow down instead of jittering. The multiplier comes from `[global] speed` or `--speed`, and `+`/`-` adjust it live. Per-effect defaults are tuned for calmer motion.
 
+## Frame Pacing
+
+The loop holds a fixed cadence. Each frame is scheduled at `started_at + n *
+1/60s` and sleeps until that deadline, rather than sleeping for "whatever is left
+of the last frame". The second form cannot repay an oversleep -- the overshoot is
+measured, discarded, and the next frame sleeps its own remainder on top of it --
+so a frame that consistently overran its slot drifted further and further from the
+cadence, and the delta every time-integrating effect was handed drifted with it.
+Falling more than a frame behind resynchronises rather than accumulating a debt,
+because a loop that tries to settle a debt it can never repay runs flat out for
+the rest of the session.
+
+Input is polled without a timeout. It used to ask for up to ten milliseconds on
+every frame, which is most of a 60 Hz budget spent asleep, and because the block
+sat inside the measured frame the delta handed to the effect claimed ten
+milliseconds had passed while the program did nothing at all. The cost of that
+was not latency -- the loop already runs sixty times a second, so a keystroke
+waited at most one frame plus ten milliseconds -- but that a heavy effect could
+not fit in what was left of the frame. A non-blocking poll cannot miss anything:
+events that arrive during the sleep sit in the terminal's queue and the next poll
+drains them.
+
+`delta` is clamped to `MAX_FRAME_DELTA` so a stall does not teleport a
+time-integrating effect forward. It used to be a hundred milliseconds, which is
+six frames of motion delivered in one.
+
 ## Playlist
 
 `Playlist` owns an ordered list of `Slot` values built from config or `--playlist`, plus a `AnyEffect` for the active entry. It accumulates the active effect's diff into a full-screen buffer, then compares that against the previously shown frame. Between effects a diagonal blank wipe masks the frame in two phases (`WipeOut` then `WipeIn`), which keeps transitions independent of what each effect draws. Sequential mode steps through the list; shuffle mode draws from a reshuffling bag so every effect runs once per round.
+
+## Accumulating a diff versus wiping one
+
+`EffectHost` and `Playlist` both wrap a running effect, and both need to apply a
+transition to the *finished frame* rather than to the effect's diff. Neither can
+use `Canvas` for this, for two reasons.
+
+The first is that wiping a diff is wrong. The effect has already committed the
+un-wiped frame to its own `Canvas`, so blanking cells in the diff leaves the
+terminal holding cells the effect believes are painted. Those cells are not in the
+next frame's diff, so they are never re-sent, and the screen stays half-stale.
+The incoming effect is worse: its first frame is a full repaint against a fresh
+canvas, the wipe blanks all of it, and the new canvas's baseline then records it
+as already on screen. So: accumulate the delta into a frame buffer, wipe a
+*copy*, and commit that. The unwiped frame underneath survives, so the wipe can
+be taken back rather than baked in permanently.
+
+The second is that `Canvas::commit` swaps its two surfaces, so what it hands back
+to draw on next is the frame from *before* the one it just emitted. That is
+correct for an effect that repaints its whole surface every frame, and wrong for
+anything that accumulates a diff, which is both of these. Built on `Canvas`, the
+playlist flickered sixty times a second, alternating between a frame and a nearly
+empty one. Both now hold two full-screen buffers and choose explicitly which one
+to draw on next.
+
+The transition is two phases, `WipeOut` then `WipeIn`, and the effect is rebuilt
+the moment the wipe-out half completes rather than in a separate `Swap` phase. A
+`Swap` phase reported "no wipe" for one frame, and because the rebuild happened
+after that frame's cells were produced, that frame was a full-brightness unwiped
+frame of the *outgoing* effect -- one full-screen flash per switch, immediately
+followed by a blank one.
+
+`transition` means the whole switch for `EffectHost` and each half for
+`Playlist`, so one `--transition` flag gives two different durations. Both choices
+are deliberate and each is pinned by a test, but it is a real divergence and the
+first thing to reconcile if the two are ever meant to feel identical.
 
 ## Build Configuration
 
@@ -142,6 +258,27 @@ Every assertion in it derives its expectations from `EffectId::all()` and
 That last group exists because six real bugs were found by writing these tests
 rather than by reading the code, including a panic on every terminal resize and a
 config trap that silently zeroed thirteen of fifteen sections.
+
+### Testing the output path
+
+Counting glyphs and cursor moves is not enough to test an encoder, and finding
+that out cost a colour bug that every test in the suite was happy with. The
+encoder was emitting every glyph it should have -- in the terminal's default
+foreground, because the style it had been tracking was reset after each one. A
+count cannot see that.
+
+So `common.rs` carries a small terminal model, written from the SGR semantics
+rather than from the encoder, and the encoded output is replayed through it and
+compared against the diff that produced it. Seven of those tests fail against the
+old encoder and pass against the new one. The same rule -- assert the observable
+result, not a proxy for it -- is why the frame-cost assertions check the
+accumulated terminal state rather than the shape of the transition, and why the
+palette tests check monotonic brightness rather than specific constants.
+
+A test that only passes with the fix is worth more than one that passes either
+way, and the check that a new test has that property is to run it against the old
+code. That is cheap here: the encoder and its model are self-contained enough to
+lift into a scratch crate and revert, which is how the seven were confirmed.
 
 ## Development Workflow
 

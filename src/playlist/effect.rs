@@ -1,5 +1,4 @@
-use crate::buffer::Cell;
-use crate::canvas::Canvas;
+use crate::buffer::{Buffer, Cell};
 use crate::common::TerminalEffect;
 use crate::config::Config;
 use crate::registry::{AnyEffect, EffectId};
@@ -68,7 +67,28 @@ pub struct Playlist {
     phase: Phase,
     phase_progress: f32,
     current: AnyEffect,
-    canvas: Canvas,
+    /// The frame being built: the frame the terminal is showing plus every
+    /// change the running effect has reported since.
+    ///
+    /// This was a `Canvas`, which is built for an effect that redraws its whole
+    /// surface every frame. `Canvas::commit` swaps its two surfaces, so what it
+    /// hands back to draw on next is the frame from *before* the one it just
+    /// emitted -- one commit too old to accumulate a diff onto. A playlist
+    /// accumulates diffs, so every cell the effect did not redraw was reported
+    /// as going blank and then redrawn on the frame after: the screen flickered
+    /// between the frame and a mostly empty one, sixty times a second.
+    frame: Buffer,
+    /// The frame the terminal is showing. The diff is against this, and it is
+    /// what lets a wipe blank a cell the effect did not redraw this frame: the
+    /// cell is on the screen whether or not it is in the diff.
+    shown: Buffer,
+    /// A wiped copy of `frame`, allocated only while a transition is running.
+    ///
+    /// The wipe goes on this rather than on `frame` so the undimmed frame
+    /// survives underneath and the wipe can be taken back as the front retreats,
+    /// instead of being baked in permanently. `clone_from` reuses the
+    /// allocation, so a transition frame costs no memory after the first.
+    wiped: Option<Buffer>,
 }
 
 impl TerminalEffect for Playlist {
@@ -130,6 +150,7 @@ impl Playlist {
         let order = (0..slots.len()).collect();
         let position = 0;
         let current = AnyEffect::build(slots[position].id, &config, screen_size);
+        let (width, height) = (screen_size.0 as usize, screen_size.1 as usize);
         let mut playlist = Self {
             config,
             screen_size,
@@ -142,12 +163,9 @@ impl Playlist {
             phase: Phase::Running,
             phase_progress: 0.0,
             current,
-            canvas: {
-                let mut canvas = Canvas::new(screen_size.0, screen_size.1);
-                canvas.clear_with(&blank_cell());
-                canvas.establish_baseline();
-                canvas
-            },
+            frame: Buffer::new(width, height),
+            shown: Buffer::new(width, height),
+            wiped: None,
         };
         playlist.rebuild_buffers();
         playlist
@@ -193,12 +211,36 @@ impl Playlist {
         self.options.transition.max(0.01)
     }
 
+    /// Resizes both frames, and starts a new effect from a blank screen.
+    ///
+    /// Only the frame being built is blanked. `shown` is the record of what the
+    /// terminal is showing, so blanking it would be a lie the next diff cannot
+    /// correct: the last frame of a wipe-out is a fraction short of blank, and
+    /// declaring it blank meant the leftover was never erased. What the terminal
+    /// really shows is the next diff's business, and it erases it.
+    ///
+    /// It used to blank the surface and then establish the baseline, which is a
+    /// commit, which swaps the two -- so the blank became the baseline and the
+    /// surface being drawn into kept the outgoing effect's frame. Every swap
+    /// then re-emitted that frame, and an effect whose diff is always empty,
+    /// like `blank` or `terrain`, repainted the previous effect's image
+    /// underneath itself for its whole slot.
     fn rebuild_buffers(&mut self) {
-        self.canvas.resize(self.screen_size.0, self.screen_size.1);
+        let (width, height) =
+            (self.screen_size.0 as usize, self.screen_size.1 as usize);
+        if (self.frame.width, self.frame.height) != (width, height) {
+            // Neither frame describes dimensions that no longer exist, and a
+            // resize is a full repaint, so neither can be trusted. The terminal
+            // is in an unknown state too, which is the one case where `shown`
+            // does get blanked.
+            self.frame = Buffer::new(width, height);
+            self.shown = Buffer::new(width, height);
+            self.wiped = None;
+            return;
+        }
         // This effect's blank is `Color::Reset`, not the `Cell::default()` black
-        // the canvas clears to, so it is filled explicitly on both counts.
-        self.canvas.clear_with(&blank_cell());
-        self.canvas.establish_baseline();
+        // a buffer clears to, so it is filled explicitly.
+        self.frame.fill_with(&blank_cell());
     }
 
     /// Wipes the effect away, swaps it, then wipes the next one in.
@@ -230,6 +272,10 @@ impl Playlist {
                 if self.phase_progress >= 1.0 {
                     self.phase = Phase::Running;
                     self.phase_progress = 0.0;
+                    // The transition is over, so the copy the wipe was using can
+                    // go. A playlist holds this between transitions rather than
+                    // for the whole session.
+                    self.wiped = None;
                 }
             }
         }
@@ -280,19 +326,21 @@ impl Playlist {
         &mut self,
         delta: Vec<(usize, usize, Cell)>,
     ) -> Vec<(usize, usize, Cell)> {
-        let width = self.canvas.width();
-        let height = self.canvas.height();
-        if (self.canvas.width(), self.canvas.height())
-            != (self.screen_size.0 as usize, self.screen_size.1 as usize)
-        {
+        let (width, height) =
+            (self.screen_size.0 as usize, self.screen_size.1 as usize);
+        if (self.frame.width, self.frame.height) != (width, height) {
             self.rebuild_buffers();
         }
 
-        // The canvas accumulates: each effect's diff lands on top of the frame
-        // it is building, which is what lets an effect that draws nothing this
-        // frame keep the one before it.
+        // The frame accumulates: each effect's diff lands on top of the frame it
+        // is building, which is what lets an effect that draws nothing this
+        // frame keep the one before it. `Buffer::set` only debug-asserts its
+        // bounds, so a coordinate from outside the screen is dropped rather than
+        // written past the end.
         for (x, y, cell) in delta {
-            self.canvas.set(x, y, cell);
+            if x < width && y < height {
+                self.frame.set(x, y, cell);
+            }
         }
 
         let wipe = match self.phase {
@@ -300,15 +348,24 @@ impl Playlist {
             Phase::WipeOut => self.phase_progress,
             Phase::WipeIn => 1.0 - self.phase_progress,
         };
-        if wipe > 0.0 {
+        let outgoing = if wipe > 0.0 {
             // Wiped on a copy, so the undimmed frame underneath survives and the
-            // wipe can be taken back rather than being baked in permanently.
-            let mut target = self.canvas.surface().clone();
-            crate::render::wipe::apply(&mut target, width, height, wipe);
-            self.canvas.replace_surface(target);
-        }
+            // wipe can be taken back rather than being baked in permanently --
+            // which is also what lets the wipe-in reveal an effect that has
+            // nothing new to draw.
+            let wiped = self.wiped.get_or_insert_with(|| self.frame.clone());
+            wiped.clone_from(&self.frame);
+            crate::render::wipe::apply(wiped, width, height, wipe);
+            wiped
+        } else {
+            &self.frame
+        };
 
-        self.canvas.commit()
+        let cells = self.shown.diff(outgoing);
+        for (x, y, cell) in &cells {
+            self.shown.set(*x, *y, *cell);
+        }
+        cells
     }
 }
 
@@ -345,6 +402,36 @@ mod tests {
             style::Attribute::Reset,
         ));
         buffer
+    }
+
+    /// One frame of the real loop: the effect is advanced, then asked for its
+    /// diff, and the result lands on `screen`.
+    fn tick(
+        playlist: &mut Playlist,
+        frame: u64,
+        screen: &mut Buffer,
+    ) -> Vec<(usize, usize, Cell)> {
+        let context = FrameContext::new(
+            (40, 12),
+            frame,
+            Duration::ZERO,
+            Duration::from_secs_f64(1.0 / 60.0),
+            InputState::default(),
+        );
+        playlist.update_with_context(&context);
+        let cells = playlist.get_diff_with_context(&context);
+        for (x, y, cell) in &cells {
+            screen.set(*x, *y, *cell);
+        }
+        cells
+    }
+
+    /// How much of the screen is showing something other than a space.
+    fn lit(buffer: &Buffer) -> usize {
+        (0..buffer.height)
+            .flat_map(|y| (0..buffer.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer.get(*x, *y).symbol != ' ')
+            .count()
     }
 
     #[test]
@@ -547,7 +634,61 @@ mod tests {
         playlist.update_size(20, 8);
 
         assert_eq!(playlist.screen_size, (20, 8));
-        assert_eq!(playlist.canvas.size(), (20, 8));
+        assert_eq!(playlist.frame.get_size(), (20, 8));
+        assert_eq!(playlist.shown.get_size(), (20, 8));
+    }
+
+    /// The accumulated frame is the frame, not a frame behind it.
+    ///
+    /// The playlist accumulates the running effect's *diff*, so the base it
+    /// accumulates onto has to be the frame the terminal is showing. It was a
+    /// `Canvas`, whose commit swaps its two surfaces and so hands back the frame
+    /// from before the one it just emitted -- one commit too old. Every cell the
+    /// effect did not redraw that frame was therefore reported as going blank
+    /// and redrawn on the frame after, and the screen flickered between the
+    /// frame and an almost empty one, sixty times a second. The bare effect
+    /// emits about fifteen times as many cells as this did.
+    #[test]
+    fn the_accumulated_frame_keeps_up_with_the_terminal() {
+        let mut playlist = playlist_with(&[("life", Some(20.0))], 0.6, false);
+        let mut screen = Buffer::new(40, 12);
+
+        // What a bare effect draws in the same number of frames, for scale.
+        let mut bare =
+            AnyEffect::build(EffectId::Life, &Config::default(), (40, 12));
+        let mut bare_screen = Buffer::new(40, 12);
+        let context = FrameContext::new(
+            (40, 12),
+            0,
+            Duration::ZERO,
+            Duration::from_secs_f64(1.0 / 60.0),
+            InputState::default(),
+        );
+        let mut bare_cells = 0;
+        for _ in 0..60 {
+            bare.update_with_context(&context);
+            let diff = bare.get_diff_with_context(&context);
+            bare_cells += diff.len();
+            for (x, y, cell) in &diff {
+                bare_screen.set(*x, *y, *cell);
+            }
+        }
+
+        let mut cells = 0;
+        let mut frame = 0;
+        while frame < 60 {
+            cells += tick(&mut playlist, frame, &mut screen).len();
+            frame += 1;
+        }
+
+        assert!(
+            cells * 4 > bare_cells,
+            "the playlist emitted {cells} cells where the effect on its own \
+             emits {bare_cells}, so it is not keeping up with the screen"
+        );
+        // And the two agree about what the screen looks like, which is the part
+        // that actually matters: the playlist is not losing the frame.
+        assert_eq!(screen.buffer, bare_screen.buffer);
     }
 
     #[test]
@@ -565,5 +706,106 @@ mod tests {
         });
 
         assert!(is_paused(&mut playlist));
+    }
+
+    /// A static effect is still revealed by the wipe.
+    ///
+    /// `terrain` draws one frame and then reports nothing at all for the rest of
+    /// its slot, so the wipe-in has to reveal the frame it already has rather
+    /// than wait for changes that never come. That only works if the
+    /// accumulation survives the wipe, which is what applying the wipe to a copy
+    /// is for -- and it did not: the wipe was baked into the surface the next
+    /// frame accumulated onto, so the static effect's one and only frame was
+    /// destroyed by the first frame of its own wipe-in and the slot was blank.
+    #[test]
+    fn a_static_effect_is_revealed_by_the_wipe_in() {
+        let mut playlist = playlist_with(
+            &[("dvd", Some(0.05)), ("terrain", Some(5.0))],
+            0.6,
+            false,
+        );
+        let mut screen = Buffer::new(40, 12);
+        let mut frame = 0;
+
+        while playlist.current_id() != EffectId::Terrain {
+            tick(&mut playlist, frame, &mut screen);
+            frame += 1;
+            assert!(frame < 1000, "the playlist never reached the second slot");
+        }
+
+        // From the swap onwards, the most the screen ever holds. Terrain fills
+        // most of the screen, so a slot that shows less than a third of it never
+        // revealed the effect.
+        let mut fullest = 0;
+        for _ in 0..200 {
+            tick(&mut playlist, frame, &mut screen);
+            fullest = fullest.max(lit(&screen));
+            frame += 1;
+        }
+
+        assert!(
+            fullest > 40 * 12 / 3,
+            "a static effect's frame was never revealed: the screen held at \
+             most {fullest} of {} cells",
+            40 * 12
+        );
+    }
+
+    /// A rebuilt playlist starts from a blank screen, not from the frame the
+    /// outgoing effect was leaving.
+    ///
+    /// `rebuild_buffers` blanked the surface and established the baseline, and
+    /// establishing a baseline is a commit, and a commit swaps the canvas's two
+    /// surfaces -- so the frame on screen became the blank while the surface
+    /// being drawn into kept the outgoing effect. `render_full_frame` then
+    /// accumulated onto that, so every swap re-emitted the outgoing frame, and
+    /// an effect whose diff is always empty painted the previous effect's image
+    /// underneath itself for its whole slot. `blank` is that effect.
+    #[test]
+    fn a_rebuilt_effect_does_not_re_emit_the_outgoing_frame() {
+        let mut playlist =
+            playlist_with(&[("dvd", Some(0.05)), ("blank", Some(5.0))], 0.6, false);
+        let mut screen = Buffer::new(40, 12);
+
+        // Run the first slot out and the wipe through into the second, keeping
+        // the most the screen ever had on it: by the time the swap lands the
+        // screen is blank again, which is the point.
+        let mut frame = 0;
+        let mut fullest = 0;
+        while playlist.current_id() != EffectId::Blank {
+            tick(&mut playlist, frame, &mut screen);
+            frame += 1;
+            fullest = fullest.max(lit(&screen));
+            assert!(frame < 1000, "the playlist never reached the second slot");
+        }
+        assert!(fullest > 0, "nothing was ever drawn to carry over");
+
+        // The surface the new effect's frame is built on is blank. The effect's
+        // first frame covers every cell it draws and nothing at all for the
+        // cells it leaves blank, so an accumulation still holding the outgoing
+        // effect shows it through underneath for the whole slot.
+        assert_eq!(
+            lit(&playlist.frame),
+            0,
+            "the outgoing effect is still in the frame the new effect builds on"
+        );
+
+        // And from here the playlist is showing `blank`, which draws nothing at
+        // all, so everything it reports has to be blank.
+        for _ in 0..120 {
+            for (x, y, cell) in tick(&mut playlist, frame, &mut screen) {
+                assert_eq!(
+                    cell.symbol, ' ',
+                    "the outgoing effect's frame was re-emitted at ({x},{y})"
+                );
+            }
+            frame += 1;
+        }
+
+        assert_eq!(
+            lit(&screen),
+            0,
+            "the previous effect stayed on screen through the whole slot"
+        );
     }
 }

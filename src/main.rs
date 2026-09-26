@@ -50,6 +50,13 @@ fn main() -> Result<(), error::TermzzzError> {
         .unwrap_or(config.global.speed)
         .clamp(common::MIN_SPEED, common::MAX_SPEED);
 
+    // Both entry points below share this, so the focus policy is decided once and
+    // cannot drift between running a single effect and running a playlist.
+    let runtime_options = common::RuntimeOptions::new(speed).with_focus_policy(
+        config.global.pause_when_unfocused,
+        config.global.idle_fps,
+    );
+
     if args.check {
         let effect = check_effect(&args);
         let frames = args.frames.unwrap_or(1);
@@ -100,7 +107,7 @@ fn main() -> Result<(), error::TermzzzError> {
                 session.stdout(),
                 &mut effect,
                 None,
-                common::RuntimeOptions::new(speed),
+                runtime_options,
             )?
         };
 
@@ -126,6 +133,17 @@ fn main() -> Result<(), error::TermzzzError> {
         let (width, height) = common::normalize_effect_size(terminal::size()?);
         let mut host = EffectHost::new(effect_id, config.clone(), (width, height));
 
+        // `--transition` used to reach the playlist and nothing else, so the wipe
+        // behind `n` and `p` was always the host's own default no matter what
+        // was asked for. The playlist still spends its number on each half of a
+        // transition; the host spends it on the whole switch, so the two differ
+        // by a factor of two on the same flag. That is a deliberate choice in
+        // each direction -- see `EffectHost::set_transition` -- but it is worth
+        // knowing about before someone reads the flag as meaning one thing.
+        if let Some(transition) = args.transition {
+            host.set_transition(transition);
+        }
+
         // Mouse capture is enabled for the whole session, not just the effect
         // that happens to be running: `n` can bring up the ASCII field at any
         // moment, and toggling capture mid-session would leave the terminal
@@ -140,7 +158,7 @@ fn main() -> Result<(), error::TermzzzError> {
             session.stdout(),
             &mut host,
             None,
-            common::RuntimeOptions::new(speed),
+            runtime_options,
         )?
     };
 

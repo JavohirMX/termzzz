@@ -48,6 +48,33 @@ const CARVE_STEP: f32 = 1.0 / 60.0;
 /// Upper bound on cells carved in one frame, so a stall cannot be paid off in
 /// a single visible jump.
 const MAX_CARVE_STEPS_PER_FRAME: usize = 8;
+/// Wall cells re-textured per frame, so the walls are not a still image.
+const WALLS_MOTTLED_PER_FRAME: usize = 3;
+
+/// The carved path's colour.
+///
+/// Was `style::Color::White`, which is invisible on a light terminal profile --
+/// a white logo on a white background -- for the one part of the effect the
+/// eye is meant to follow.
+///
+/// Magenta instead, and that is a contrast calculation rather than a preference.
+/// The walls are drawn with red and blue both below 120 and green up to 255, so
+/// they are green-dominant colours of low-to-medium luminance. Magenta has no
+/// green in it and a red above any wall can have, so it separates from them by
+/// hue on a dark profile and by luminance on a light one:
+///
+/// * relative luminance 0.19, which is 4.3:1 against white and 4.8:1 against
+///   black -- both comfortably over the 3:1 that WCAG asks of a graphical
+///   object, which is what a wall of `█` is.
+///
+/// The walls themselves are `Attribute::Bold`, which many terminals render by
+/// brightening, so the path deliberately is not: it should be the one part of
+/// the frame whose brightness is exactly what was asked for.
+const PATH_COLOR: style::Color = style::Color::Rgb {
+    r: 220,
+    g: 0,
+    b: 200,
+};
 
 pub struct Maze {
     pub screen_size: (u16, u16),
@@ -72,27 +99,6 @@ impl TerminalEffect for Maze {
             self.reset();
             return Vec::new();
         }
-        let mut modified_cells = HashSet::new();
-        // Randomly change 5 distinct cells
-        while modified_cells.len() < 3 {
-            let x = self.rng.random_range(0..self.canvas.width());
-            let y = self.rng.random_range(0..self.canvas.height());
-
-            if modified_cells.insert((x, y)) {
-                let random_char =
-                    CHARACTERS[self.rng.random_range(0..CHARACTERS.len())];
-                let random_color = style::Color::Rgb {
-                    r: self.rng.random_range(0..200) as u8,
-                    g: self.rng.random_range(0..256) as u8,
-                    b: self.rng.random_range(0..200) as u8,
-                };
-                self.initial_walls.set(
-                    x,
-                    y,
-                    Cell::new(random_char, random_color, style::Attribute::Bold),
-                );
-            }
-        }
 
         // The frame is the wall template with the carved path painted over it.
         // Blitting the template replaces cloning it every frame.
@@ -101,7 +107,7 @@ impl TerminalEffect for Maze {
             self.canvas.set(
                 *x,
                 *y,
-                Cell::new('█', style::Color::White, style::Attribute::Reset),
+                Cell::new('█', PATH_COLOR, style::Attribute::Reset),
             )
         }
 
@@ -109,13 +115,13 @@ impl TerminalEffect for Maze {
     }
 
     fn update(&mut self) {
-        self.carve(1.0 / 60.0);
+        self.advance(1.0 / 60.0);
     }
 
     fn update_with_context(&mut self, context: &crate::runtime::FrameContext) {
         // Capped so a stall does not finish the whole maze in one frame, which
         // would be a single visible jump rather than an animation.
-        self.carve(context.delta.as_secs_f64().min(0.1) as f32);
+        self.advance(context.delta.as_secs_f64().min(0.1) as f32);
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -144,6 +150,49 @@ impl TerminalEffect for Maze {
 }
 
 impl Maze {
+    /// One simulation step: the walls move, and the maze is carved a little
+    /// further.
+    ///
+    /// Both live here so the draw stays a pure function of the simulation. The
+    /// wall mottling used to run inside `get_diff`, which made the wall texture a
+    /// function of how many frames had been drawn rather than of elapsed time: a
+    /// terminal refreshing at 144 Hz re-textured its walls at twice the rate of
+    /// one at 72 Hz, and the effect consumed generator draws at the refresh rate
+    /// rather than the simulation rate.
+    fn advance(&mut self, seconds: f32) {
+        self.mottle();
+        self.carve(seconds);
+    }
+
+    /// Re-textures a few random wall cells, so the brickwork is not a still
+    /// image behind the carve.
+    fn mottle(&mut self) {
+        if self.maze_complete {
+            return;
+        }
+
+        let mut modified_cells = HashSet::new();
+        while modified_cells.len() < WALLS_MOTTLED_PER_FRAME {
+            let x = self.rng.random_range(0..self.canvas.width());
+            let y = self.rng.random_range(0..self.canvas.height());
+
+            if modified_cells.insert((x, y)) {
+                let random_char =
+                    CHARACTERS[self.rng.random_range(0..CHARACTERS.len())];
+                let random_color = style::Color::Rgb {
+                    r: self.rng.random_range(0..200) as u8,
+                    g: self.rng.random_range(0..256) as u8,
+                    b: self.rng.random_range(0..200) as u8,
+                };
+                self.initial_walls.set(
+                    x,
+                    y,
+                    Cell::new(random_char, random_color, style::Attribute::Bold),
+                );
+            }
+        }
+    }
+
     fn carve_one(&mut self) {
         if let Some((x, y)) = self.stack.pop_back() {
             let directions = [(2, 0), (0, 2), (-2, 0), (0, -2)]; // Skip one cell to maintain walls
@@ -304,5 +353,106 @@ mod tests {
             }
         }
         assert_eq!(path_cells, 23);
+    }
+
+    #[test]
+    fn the_carved_path_is_not_white_and_cannot_be_mistaken_for_a_wall() {
+        let mut maze = Maze::new(MazeOptions::default(), (12, 9));
+        for _ in 0..30 {
+            maze.update();
+            maze.get_diff();
+        }
+
+        let (x, y) = *maze.paths.iter().next().expect("nothing was carved");
+        let cell = maze.canvas.get(x, y);
+
+        assert_eq!(cell.symbol, '█');
+        assert_ne!(
+            cell.color,
+            style::Color::White,
+            "the carved path is white, which is invisible on a light profile"
+        );
+
+        // The walls are drawn with red and blue both below 120, so a red above
+        // 200 cannot be a wall colour however many times the mottle has run.
+        let style::Color::Rgb { r, .. } = cell.color else {
+            panic!("the path is not a truecolor value: {:?}", cell.color);
+        };
+        assert!(
+            r > 200,
+            "the path colour {r},.. is inside the range a wall is drawn from, so \
+             the path does not stand out from the walls"
+        );
+    }
+
+    #[test]
+    fn the_path_colour_reads_on_a_light_and_on_a_dark_profile() {
+        // The reason the path colour is not "whatever looked nice": it has to
+        // clear 3:1 against both a white and a black background, because a
+        // terminal profile is whichever of those the user happens to run.
+        let style::Color::Rgb { r, g, b } = PATH_COLOR else {
+            unreachable!("PATH_COLOR is defined as an Rgb");
+        };
+        let luminance =
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+        let on_white = 1.05 / (luminance + 0.05);
+        let on_black = (luminance + 0.05) / 0.05;
+
+        assert!(
+            on_white >= 3.0,
+            "the path is only {on_white:.1}:1 on a light profile"
+        );
+        assert!(
+            on_black >= 3.0,
+            "the path is only {on_black:.1}:1 on a dark profile"
+        );
+    }
+
+    /// sRGB channel to relative luminance, per WCAG 2.x.
+    fn linear(channel: u8) -> f64 {
+        let c = f64::from(channel) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    #[test]
+    fn drawing_a_frame_does_not_re_texture_the_walls() {
+        let mut maze = Maze::new(MazeOptions::default(), (10, 8));
+        maze.update();
+        maze.get_diff();
+
+        let settled = maze.initial_walls.buffer.clone();
+
+        // The mottle ran inside `get_diff`, so redrawing a frame without a
+        // simulation step still consumed generator draws and still changed the
+        // wall texture. What was on screen therefore depended on how many times
+        // the frame had been drawn rather than on elapsed time, which is the
+        // same frame-rate dependence the carve accumulator was added to fix.
+        for _ in 0..30 {
+            maze.get_diff();
+        }
+
+        assert_eq!(
+            settled, maze.initial_walls.buffer,
+            "redrawing the frame re-textured the walls"
+        );
+    }
+
+    #[test]
+    fn a_simulation_step_still_moves_the_walls() {
+        // The other half: moving the mottle must not have quietly stopped it,
+        // or the brickwork behind the carve is a still image.
+        let mut maze = Maze::new(MazeOptions::default(), (10, 8));
+        let before = maze.initial_walls.buffer.clone();
+
+        for _ in 0..30 {
+            maze.update();
+            maze.get_diff();
+        }
+
+        assert_ne!(before, maze.initial_walls.buffer);
     }
 }

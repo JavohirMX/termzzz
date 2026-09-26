@@ -169,6 +169,586 @@ impl InputSource for BatchInput {
     }
 }
 
+/// An input source that records the timeout it was asked to wait for, and
+/// faithfully blocks for it, so a test can tell whether the loop is willing to
+/// spend frame budget on waiting.
+struct RecordingInput {
+    timeouts: Vec<Duration>,
+    /// Set to hand over one event per poll, so a test can check that polling
+    /// without a timeout still delivers input.
+    pending: Vec<InputEvent>,
+    /// Polls remaining before quitting, so the loop terminates.
+    quit_after: Option<usize>,
+    polls: usize,
+}
+
+impl RecordingInput {
+    fn new() -> Self {
+        Self {
+            timeouts: Vec::new(),
+            pending: Vec::new(),
+            quit_after: None,
+            polls: 0,
+        }
+    }
+}
+
+impl InputSource for RecordingInput {
+    fn poll(&mut self, timeout: Duration) -> std::io::Result<Vec<InputEvent>> {
+        self.timeouts.push(timeout);
+        self.polls += 1;
+        if let Some(remaining) = self.quit_after
+            && self.polls > remaining
+        {
+            return Ok(vec![InputEvent::Quit]);
+        }
+        // A real poll blocks for up to `timeout`. Reproducing that is the point:
+        // the cost only exists if the source is asked to wait.
+        if !timeout.is_zero() {
+            std::thread::sleep(timeout);
+        }
+        Ok(if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.pending.remove(0)]
+        })
+    }
+}
+
+/// The screensaver loop must never ask the input source to block.
+///
+/// It used to ask for up to ten milliseconds on every frame. That is most of a
+/// 60 Hz frame budget spent asleep, and because the block sat *inside* the
+/// measured frame, the delta handed to the effect claimed ten milliseconds had
+/// passed while the program did nothing at all. The visible cost was that a
+/// heavy effect could not fit in what was left of the frame, plus up to ten
+/// milliseconds of extra latency on every keystroke.
+#[test]
+fn the_frame_loop_never_blocks_waiting_for_input() {
+    let mut source = RecordingInput::new();
+    source.quit_after = Some(8);
+    let mut effect = ResizeEffect {
+        resets: 0,
+        last_size: None,
+    };
+
+    termzzz::common::run_loop_with_source_and_size_and_target(
+        &mut Vec::new(),
+        &mut termzzz::common::SingleEffect::new(&mut effect),
+        None,
+        &mut source,
+        (20, 6),
+        termzzz::common::RuntimeOptions::default(),
+    )
+    .expect("the loop runs without a terminal");
+
+    assert!(
+        !source.timeouts.is_empty(),
+        "the loop never polled for input, so this test proved nothing"
+    );
+    assert!(
+        source.timeouts.iter().all(|timeout| timeout.is_zero()),
+        "the loop asked the source to block for {:?}. Every poll should be \
+         non-blocking: the loop already runs sixty times a second, so the worst a \
+         keystroke waits is one frame, which is better than ten milliseconds plus \
+         a frame",
+        source.timeouts
+    );
+}
+
+/// Polling without a timeout must not cost input delivery.
+///
+/// The obvious risk of making the poll non-blocking is that events arriving while
+/// the loop is asleep are missed. They are not: they sit in the terminal's queue
+/// and the next poll drains them. This is the test for that.
+#[test]
+fn non_blocking_polls_still_deliver_input() {
+    struct Counting {
+        keys: usize,
+    }
+
+    impl TerminalEffect for Counting {
+        fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
+            Vec::new()
+        }
+
+        fn update(&mut self) {}
+
+        fn update_size(&mut self, _width: u16, _height: u16) {}
+
+        fn reset(&mut self) {}
+
+        fn handle_input(&mut self, _event: &InputEvent) {
+            self.keys += 1;
+        }
+    }
+
+    let mut source = RecordingInput::new();
+    for _ in 0..3 {
+        source.pending.push(InputEvent::Key {
+            key: Key::Char('z'),
+            phase: KeyPhase::Pressed,
+        });
+    }
+    source.quit_after = Some(8);
+    let mut effect = Counting { keys: 0 };
+
+    termzzz::common::run_loop_with_source_and_size_and_target(
+        &mut Vec::new(),
+        &mut termzzz::common::SingleEffect::new(&mut effect),
+        None,
+        &mut source,
+        (20, 6),
+        termzzz::common::RuntimeOptions::default(),
+    )
+    .expect("the loop runs without a terminal");
+
+    assert_eq!(
+        effect.keys, 3,
+        "three keypresses were queued and the effect saw {} of them; a \
+         non-blocking poll must still drain what is waiting",
+        effect.keys
+    );
+}
+
+/// Work inside the frame budget must not lengthen the run.
+///
+/// The loop used to sleep for "whatever is left of the last frame", measured
+/// before the sleep itself. An oversleep therefore could not be repaid: it was
+/// measured, discarded, and the next frame slept its own remainder on top of it.
+/// A frame that consistently overran its slot drifted further and further from
+/// the cadence, and the delta every time-integrating effect was handed drifted
+/// with it. That is visible as stutter in anything that integrates `delta`.
+#[test]
+fn a_frames_cost_does_not_compound_into_the_next_one() {
+    /// Burns a fixed amount of wall clock per frame, which is the case the old
+    /// pacing got wrong: a constant overshoot, frame after frame.
+    struct SlowEffect {
+        cost: Duration,
+        deltas: Vec<Duration>,
+    }
+
+    impl TerminalEffect for SlowEffect {
+        fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
+            let until = std::time::Instant::now() + self.cost;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            Vec::new()
+        }
+
+        fn update(&mut self) {}
+
+        fn update_size(&mut self, _width: u16, _height: u16) {}
+
+        fn reset(&mut self) {}
+
+        fn update_with_context(
+            &mut self,
+            context: &termzzz::runtime::FrameContext,
+        ) {
+            self.deltas.push(context.delta);
+        }
+    }
+
+    let frame = Duration::from_secs_f64(1.0 / 60.0);
+    let frames = 24usize;
+
+    let run = |cost: Duration| {
+        let mut effect = SlowEffect {
+            cost,
+            deltas: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        termzzz::common::run_loop_with_source_and_size(
+            &mut Vec::new(),
+            &mut effect,
+            Some(frames),
+            &mut BatchInput::with(Vec::new()),
+            (20, 6),
+        )
+        .expect("the loop runs without a terminal");
+        (started.elapsed(), effect.deltas)
+    };
+
+    // A third of the budget, spent inside the frame. The loop should absorb it:
+    // the frame is still scheduled at a fixed cadence, so the run takes the same
+    // wall clock and the effect sees the same steady delta.
+    let (slow_elapsed, slow_deltas) = run(frame / 3);
+    let (fast_elapsed, fast_deltas) = run(Duration::ZERO);
+
+    let ideal = frame * frames as u32;
+    assert!(
+        fast_elapsed >= ideal / 2 && fast_elapsed < ideal * 2,
+        "{frames} frames with no work took {fast_elapsed:?}, which is not near \
+         the {ideal:?} a 60 Hz cadence asks for"
+    );
+
+    let drift = slow_elapsed
+        .checked_sub(fast_elapsed)
+        .unwrap_or(Duration::ZERO);
+    assert!(
+        drift < ideal / 4,
+        "spending {:?} per frame inside a {frame:?} budget stretched {frames} \
+         frames by {drift:?}; the cost should be absorbed, not compounded",
+        frame / 3
+    );
+
+    // And the deltas the effect was handed stayed near the frame time instead of
+    // creeping, which is what a drifting loop looks like from inside an effect.
+    let mean = |deltas: &[Duration]| -> Duration {
+        let total: Duration = deltas.iter().sum();
+        total / deltas.len() as u32
+    };
+    let slow_mean = mean(&slow_deltas);
+    let fast_mean = mean(&fast_deltas);
+    assert!(
+        slow_mean < frame * 2,
+        "with a third of the budget spent per frame the mean delta was \
+         {slow_mean:?}, so the loop is drifting rather than holding its cadence"
+    );
+    assert!(
+        slow_mean < fast_mean + frame,
+        "the mean delta grew from {fast_mean:?} to {slow_mean:?} once each frame \
+         had work to do, so the per-frame cost is being added on top of the wait \
+         rather than absorbed by it"
+    );
+}
+
+/// An input source that can report a focus change partway through, and that
+/// stops the loop on a deadline.
+///
+/// The stop is wall-clock rather than a poll count on purpose: these tests exist
+/// to measure frame rates, and a poll budget at four frames a second takes fifty
+/// seconds to spend.
+struct FocusInput {
+    pending: Vec<InputEvent>,
+    /// Stop once this many polls have happened.
+    quit_after: Option<usize>,
+    /// Stop once this much wall clock has passed, measured from construction.
+    stop_after: Option<Duration>,
+    started: std::time::Instant,
+    polls: usize,
+}
+
+impl FocusInput {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            quit_after: None,
+            stop_after: None,
+            started: std::time::Instant::now(),
+            polls: 0,
+        }
+    }
+
+    /// Hands over one event per poll, then stops after `seconds` of wall clock.
+    fn scripted(pending: Vec<InputEvent>, seconds: f64) -> Self {
+        Self {
+            pending,
+            quit_after: None,
+            stop_after: Some(Duration::from_secs_f64(seconds)),
+            started: std::time::Instant::now(),
+            polls: 0,
+        }
+    }
+}
+
+impl InputSource for FocusInput {
+    fn poll(&mut self, _timeout: Duration) -> std::io::Result<Vec<InputEvent>> {
+        self.polls += 1;
+        if let Some(remaining) = self.quit_after
+            && self.polls > remaining
+        {
+            return Ok(vec![InputEvent::Quit]);
+        }
+        if let Some(limit) = self.stop_after
+            && self.polls > 1
+            && self.started.elapsed() >= limit
+        {
+            return Ok(vec![InputEvent::Quit]);
+        }
+        Ok(if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.pending.remove(0)]
+        })
+    }
+}
+
+/// Records the delta of every frame it is asked to advance.
+struct FocusEffect {
+    deltas: Vec<Duration>,
+}
+
+impl TerminalEffect for FocusEffect {
+    fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
+        Vec::new()
+    }
+
+    fn update(&mut self) {}
+
+    fn update_size(&mut self, _width: u16, _height: u16) {}
+
+    fn reset(&mut self) {}
+
+    fn update_with_context(&mut self, context: &termzzz::runtime::FrameContext) {
+        self.deltas.push(context.delta);
+    }
+}
+
+/// Runs the loop over `effect` with a focus policy.
+///
+/// The `SingleEffect` has to be dropped before the caller can read `effect`,
+/// which is why this is a function rather than four copies of the same block.
+fn run_with_focus_policy(
+    effect: &mut FocusEffect,
+    source: &mut FocusInput,
+    options: termzzz::common::RuntimeOptions,
+) -> std::io::Result<f64> {
+    let mut target = termzzz::common::SingleEffect::new(effect);
+    termzzz::common::run_loop_with_source_and_size_and_options(
+        &mut Vec::new(),
+        &mut target,
+        None,
+        source,
+        (40, 12),
+        options,
+    )
+}
+
+/// Runs for a fixed number of seconds and reports what the loop did.
+struct Measured {
+    seconds: f64,
+    frames: usize,
+    deltas: Vec<Duration>,
+}
+
+fn measure(pending: Vec<InputEvent>, policy: bool, idle_fps: f32) -> Measured {
+    let mut source = FocusInput::scripted(pending, 2.0);
+    let mut effect = FocusEffect { deltas: Vec::new() };
+
+    let started = std::time::Instant::now();
+    run_with_focus_policy(
+        &mut effect,
+        &mut source,
+        termzzz::common::RuntimeOptions::default()
+            .with_focus_policy(policy, idle_fps),
+    )
+    .expect("the loop runs without a terminal");
+
+    Measured {
+        seconds: started.elapsed().as_secs_f64(),
+        frames: source.polls,
+        deltas: effect.deltas,
+    }
+}
+
+/// An unfocused terminal must cost dramatically less.
+///
+/// This is the whole point of the feature, so it is asserted as a rate rather
+/// than as an implementation detail: whatever the loop does internally, an
+/// unfocused window has to run at a small fraction of the focused rate.
+#[test]
+fn an_unfocused_terminal_runs_at_a_fraction_of_the_frame_rate() {
+    let focused = measure(Vec::new(), true, 4.0);
+    let idle = measure(vec![InputEvent::FocusLost], true, 4.0);
+
+    assert!(
+        focused.frames > 20,
+        "only {} focused frames in two seconds, so this is not measuring \
+         anything",
+        focused.frames
+    );
+    assert!(
+        idle.frames >= 4,
+        "only {} unfocused frames in two seconds; the throttle is slower than \
+         expected or the deadline is not being honoured",
+        idle.frames
+    );
+
+    let focused_fps = focused.frames as f64 / focused.seconds;
+    let idle_fps = idle.frames as f64 / idle.seconds;
+
+    assert!(
+        focused_fps > 40.0,
+        "the focused loop only managed {focused_fps:.1} fps"
+    );
+    assert!(
+        idle_fps < focused_fps / 5.0,
+        "unfocused ran at {idle_fps:.1} fps against {focused_fps:.1} focused, \
+         which is not the saving it is supposed to be"
+    );
+    assert!(
+        (2.0..=7.0).contains(&idle_fps),
+        "unfocused ran at {idle_fps:.1} fps, nowhere near the configured 4"
+    );
+}
+
+/// The frames it does draw cost nothing to simulate.
+///
+/// The simulation is frozen rather than fed a coarser delta. At four frames a
+/// second a real delta is 250 ms, which the frame-delta clamp would cut to 50,
+/// so the effect would run at a fifth of its speed and stay there.
+#[test]
+fn an_unfocused_effect_is_frozen_rather_than_slowed() {
+    let idle = measure(vec![InputEvent::FocusLost], true, 4.0);
+    assert!(
+        idle.deltas.is_empty(),
+        "the effect was advanced {} times while unfocused, each with a delta of \
+         {:?}; it should not be advanced at all",
+        idle.deltas.len(),
+        idle.deltas.first()
+    );
+
+    let focused = measure(Vec::new(), true, 4.0);
+    assert!(
+        focused.deltas.len() > 20,
+        "a focused run only advanced the effect {} times, so the freeze is not \
+         being distinguished from a broken loop",
+        focused.deltas.len()
+    );
+}
+
+/// The rate has to be the configured one, not merely a smaller one.
+#[test]
+fn the_unfocused_frame_rate_is_the_configured_one() {
+    let slow = measure(vec![InputEvent::FocusLost], true, 2.0);
+    let fast = measure(vec![InputEvent::FocusLost], true, 8.0);
+
+    let slow_fps = slow.frames as f64 / slow.seconds;
+    let fast_fps = fast.frames as f64 / fast.seconds;
+
+    assert!(
+        (1.0..=3.5).contains(&slow_fps),
+        "asked for 2 fps unfocused and got {slow_fps:.1}"
+    );
+    assert!(
+        fast_fps > slow_fps * 1.5,
+        "asked for 8 fps and got {fast_fps:.1}, against {slow_fps:.1} at 2 fps, \
+         so the configured rate is not what is being used"
+    );
+}
+
+/// Turning the policy off has to restore the full rate.
+///
+/// Otherwise there is no way to run at full speed on a terminal that never
+/// reports focus changes, which is the situation the policy exists to survive.
+#[test]
+fn the_focus_policy_can_be_turned_off() {
+    let measured = measure(vec![InputEvent::FocusLost], false, 4.0);
+    let fps = measured.frames as f64 / measured.seconds;
+
+    assert!(
+        fps > 40.0,
+        "with the policy off an unfocused terminal still ran at {fps:.1} fps"
+    );
+    assert!(
+        measured.deltas.len() > 20,
+        "with the policy off the effect was advanced only {} times, so the \
+         simulation is frozen even though the policy is off",
+        measured.deltas.len()
+    );
+}
+
+/// Regaining focus must not teleport the simulation forward.
+///
+/// The wall clock runs on while the simulation is frozen, so the first focused
+/// frame is handed the whole absence as one delta unless the loop resets its
+/// frame clock. The effect would visibly jump, which is the artefact this
+/// feature would otherwise introduce.
+#[test]
+fn returning_to_focus_does_not_jump_the_simulation_forward() {
+    // Lose focus, wait out a few throttled frames, get it back, then let the
+    // deadline end the run while focused.
+    let mut source = FocusInput::new();
+    source.pending = vec![
+        InputEvent::FocusLost,
+        InputEvent::FocusGained,
+        InputEvent::FocusGained,
+    ];
+    source.stop_after = Some(Duration::from_millis(1500));
+    let mut effect = FocusEffect { deltas: Vec::new() };
+
+    run_with_focus_policy(
+        &mut effect,
+        &mut source,
+        termzzz::common::RuntimeOptions::default().with_focus_policy(true, 4.0),
+    )
+    .expect("the loop runs without a terminal");
+
+    assert!(
+        !effect.deltas.is_empty(),
+        "the effect was never advanced, so nothing regained focus; the test is \
+         not exercising the resume path"
+    );
+
+    // Every delta after the resume is one frame, not the whole absence. The
+    // absence is bounded by the clamp either way, so what matters is that it is
+    // not the *whole* stretch and that the resumed frames are frame-sized.
+    let longest = effect.deltas.iter().copied().max().unwrap();
+    assert!(
+        longest <= Duration::from_millis(60),
+        "a frame was handed a delta of {longest:?} after focus came back, so the \
+         absence was paid out in one lump rather than discarded"
+    );
+}
+
+/// Quitting has to work while unfocused.
+///
+/// The loop polls as rarely as once a second at its slowest, so this is the one
+/// interaction that must not be lost. A user who alt-tabs away and then closes
+/// the window should not have to come back to quit.
+#[test]
+fn quitting_works_while_unfocused() {
+    let mut source = FocusInput::new();
+    // The first poll reports the focus loss, the second reports the quit -- so
+    // the quit arrives while unfocused, at the slowest rate allowed.
+    source.pending = vec![InputEvent::FocusLost];
+    source.quit_after = Some(1);
+    let mut effect = FocusEffect { deltas: Vec::new() };
+
+    let started = std::time::Instant::now();
+    let result = run_with_focus_policy(
+        &mut effect,
+        &mut source,
+        termzzz::common::RuntimeOptions::default().with_focus_policy(true, 1.0),
+    );
+
+    assert!(result.is_ok(), "the loop returned an error while unfocused");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "quitting took {:?} while unfocused, so the key was effectively lost at \
+         the slowest frame rate",
+        started.elapsed()
+    );
+}
+
+/// The unfocused rate is clamped, because a config of `0` would mean "stop".
+///
+/// Stopping is the cheapest option and the most dangerous one: a terminal that
+/// never reports a focus change would leave the program frozen with no way back.
+#[test]
+fn the_unfocused_rate_is_clamped_away_from_stopping() {
+    for (requested, expected_floor) in
+        [(0.0f32, 1.0f32), (-5.0, 1.0), (0.001, 1.0), (1000.0, 30.0)]
+    {
+        let options = termzzz::common::RuntimeOptions::default()
+            .with_focus_policy(true, requested);
+        assert!(
+            (termzzz::common::MIN_IDLE_FPS..=termzzz::common::MAX_IDLE_FPS)
+                .contains(&options.idle_fps),
+            "asked for {requested} fps unfocused and got {}",
+            options.idle_fps
+        );
+        assert!(
+            options.idle_fps >= expected_floor,
+            "asked for {requested} fps and got {}, which is below the floor",
+            options.idle_fps
+        );
+    }
+}
+
 struct ResizeEffect {
     resets: usize,
     last_size: Option<(u16, u16)>,
@@ -506,12 +1086,41 @@ fn speed_clock_scales_simulation_ticks() {
 fn legacy_effect_defaults_use_calmer_pacing() {
     let config = Config::default();
 
-    assert_eq!(config.get_plasma_options().color_speed, 20.0);
+    // Plasma's `color_speed` was 20 here, which with its `time_scale` of 0.5
+    // moved the palette ten entries a second -- about a sixth of a whole lap per
+    // frame, so a sixth of the screen changed colour every frame. That measured
+    // 824 KB of escape sequences per frame at 400x200, or 49 MB/s, and was the
+    // single largest source of the lag. The invariant behind the new value is
+    // pinned in `plasma`'s own tests, where the reasoning lives; this is here to
+    // catch a config default quietly reverting it.
+    assert_eq!(
+        config.get_plasma_options().color_speed,
+        termzzz::plasma::PlasmaOptions::default().color_speed
+    );
+    assert!(
+        config.get_plasma_options().color_speed < 20.0,
+        "plasma's palette speed went back to 20, which repaints a sixth of the \
+         screen every frame"
+    );
     assert_eq!(
         config.get_life_options((20, 10)).generations_per_second,
         8.0
     );
-    assert_eq!(config.get_donut_options((20, 10)).rotation_speed_a, 0.022);
+    // The donut's rotation speed was 0.022 here. That value is radians per
+    // *frame* from when the effect advanced a fixed step per rendered frame, and
+    // it is multiplied by the frame delta in seconds, so it was being applied
+    // 60x too slowly: one revolution every 4 minutes 46 seconds, and 12.6
+    // degrees of turn in ten seconds of watching. It did not look like a slow
+    // animation, it looked like a broken effect. The relationship is pinned in
+    // `donut`'s own tests; this catches the config default reverting it.
+    let donut = config.get_donut_options((20, 10));
+    assert!(
+        donut.rotation_speed_a > 0.5,
+        "the donut's rotation speed is back at {}, which is one revolution every \
+         {} seconds",
+        donut.rotation_speed_a,
+        std::f32::consts::TAU / donut.rotation_speed_a
+    );
     assert_eq!(config.get_pipes_options().num_lines, 3);
     assert_eq!(config.get_cube_options().rotation_speed_x, 0.25);
     assert_eq!(config.get_crab_options((20, 10)).movement_speed, 3.0);

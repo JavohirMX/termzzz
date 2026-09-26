@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 ## [0.2.0] - Unreleased
 
 ### Fixed
+- **The donut now visibly spins.** `rotation_speed_a` and `rotation_speed_b` are
+  radians per *second* — the effect multiplies them by the frame delta — but the
+  values were the old per-frame numbers, so they were being applied 60× too
+  slowly. One revolution took 4 minutes 46 seconds, and ten seconds of watching
+  turned the torus 12.6°, which does not read as a slow animation but as a
+  broken effect. The defaults are now 1.32 and 0.60 rad/s, a revolution every
+  4.8 and 10.5 seconds
+- Effects now slow down when the terminal window does not have focus, instead of
+  spending a core on a screensaver nobody is looking at. It drops to
+  `[global] idle_fps` (4 by default) and the simulation is frozen rather than fed
+  a coarser delta, so nothing jumps when you come back. Set
+  `[global] pause_when_unfocused = false` to disable
+
+  Two notes. This *throttles* rather than stops, deliberately: focus reporting
+  is off by default in most terminals, and a screensaver that stopped and could
+  not be restarted would be a far worse failure than one that runs quietly at
+  4 fps. And quitting still works while unfocused, with up to one second of
+  latency at the slowest rate.
+- **Colours are no longer washed out.** The output path was skipping the colour
+  on every cell after the first of a run, because it tracked the style as still
+  being in effect when the terminal had in fact reset it after each glyph. Those
+  cells were drawn in the terminal's default foreground, which is white on a dark
+  profile. Cells tagged `Attribute::Reset` were worse: that is SGR 0, so it
+  cleared the colour that had just been set, before the glyph was drawn. The
+  mandelbrot tags every cell `Reset` and was rendering entirely white. The
+  encoder is now built from crossterm's individual commands so it controls what
+  is emitted and when
+- A cell's background colour now reaches the terminal. It was never written at
+  all, so the half-block glyph `▀` painted its bottom half in the terminal's
+  default background -- which cost the mandelbrot half its vertical resolution
+  and the two-colours-per-cell capability the sub-cell renderer exists for
+- A cleared cell is now a space in the terminal's own background rather than a
+  space in black. On a light terminal profile a cleared cell was a black block,
+  and a wipe could not reproduce a clear because the two used different blanks
+- Switching effects with `n` and `p` no longer leaves the previous effect on
+  screen. The host wiped the effect's *diff* while the effect had already
+  committed the un-wiped frame to its own canvas, so the terminal held cells the
+  effect believed were painted and never re-sent them. Both the host and the
+  playlist now accumulate the delta into a frame buffer and wipe a copy
+- `--playlist` no longer flickers sixty times a second. `Canvas::commit` swaps
+  its two surfaces, so a consumer that accumulates a diff was handed the frame
+  from *before* the one it had just emitted, alternating between a frame and a
+  nearly empty one
+- Switching effects no longer flashes the outgoing effect at full brightness for
+  one frame. A `Swap` phase reported "no wipe", and the rebuild happened after
+  that frame's cells were produced
+- Holding `n` or `p` no longer strobes. A held key arrives as a stream of
+  repeats, and each one advanced the effect *and* restarted the transition, so
+  the wipe never got past its first frame and never hid anything while sixteen
+  effects were cycled through at key-repeat rate
+- `--transition` now reaches `n` and `p`. It was parsed into the playlist options
+  and nothing else, so the wipe behind a keypress always used the host's default
+- The transition now lasts the configured duration. Each phase compared against a
+  hardcoded `1.0`, so `transition` had no effect on either length or progress and
+  every switch took two seconds
+- The frame loop no longer blocks for up to ten milliseconds waiting for input on
+  every frame, which was most of a 60 Hz budget spent asleep and was counted as
+  elapsed time handed to the effect
+- The frame loop holds a fixed cadence instead of sleeping for the remainder of
+  the last frame, which could not repay an oversleep and so drifted
+- The mandelbrot no longer zooms past the point where it can resolve anything.
+  The depth limit is now derived from the iteration budget and the field's `f32`
+  precision, and `recentre` restarts at a scale where the boundary is across the
+  screen instead of the widest view, where the set is a small blob in a lot of
+  black. A tour went from about 36 seconds to 17.5, most of the old one a flat
+  wash
+- The mandelbrot no longer panics on a `max_iterations` of 23 or less. The
+  iteration budget clamped against a floor above its own ceiling
+- The donut's brightness ramp is no longer inverted. Dim glyphs were painted in
+  the two lightest colours in the palette and bright ones in yellow and orange,
+  and the top of both the glyph and colour ramps was unreachable
+- Matrix drop tails no longer saturate to full-bright green. A `.clamp(10, 256)
+  as u8` truncated 256 to 0, so the bottom two-thirds of every drop was one flat
+  colour instead of a fade
+- The donut and the matrix no longer leave a stale drawing surface behind on
+  `update_size`, which left a growing terminal partly unpainted and a shrinking
+  one keeping stale pixels
+- Plasma no longer repaints a sixth of the screen every frame. Its palette
+  advanced ten entries a second, and at 400x200 that measured 824 KB of escape
+  sequences per frame, or 49 MB/s. With the palette work and the encoder fix it is
+  483 KB
+- Fire's core is no longer pure white, and a no-colour config no longer paints
+  every blank cell white
+- The dvd logo no longer starts on a near-white colour, which made it invisible
+  on a light terminal for a sixth of its cycle
+- The maze's carved path is no longer a white bar, and effects no longer paint
+  with a blanket `Bold` that brightens an already-pale colour toward white
 - The output path no longer emits a cursor move and a colour change per cell. A
   move is only sent when a cell is not the one after the previous one, and a
   colour is only re-sent when it changes. This cuts ANSI volume per frame by
@@ -65,6 +152,18 @@ All notable changes to this project will be documented in this file.
   generator, so no two runs looked alike and the contract suite could not check
   their timing at all. Each now carries a `seed` option and a seeded generator,
   reseeded on reset so a resize starts a fresh run rather than continuing one
+
+### Upgrade notes
+- **If you have a `~/.config/termzzz.toml` generated by an earlier build, delete
+  its `[donut]` `rotation_speed_a` and `rotation_speed_b` lines** (or set them to
+  `1.32` and `0.6`). `--print-config` writes every default to disk, so an
+  existing config pins the old, 60×-too-slow values and the faster defaults will
+  not reach you. This is the one change in this release that a config file can
+  silently cancel.
+- A `[global]` section written by an earlier build has no `pause_when_unfocused`
+  or `idle_fps`. Both fall back to their defaults (`true` and `4.0`) because
+  `Config` inherits from the real defaults for anything a file omits, so an old
+  config keeps working and gets the new behaviour.
 
 ### Changed
 - The release profile optimizes for speed rather than size. This is a real-time
@@ -138,10 +237,11 @@ All notable changes to this project will be documented in this file.
   continuously into the boundary and re-picks its coastline by seeded rejection
   sampling when it gets too deep to resolve. Drawn with half-blocks, so the
   escape-time bands are read as colour rather than density. `max_iterations` is
-  the quality dial and the dominant cost; the iteration budget also falls
-  automatically as the camera pulls back, since interior pixels are most of the
-  screen when zoomed out and every one of them spends the full budget to
-  discover it never escapes
+  the quality dial and the dominant cost, and it now also sets how deep the camera
+  may zoom: the deepest useful scale moves one decade per doubling of the budget,
+  and a second term stops the camera where `f32` sample coordinates stop being
+  distinguishable from one another. `MIN_USEFUL_ITERATIONS` floors the budget
+  itself
 
 ### Changed
 - `Cell` carries a background colour. Only the half-block glyph `▀` needs it,

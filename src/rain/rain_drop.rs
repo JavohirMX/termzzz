@@ -32,6 +32,11 @@ static CHARACTERS: LazyLock<Vec<char>> = LazyLock::new(|| {
     v
 });
 
+/// How a drop is coloured, which is also how it fades.
+///
+/// `Debug` is here so a failing assertion about a drop's colours can name the
+/// style it was about rather than printing an opaque field number.
+#[derive(Debug)]
 pub enum RainDropStyle {
     Front,
     Middle,
@@ -78,6 +83,16 @@ impl RainDrop {
         let style: RainDropStyle = rng.random();
         let fx: u16 = rng.random_range(0..screen_size.0);
         let fy: f32 = rng.random_range(0..screen_size.1 / 4) as f32;
+        // At most `2h/3`. The bound is load-bearing twice over: a drop that long
+        // covers most of a terminal, and it is what keeps a drop inside the
+        // colour ramp, which is built at `3h/2` entries (see
+        // `DigitalRain::build_ramp`). `reset` below uses a tighter `h/2` bound.
+        //
+        // It stopped being a guarantee for a while, because a drop created after
+        // a resize is sized from the *new* height while the ramp was still sized
+        // from the one the effect was built at -- so growing the terminal could
+        // index a drop straight past the end of the ramp. Both sides follow the
+        // current height now.
         let max_length: usize =
             rng.random_range(4..=(2 * screen_size.1 / 3)) as usize;
 

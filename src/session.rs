@@ -21,7 +21,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::{
     cursor,
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange,
+        EnableMouseCapture,
+    },
     execute,
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -45,11 +48,16 @@ impl TerminalSession {
         let mut stdout = io::stdout();
         terminal::enable_raw_mode()?;
 
+        // Focus reporting is off by default, so without this the terminal never
+        // sends `FocusGained`/`FocusLost` and the frame loop cannot tell whether
+        // anyone is watching. A screensaver nobody is watching should not be
+        // spending a core on it.
         if let Err(error) = execute!(
             stdout,
             EnterAlternateScreen,
             cursor::Hide,
-            Clear(ClearType::All)
+            Clear(ClearType::All),
+            EnableFocusChange
         ) {
             // Undo the half-applied state before reporting the failure, or the
             // caller is left with raw mode enabled and no way back.
@@ -57,6 +65,7 @@ impl TerminalSession {
                 stdout,
                 cursor::Show,
                 Clear(ClearType::All),
+                DisableFocusChange,
                 LeaveAlternateScreen,
             );
             let _ = terminal::disable_raw_mode();
@@ -99,6 +108,7 @@ impl TerminalSession {
             self.stdout,
             cursor::Show,
             Clear(ClearType::All),
+            DisableFocusChange,
             LeaveAlternateScreen,
         );
         let _ = terminal::disable_raw_mode();
@@ -135,6 +145,7 @@ pub fn restore_terminal() {
     let _ = execute!(
         stdout,
         DisableMouseCapture,
+        DisableFocusChange,
         cursor::Show,
         Clear(ClearType::All),
         LeaveAlternateScreen,

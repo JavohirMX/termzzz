@@ -61,10 +61,23 @@ impl Cell {
 }
 
 impl Default for Cell {
+    /// A blank that matches whatever the terminal's own background is.
+    ///
+    /// `Color::Black` used to be the foreground here, on the reasonable-sounding
+    /// grounds that a blank cell is black. It is not: a cleared cell is a space
+    /// in the foreground colour, and a space in black is invisible on a dark
+    /// profile and a black block on a light one. `Color::Reset` means "whatever
+    /// the terminal would have drawn", which is what a blank should be, and it
+    /// is also what [`crate::render::wipe::blank_cell`] already used -- so the
+    /// two blanked the screen differently and a wipe could not reproduce a clear.
+    ///
+    /// It has a second effect worth having: a cleared cell now encodes to a bare
+    /// space, because it matches the state the output path leaves the terminal
+    /// in. See [`crate::common::write_cells`].
     fn default() -> Self {
         Self {
             symbol: ' ',
-            color: style::Color::Black,
+            color: style::Color::Reset,
             bg: style::Color::Reset,
             attr: style::Attribute::Reset,
         }
@@ -155,8 +168,19 @@ mod tests {
     fn cell_default() {
         let c = Cell::default();
         assert_eq!(c.symbol, ' ');
-        assert_eq!(c.color, style::Color::Black);
+        // Not `Color::Black`: a blank cell is a space, and a space in black is
+        // a visible block on a light terminal profile. `Reset` means "whatever
+        // the terminal would have drawn here".
+        assert_eq!(c.color, style::Color::Reset);
+        assert_eq!(c.bg, style::Color::Reset);
         assert_eq!(c.attr, style::Attribute::Reset);
+    }
+
+    /// The blank an effect clears to and the blank a wipe leaves behind have to
+    /// be the same cell, or a wipe cannot reproduce a clear.
+    #[test]
+    fn the_default_cell_is_the_wipes_blank_cell() {
+        assert_eq!(Cell::default(), crate::render::wipe::blank_cell());
     }
 
     #[test]

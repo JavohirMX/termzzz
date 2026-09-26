@@ -52,6 +52,23 @@ static PALETTE: LazyLock<Vec<u8>> = LazyLock::new(|| {
 });
 const MAXTABLE: usize = 256 * 5;
 
+/// Scale that takes the table's 0..63 range to 0..255.
+const PALETTE_GAIN: f32 = 4.047619;
+
+/// Highest intensity the palette is used at.
+///
+/// The table's top entries walk out of yellow and into white, ending at
+/// `(63, 63, 63)`, which `PALETTE_GAIN` turns into `(254, 254, 254)`. Every cell
+/// above intensity 187 was therefore drawn as a near-white block -- and the core
+/// of a large flame is almost entirely above 187, so the brightest part of the
+/// effect was a slab of white rather than a hot colour.
+///
+/// 187 is the last table entry with no blue channel at all, i.e. pure yellow,
+/// and yellow is what the hottest part of a flame actually looks like. Capping
+/// the index there rather than editing the table keeps the table honest: the
+/// white is still in it, the effect just never reaches it.
+const HOTTEST: usize = 187;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FireOptions {
     pub use_colors: bool,
@@ -150,9 +167,9 @@ impl Fire {
         // Create color palette from RGB values
         let mut color_palette = Vec::with_capacity(256);
         for i in 0..256 {
-            let r = (PALETTE[i * 3] as f32 * 4.047619) as u8;
-            let g = (PALETTE[i * 3 + 1] as f32 * 4.047619) as u8;
-            let b = (PALETTE[i * 3 + 2] as f32 * 4.047619) as u8;
+            let r = (PALETTE[i * 3] as f32 * PALETTE_GAIN) as u8;
+            let g = (PALETTE[i * 3 + 1] as f32 * PALETTE_GAIN) as u8;
+            let b = (PALETTE[i * 3 + 2] as f32 * PALETTE_GAIN) as u8;
             color_palette.push(style::Color::Rgb { r, g, b });
         }
 
@@ -341,22 +358,149 @@ impl Fire {
                         _ => '%',
                     };
 
-                    // Set cell with appropriate color based on intensity
-                    let fg_color = if self.options.use_colors
-                        && intensity < self.color_palette.len()
-                    {
-                        self.color_palette[intensity]
+                    // A blank is a blank, in either colour mode. The
+                    // `use_colors = false` branch used to hand back
+                    // `Color::White` for these as well as for the glyphs, so the
+                    // cold part of the frame was a field of white spaces: a slab
+                    // of white on a light profile and nothing at all on a dark
+                    // one, which is the opposite of the plain ASCII fire the
+                    // option is meant to give.
+                    let cell = if character == ' ' {
+                        Cell::default()
                     } else {
-                        style::Color::White
+                        // `Color::Reset` rather than white when colour is off:
+                        // "no colours" means the terminal's own foreground, not
+                        // the one that happens to be in the palette.
+                        let fg_color = if self.options.use_colors
+                            && intensity < self.color_palette.len()
+                        {
+                            self.color_palette[intensity.min(HOTTEST)]
+                        } else {
+                            style::Color::Reset
+                        };
+
+                        // `Attribute::Reset`, not `Attribute::Bold`. Every cell
+                        // used to be bold, and bold on a truecolor foreground is
+                        // a brightening hint that many terminals act on, which
+                        // pushes the hot end of a ramp toward white.
+                        Cell::new(character, fg_color, style::Attribute::Reset)
                     };
 
-                    self.canvas.set(
-                        x,
-                        y,
-                        Cell::new(character, fg_color, style::Attribute::Bold),
-                    );
+                    self.canvas.set(x, y, cell);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_hottest_colour_the_effect_can_draw_is_yellow_not_white() {
+        let fire = Fire::new(FireOptions::default(), (20, 10));
+
+        // Scanned over the range the effect indexes, not the whole table: the
+        // table's top entries are white by design and the cap is what stops the
+        // effect reaching them. If the cap goes, this fails.
+        let reachable = fire.color_palette.len().min(HOTTEST + 1);
+        for (index, color) in fire.color_palette.iter().take(reachable).enumerate()
+        {
+            let style::Color::Rgb { r, g, b } = *color else {
+                panic!("palette entry {index} is not truecolor: {color:?}");
+            };
+            assert!(
+                r.min(g).min(b) < 200,
+                "palette entry {index} is ({r}, {g}, {b}): close enough to white \
+                 that the core of a flame reads as a white block"
+            );
+        }
+
+        // And the cap is at the top of the table's yellow, not merely somewhere
+        // short of the white.
+        let style::Color::Rgb { r, g, b } = fire.color_palette[HOTTEST] else {
+            unreachable!("the palette is built as truecolor");
+        };
+        assert!(
+            r > 200 && g > 200 && b < 32,
+            "the hottest entry is ({r}, {g}, {b}), which is not hot yellow"
+        );
+    }
+
+    #[test]
+    fn a_settled_fire_never_puts_a_near_white_or_a_bold_cell_on_screen() {
+        let mut fire = Fire::new(FireOptions::default(), (40, 12));
+        for _ in 0..180 {
+            fire.update();
+            fire.get_diff();
+        }
+
+        let mut hottest: Option<u8> = None;
+        for cell in fire.canvas.on_screen().buffer.iter() {
+            assert_eq!(
+                cell.attr,
+                style::Attribute::Reset,
+                "cell {:?} is still bold, which brightens the hot end of the ramp",
+                cell.symbol
+            );
+            let style::Color::Rgb { r, g, b } = cell.color else {
+                continue;
+            };
+            let lo = r.min(g).min(b);
+            if hottest.is_none_or(|best| lo > best) {
+                hottest = Some(lo);
+            }
+        }
+
+        // The brightest thing in the effect is a hot yellow, not a white block.
+        // Before the cap the core was `(254, 254, 254)` and this is 254.
+        let hottest = hottest.expect("nothing was drawn at all");
+        assert!(
+            hottest < 64,
+            "the brightest cell on screen has every channel at {hottest} or above, \
+             which is white"
+        );
+    }
+
+    #[test]
+    fn without_colours_a_dead_cell_is_a_blank_rather_than_a_white_space() {
+        let mut fire = Fire::new(
+            FireOptions {
+                use_colors: false,
+                seed: 7,
+            },
+            (40, 12),
+        );
+        for _ in 0..120 {
+            fire.update();
+            fire.get_diff();
+        }
+
+        let blanks: Vec<Cell> = fire
+            .canvas
+            .on_screen()
+            .buffer
+            .iter()
+            .copied()
+            .filter(|cell| cell.symbol == ' ')
+            .collect();
+
+        assert!(
+            !blanks.is_empty(),
+            "the fixture produced no dead cells, so there was nothing to check"
+        );
+        for cell in blanks {
+            assert_ne!(
+                cell.color,
+                style::Color::White,
+                "a dead cell was painted as a white space"
+            );
+            assert_eq!(
+                cell,
+                Cell::default(),
+                "a dead cell is not the blank the rest of the crate clears to"
+            );
         }
     }
 }

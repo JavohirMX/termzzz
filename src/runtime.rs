@@ -67,6 +67,13 @@ pub enum InputEvent {
     Resize {
         size: (u16, u16),
     },
+    /// The terminal window gained keyboard focus.
+    ///
+    /// These used to be folded into [`InputEvent::Ignored`], which threw away the
+    /// one piece of information that says whether anyone is watching.
+    FocusGained,
+    /// The terminal window lost keyboard focus.
+    FocusLost,
     Quit,
     Ignored,
 }
@@ -96,11 +103,36 @@ impl Default for PointerState {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InputState {
     pointer: PointerState,
     pressed_keys: Vec<Key>,
     size: (u16, u16),
+    /// Whether the terminal window has keyboard focus.
+    ///
+    /// Latched rather than per-frame, unlike `pressed_keys`: a window stays
+    /// focused across every frame in which no focus event arrives, so a
+    /// "was it focused this frame" reading would be wrong almost always.
+    focused: bool,
+}
+
+/// Hand-written, and only because of `focused`.
+///
+/// The derive would default it to `false`, which would make every test,
+/// `--check`, and the first frame of every run believe the terminal had lost
+/// focus -- and a screensaver that thinks nobody is watching throttles itself to
+/// a crawl. Everything else matches what the derive produced, `size` included:
+/// it is `(0, 0)`, not `(1, 1)`, and the size accessors floor it where it
+/// matters.
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            pointer: PointerState::default(),
+            pressed_keys: Vec::new(),
+            size: (0, 0),
+            focused: true,
+        }
+    }
 }
 
 impl InputState {
@@ -113,6 +145,8 @@ impl InputState {
                 button,
             } => self.apply_pointer(position, phase, button),
             InputEvent::Resize { size } => self.set_size(size),
+            InputEvent::FocusGained => self.set_focused(true),
+            InputEvent::FocusLost => self.set_focused(false),
             InputEvent::Quit | InputEvent::Ignored => {}
         }
     }
@@ -136,6 +170,19 @@ impl InputState {
 
     pub fn is_key_pressed(&self, key: Key) -> bool {
         self.pressed_keys.contains(&key)
+    }
+
+    /// Whether the terminal window has keyboard focus.
+    ///
+    /// True until something says otherwise, because a terminal that has not
+    /// reported a focus change still has the window.
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Records a focus change.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
     }
 
     pub fn pressed_keys(&self) -> &[Key] {
@@ -260,9 +307,9 @@ fn translate_event(event: Event) -> InputEvent {
         Event::Resize(width, height) => InputEvent::Resize {
             size: (width, height),
         },
-        Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
-            InputEvent::Ignored
-        }
+        Event::FocusGained => InputEvent::FocusGained,
+        Event::FocusLost => InputEvent::FocusLost,
+        Event::Paste(_) => InputEvent::Ignored,
     }
 }
 
@@ -356,5 +403,54 @@ mod tests {
                 phase: KeyPhase::Pressed,
             }
         );
+    }
+
+    /// Focus is latched, not read per frame.
+    ///
+    /// A window stays focused across every frame in which no focus event
+    /// arrives, so `begin_frame` must not clear this. If it did, every effect
+    /// would believe it was unfocused on all but one frame in sixty.
+    #[test]
+    fn focus_persists_across_frames() {
+        let mut state = InputState::default();
+        assert!(state.is_focused(), "a terminal starts focused");
+
+        state.apply(InputEvent::FocusLost);
+        assert!(!state.is_focused());
+
+        state.begin_frame();
+        state.begin_frame();
+        assert!(
+            !state.is_focused(),
+            "a focus change was forgotten at the frame boundary"
+        );
+
+        state.apply(InputEvent::FocusGained);
+        assert!(state.is_focused());
+    }
+
+    /// The default has to be "focused", and the derive would not have managed it.
+    ///
+    /// A `bool` derives to `false`. That would make every test, `--check`, and
+    /// the first frame of every real run believe nobody was watching, and a
+    /// screensaver that thinks that throttles itself to a crawl.
+    #[test]
+    fn the_default_input_state_is_focused() {
+        assert!(InputState::default().is_focused());
+    }
+
+    /// The rest of the default has to match what the derive used to produce.
+    ///
+    /// `size` in particular is `(0, 0)`, not `(1, 1)`, and the accessors floor it
+    /// where it matters. A hand-written `Default` that "helpfully" started at
+    /// `(1, 1)` would change what a caller sees before it calls `set_size`.
+    #[test]
+    fn the_hand_written_default_matches_the_derived_one_elsewhere() {
+        let state = InputState::default();
+        assert_eq!(state.size(), (0, 0));
+        assert_eq!(state.pointer(), &PointerState::default());
+        assert!(state.pressed_keys().is_empty());
+        // And the pointer is normalised without panicking on a zero size.
+        assert_eq!(state.pointer().normalized, (0.0, 0.0));
     }
 }

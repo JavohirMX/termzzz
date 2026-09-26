@@ -5,13 +5,37 @@ use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
+/// The logo's colours, in the order it cycles through them.
+///
+/// Every entry sits in a narrow band of relative luminance, 0.12 to 0.25, and
+/// that is the whole design constraint. Against a pure white background a
+/// colour is legible at 3:1 or better only below relative luminance 0.30, and
+/// against pure black only above 0.10. A terminal profile is whichever of the
+/// two the user runs, and a screensaver has no way to ask, so the band that
+/// works on both is the band every colour has to be in.
+///
+/// The first entry used to be `(235, 235, 245)` -- a near-white, luminance
+/// 0.83. On a light profile that is 1.03:1, which is invisible, and since
+/// `color_index` is randomised at construction the logo was invisible for one
+/// frame in six. It is now the deep rose, which is 4.3:1 on white and 4.8:1 on
+/// black, and it is first because a red logo is what a DVD logo should be.
+///
+/// The whole palette had to move, not just that entry: any of the six could be
+/// the starting colour, so leaving five of them above luminance 0.30 would have
+/// left the bug reachable five times out of six.
 const PALETTE: [(u8, u8, u8); 6] = [
-    (235, 235, 245),
-    (255, 95, 120),
-    (95, 205, 255),
-    (140, 245, 160),
-    (255, 205, 95),
-    (200, 145, 255),
+    // rose,   luminance 0.19
+    (220, 60, 90),
+    // amber,  luminance 0.24
+    (200, 110, 30),
+    // green,   luminance 0.23
+    (50, 150, 60),
+    // teal,    luminance 0.25
+    (30, 150, 160),
+    // blue,    luminance 0.15
+    (60, 100, 210),
+    // violet,  luminance 0.15
+    (160, 60, 200),
 ];
 
 const DT: f64 = 1.0 / 60.0;
@@ -241,6 +265,87 @@ mod tests {
             logo: String::from("DVD"),
             start_in_corner: false,
             ..Default::default()
+        }
+    }
+
+    /// sRGB channel to relative luminance, per WCAG 2.x.
+    fn linear(channel: u8) -> f64 {
+        let c = f64::from(channel) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(color: (u8, u8, u8)) -> f64 {
+        0.2126 * linear(color.0)
+            + 0.7152 * linear(color.1)
+            + 0.0722 * linear(color.2)
+    }
+
+    fn contrast(a: f64, b: f64) -> f64 {
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn the_first_colour_is_not_a_near_white_one() {
+        // `color_index` is randomised at construction, so this is the colour a
+        // run actually starts on one time in six. It used to be
+        // `(235, 235, 245)`, which is 1.03:1 against a white background: not
+        // merely dull, invisible.
+        let (r, g, b) = PALETTE[0];
+        assert!(
+            r.min(g).min(b) < 200,
+            "PALETTE[0] is ({r}, {g}, {b}), close enough to white to disappear on \
+             a light profile"
+        );
+        assert_ne!(PALETTE[0], (235, 235, 245));
+    }
+
+    #[test]
+    fn every_colour_reads_on_a_light_and_on_a_dark_profile() {
+        // Not only the first: `color_index` is randomised, so any entry can be
+        // the colour a run starts on. Fixing one and leaving the other five
+        // invisible would have left the same bug five times out of six.
+        for color in PALETTE {
+            let lum = luminance(color);
+            let on_white = contrast(lum, 1.0);
+            let on_black = contrast(lum, 0.0);
+
+            assert!(
+                on_white >= 3.0,
+                "{color:?} is only {on_white:.1}:1 on a light profile"
+            );
+            assert!(
+                on_black >= 3.0,
+                "{color:?} is only {on_black:.1}:1 on a dark profile"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_always_starts_on_a_legible_colour() {
+        // The end-to-end version of the two above: whatever the seed picks, the
+        // logo is drawn in something that can be seen.
+        for seed in 0..64u64 {
+            let mut effect = Dvd::new(
+                DvdOptions {
+                    seed,
+                    start_in_corner: true,
+                    ..Default::default()
+                },
+                (40, 12),
+            );
+            effect.get_diff();
+
+            let (r, g, b) = PALETTE[effect.color_index];
+            let lum = luminance((r, g, b));
+            assert!(
+                contrast(lum, 1.0) >= 3.0 && contrast(lum, 0.0) >= 3.0,
+                "seed {seed} started on {r},{g},{b}"
+            );
         }
     }
 
