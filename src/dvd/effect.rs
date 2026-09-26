@@ -1,4 +1,5 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
+use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
@@ -49,7 +50,7 @@ impl Default for DvdOptions {
 pub struct Dvd {
     screen_size: (u16, u16),
     options: DvdOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     rows: Vec<Vec<char>>,
     x: f64,
     y: f64,
@@ -61,10 +62,8 @@ pub struct Dvd {
 
 impl TerminalEffect for Dvd {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let curr_buffer = self.draw();
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.draw();
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -77,12 +76,13 @@ impl TerminalEffect for Dvd {
 
     fn update_size(&mut self, width: u16, height: u16) {
         self.screen_size = (width.max(1), height.max(1));
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
         self.reset();
     }
 
     fn reset(&mut self) {
-        self.buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        self.canvas
+            .resize(self.screen_size.0.max(1), self.screen_size.1.max(1));
         self.rows = Self::parse_logo(&self.options.logo);
 
         // Reseeded rather than merely carried over: a resize is a new screen, and
@@ -119,7 +119,7 @@ impl Dvd {
         let seed = options.seed;
         let mut effect = Self {
             screen_size,
-            buffer: Buffer::new(screen_size.0 as usize, screen_size.1 as usize),
+            canvas: Canvas::new(screen_size.0, screen_size.1),
             rows: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -202,9 +202,9 @@ impl Dvd {
         }
     }
 
-    fn draw(&self) -> Buffer {
-        let mut next =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+    /// Draws the logo at its current position into the canvas.
+    fn draw(&mut self) {
+        self.canvas.clear();
         let (r, g, b) = PALETTE[self.color_index % PALETTE.len()];
 
         for (row_index, row) in self.rows.iter().enumerate() {
@@ -217,7 +217,7 @@ impl Dvd {
                 if x >= self.screen_size.0 as usize {
                     break;
                 }
-                next.set(
+                self.canvas.set(
                     x,
                     y,
                     Cell::new(
@@ -228,8 +228,6 @@ impl Dvd {
                 );
             }
         }
-
-        next
     }
 }
 

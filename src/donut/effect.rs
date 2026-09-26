@@ -1,4 +1,5 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
+use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
@@ -155,7 +156,7 @@ struct Scratch {
 pub struct Donut {
     pub screen_size: (u16, u16),
     options: DonutOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     rotation_a: f32,
     rotation_b: f32,
     colors: &'static [style::Color; 12],
@@ -164,14 +165,8 @@ pub struct Donut {
 
 impl TerminalEffect for Donut {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let mut curr_buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
-
-        self.render_donut(&mut curr_buffer);
-
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.render_donut();
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -203,11 +198,11 @@ impl Donut {
     }
 
     pub fn new(options: DonutOptions, screen_size: (u16, u16)) -> Self {
-        let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
         Self {
             screen_size,
             options,
-            buffer,
+            canvas,
             rotation_a: 0.0,
             rotation_b: 0.0,
             colors: &COLORS,
@@ -215,8 +210,8 @@ impl Donut {
         }
     }
 
-    fn render_donut(&mut self, buffer: &mut Buffer) {
-        buffer.fill_with(&Cell::default());
+    fn render_donut(&mut self) {
+        self.canvas.clear();
 
         let width = self.screen_size.0 as usize;
         let height = self.screen_size.1 as usize;
@@ -334,7 +329,11 @@ impl Donut {
                     continue;
                 }
                 let color = colors[shade[idx] as usize % colors.len()];
-                buffer.set(x, y, Cell::new(symbol, color, style::Attribute::Bold));
+                self.canvas.set(
+                    x,
+                    y,
+                    Cell::new(symbol, color, style::Attribute::Bold),
+                );
             }
         }
     }

@@ -188,28 +188,26 @@ where
     process_runtime_events(effect, &mut source, &mut input, &mut size, &mut speed)
 }
 
-pub fn run_loop<W, TE>(
+pub fn run_loop<W>(
     stdout: &mut W,
-    effect: &mut TE,
+    effect: &mut dyn TerminalEffect,
     iterations: Option<usize>,
 ) -> Result<f64>
 where
     W: Write,
-    TE: TerminalEffect,
 {
     let mut source = CrosstermInput;
     run_loop_with_source(stdout, effect, iterations, &mut source)
 }
 
-pub fn run_loop_with_options<W, TE>(
+pub fn run_loop_with_options<W>(
     stdout: &mut W,
-    effect: &mut TE,
+    effect: &mut dyn TerminalEffect,
     iterations: Option<usize>,
     options: RuntimeOptions,
 ) -> Result<f64>
 where
     W: Write,
-    TE: TerminalEffect,
 {
     let mut source = CrosstermInput;
     let size = terminal::size()?;
@@ -223,31 +221,29 @@ where
     )
 }
 
-pub fn run_loop_with_source<W, TE, S>(
+pub fn run_loop_with_source<W, S>(
     stdout: &mut W,
-    effect: &mut TE,
+    effect: &mut dyn TerminalEffect,
     iterations: Option<usize>,
     source: &mut S,
 ) -> Result<f64>
 where
     W: Write,
-    TE: TerminalEffect,
     S: InputSource,
 {
     let size = terminal::size()?;
     run_loop_with_source_and_size(stdout, effect, iterations, source, size)
 }
 
-pub fn run_loop_with_source_and_size<W, TE, S>(
+pub fn run_loop_with_source_and_size<W, S>(
     stdout: &mut W,
-    effect: &mut TE,
+    effect: &mut dyn TerminalEffect,
     iterations: Option<usize>,
     source: &mut S,
     initial_size: (u16, u16),
 ) -> Result<f64>
 where
     W: Write,
-    TE: TerminalEffect,
     S: InputSource,
 {
     run_loop_with_source_and_size_and_options(
@@ -260,9 +256,15 @@ where
     )
 }
 
-pub fn run_loop_with_source_and_size_and_options<W, TE, S>(
+/// The one frame loop. Every other `run_loop*` is a convenience wrapper over it.
+///
+/// Takes a trait object rather than a generic. A generic would monomorphise the
+/// entire loop once per effect type -- fifteen copies of the timing, input and
+/// encoding code -- and would forbid holding effects of different types at once,
+/// which is what swapping the running effect needs.
+pub fn run_loop_with_source_and_size_and_options<W, S>(
     stdout: &mut W,
-    effect: &mut TE,
+    effect: &mut dyn TerminalEffect,
     iterations: Option<usize>,
     source: &mut S,
     initial_size: (u16, u16),
@@ -270,7 +272,6 @@ pub fn run_loop_with_source_and_size_and_options<W, TE, S>(
 ) -> Result<f64>
 where
     W: Write,
-    TE: TerminalEffect,
     S: InputSource,
 {
     if iterations == Some(0) {
@@ -344,15 +345,14 @@ where
     Ok(frames_per_second)
 }
 
-fn process_runtime_events<TE, S>(
-    effect: &mut TE,
+fn process_runtime_events<S>(
+    effect: &mut dyn TerminalEffect,
     source: &mut S,
     input: &mut InputState,
     size: &mut (u16, u16),
     speed: &mut f32,
 ) -> Result<bool>
 where
-    TE: TerminalEffect,
     S: InputSource,
 {
     let events = source.poll(Duration::from_millis(10))?;

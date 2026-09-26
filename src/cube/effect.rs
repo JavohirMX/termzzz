@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, Cell};
+use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
@@ -56,7 +57,7 @@ impl Default for CubeOptions {
 pub struct Cube {
     pub screen_size: (u16, u16),
     options: CubeOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     vertices: Vec<Point3D>,
     edges: Vec<Edge>,
     rotation: (f32, f32, f32),
@@ -65,9 +66,6 @@ pub struct Cube {
 
 impl TerminalEffect for Cube {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let mut curr_buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
-
         // Rotate vertices
         let rotated_vertices = self.rotate_vertices();
 
@@ -75,16 +73,30 @@ impl TerminalEffect for Cube {
         let projected_vertices: Vec<Point2D> =
             rotated_vertices.iter().map(|v| self.project(*v)).collect();
 
-        // Draw the cube
-        if self.options.use_braille {
-            self.draw_braille(&projected_vertices, &mut curr_buffer);
+        self.canvas.clear();
+
+        // Draw the cube. The draw helpers are associated functions rather than
+        // methods so that borrowing the canvas here does not overlap a borrow of
+        // the whole effect.
+        let (edges, size, braille) =
+            (&self.edges, self.screen_size, self.options.use_braille);
+        if braille {
+            Self::draw_braille(
+                edges,
+                size,
+                &projected_vertices,
+                self.canvas.surface_mut(),
+            );
         } else {
-            self.draw_ascii(&projected_vertices, &mut curr_buffer);
+            Self::draw_ascii(
+                edges,
+                size,
+                &projected_vertices,
+                self.canvas.surface_mut(),
+            );
         }
 
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -99,6 +111,7 @@ impl TerminalEffect for Cube {
 
     fn update_size(&mut self, width: u16, height: u16) {
         self.screen_size = (width, height);
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
     }
 
     fn reset(&mut self) {
@@ -115,7 +128,7 @@ impl Cube {
     }
 
     pub fn new(options: CubeOptions, screen_size: (u16, u16)) -> Self {
-        let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
 
         // Define cube vertices
         let size = options.cube_size;
@@ -184,7 +197,7 @@ impl Cube {
         Self {
             screen_size,
             options,
-            buffer,
+            canvas,
             vertices,
             edges,
             rotation: (0.0, 0.0, 0.0),
@@ -250,13 +263,16 @@ impl Cube {
     }
 
     // Draw the cube using ASCII characters
-    fn draw_ascii(&self, projected: &[Point2D], buffer: &mut Buffer) {
-        // Clear the buffer first
-        buffer.fill_with(&Cell::default());
-
+    fn draw_ascii(
+        edges: &[Edge],
+        size: (u16, u16),
+        projected: &[Point2D],
+        buffer: &mut Buffer,
+    ) {
         // Draw edges
-        for edge in &self.edges {
-            self.draw_line(
+        for edge in edges {
+            Self::draw_line(
+                size,
                 projected[edge.v1].x,
                 projected[edge.v1].y,
                 projected[edge.v2].x,
@@ -267,13 +283,16 @@ impl Cube {
     }
 
     // Draw the cube using braille patterns
-    fn draw_braille(&self, projected: &[Point2D], buffer: &mut Buffer) {
-        // Clear the buffer first
-        buffer.fill_with(&Cell::default());
-
+    fn draw_braille(
+        edges: &[Edge],
+        size: (u16, u16),
+        projected: &[Point2D],
+        buffer: &mut Buffer,
+    ) {
         // Draw edges with braille
-        for edge in &self.edges {
-            self.draw_braille_line(
+        for edge in edges {
+            Self::draw_braille_line(
+                size,
                 projected[edge.v1].x,
                 projected[edge.v1].y,
                 projected[edge.v2].x,
@@ -284,7 +303,14 @@ impl Cube {
     }
 
     // Draw a line using ASCII characters
-    fn draw_line(&self, x0: f32, y0: f32, x1: f32, y1: f32, buffer: &mut Buffer) {
+    fn draw_line(
+        size: (u16, u16),
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        buffer: &mut Buffer,
+    ) {
         let mut x0 = x0 as i32;
         let mut y0 = y0 as i32;
         let x1 = x1 as i32;
@@ -296,8 +322,8 @@ impl Cube {
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
 
-        let width = self.screen_size.0 as i32;
-        let height = self.screen_size.1 as i32;
+        let width = size.0 as i32;
+        let height = size.1 as i32;
 
         loop {
             if x0 >= 0 && x0 < width && y0 >= 0 && y0 < height {
@@ -332,7 +358,7 @@ impl Cube {
 
     // Draw a line using braille patterns for higher resolution
     fn draw_braille_line(
-        &self,
+        size: (u16, u16),
         x0: f32,
         y0: f32,
         x1: f32,
@@ -357,8 +383,8 @@ impl Cube {
         let mut err = dx + dy;
 
         // Map from braille resolution to terminal cells
-        let width = (self.screen_size.0 as i32) * 2;
-        let height = (self.screen_size.1 as i32) * 4;
+        let width = (size.0 as i32) * 2;
+        let height = (size.1 as i32) * 4;
 
         // Braille dot tracking
         let mut braille_map: std::collections::HashMap<(i32, i32), u8> =
@@ -404,11 +430,7 @@ impl Cube {
 
         // Convert our braille map to characters and set them in the buffer
         for ((x, y), dots) in braille_map {
-            if x >= 0
-                && x < self.screen_size.0 as i32
-                && y >= 0
-                && y < self.screen_size.1 as i32
-            {
+            if x >= 0 && x < size.0 as i32 && y >= 0 && y < size.1 as i32 {
                 // The Unicode braille patterns start at U+2800
                 // Each bit set in our dots variable corresponds to a raised dot
                 let braille_char =

@@ -1,4 +1,5 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
+use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
@@ -100,7 +101,7 @@ impl Default for BoidsOptions {
 
 pub struct Boids {
     options: BoidsOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     boids: Vec<Boid>,
     charset_chars: [char; 8],
 }
@@ -139,28 +140,23 @@ impl Boid {
 
 impl TerminalEffect for Boids {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let mut curr_buffer = Buffer::new(
-            self.options.screen_size.0 as usize,
-            self.options.screen_size.1 as usize,
-        );
+        self.canvas.clear();
 
-        // Fill current buffer with boids
+        // Fill the canvas with boids
         for boid in &self.boids {
             let x = boid.position.0.round() as usize
                 % self.options.screen_size.0 as usize;
             let y = boid.position.1.round() as usize
                 % self.options.screen_size.1 as usize;
 
-            curr_buffer.set(
+            self.canvas.set(
                 x,
                 y,
                 Cell::new(boid.character, boid.color, style::Attribute::Bold),
             );
         }
 
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -178,6 +174,8 @@ impl TerminalEffect for Boids {
 
     fn update_size(&mut self, width: u16, height: u16) {
         self.options.screen_size = (width.max(1), height.max(1));
+        self.canvas
+            .resize(self.options.screen_size.0, self.options.screen_size.1);
         let area =
             self.options.screen_size.0 as f32 * self.options.screen_size.1 as f32;
         self.options.boid_count =
@@ -198,10 +196,7 @@ impl Boids {
 
     pub fn new(options: BoidsOptions) -> Self {
         let mut rng = seeded_rng(options.seed, "boids");
-        let buffer = Buffer::new(
-            options.screen_size.0 as usize,
-            options.screen_size.1 as usize,
-        );
+        let canvas = Canvas::new(options.screen_size.0, options.screen_size.1);
 
         let width = options.screen_size.0 as f32;
         let height = options.screen_size.1 as f32;
@@ -224,7 +219,7 @@ impl Boids {
 
         Self {
             options,
-            buffer,
+            canvas,
             boids,
             charset_chars,
         }

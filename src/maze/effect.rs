@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, Cell};
+use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::{RngExt, seq::SliceRandom};
@@ -51,7 +52,7 @@ const MAX_CARVE_STEPS_PER_FRAME: usize = 8;
 pub struct Maze {
     pub screen_size: (u16, u16),
     options: MazeOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     initial_walls: Buffer,
     paths: HashSet<(usize, usize)>,
     stack: VecDeque<(isize, isize)>,
@@ -71,12 +72,11 @@ impl TerminalEffect for Maze {
             self.reset();
             return Vec::new();
         }
-        let mut curr_buffer = self.initial_walls.clone();
         let mut modified_cells = HashSet::new();
         // Randomly change 5 distinct cells
         while modified_cells.len() < 3 {
-            let x = self.rng.random_range(0..curr_buffer.width);
-            let y = self.rng.random_range(0..curr_buffer.height);
+            let x = self.rng.random_range(0..self.canvas.width());
+            let y = self.rng.random_range(0..self.canvas.height());
 
             if modified_cells.insert((x, y)) {
                 let random_char =
@@ -94,17 +94,18 @@ impl TerminalEffect for Maze {
             }
         }
 
+        // The frame is the wall template with the carved path painted over it.
+        // Blitting the template replaces cloning it every frame.
+        self.canvas.blit(&self.initial_walls);
         for (x, y) in self.paths.iter() {
-            curr_buffer.set(
+            self.canvas.set(
                 *x,
                 *y,
                 Cell::new('█', style::Color::White, style::Attribute::Reset),
             )
         }
 
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -126,7 +127,7 @@ impl TerminalEffect for Maze {
         // the carved path coordinates no longer fit. `reset` rebuilds them
         // anyway, but `update_size` is a public entry point and has to leave a
         // renderable effect behind on its own.
-        self.buffer = Buffer::new(width, height);
+        self.canvas.resize(width as u16, height as u16);
         self.initial_walls = Buffer::new(width, height);
         let mut rng = seeded_rng(self.options.seed, "maze");
         fill_initial_walls(&mut self.initial_walls, &mut rng);
@@ -203,7 +204,7 @@ impl Maze {
     pub fn new(options: MazeOptions, screen_size: (u16, u16)) -> Self {
         let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
         let mut rng = seeded_rng(options.seed, "maze");
-        let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
 
         let paths = HashSet::new();
         let start_x = rng.random_range(0..screen_size.0);
@@ -211,13 +212,13 @@ impl Maze {
         let mut stack = VecDeque::new();
         stack.push_back((start_x as isize, start_y as isize));
 
-        let mut initial_walls = buffer.clone();
+        let mut initial_walls = canvas.surface().clone();
         fill_initial_walls(&mut initial_walls, &mut rng);
 
         Self {
             screen_size,
             options,
-            buffer,
+            canvas,
             initial_walls,
             paths,
             stack,
@@ -273,7 +274,7 @@ mod tests {
 
         // buffer correctly initialized
         let mut initialized_cells = 0;
-        for cell in maze.buffer.iter() {
+        for cell in maze.canvas.on_screen().iter() {
             if cell.symbol != ' ' {
                 initialized_cells += 1;
             }
@@ -297,7 +298,7 @@ mod tests {
 
         // buffer correctly processed
         let mut path_cells = 0;
-        for cell in maze.buffer.iter() {
+        for cell in maze.canvas.on_screen().iter() {
             if cell.symbol != '█' {
                 path_cells += 1;
             }

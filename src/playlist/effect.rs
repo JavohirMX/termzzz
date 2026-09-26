@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, Cell};
+use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crate::config::Config;
 use crate::registry::{AnyEffect, EffectId};
@@ -67,8 +68,7 @@ pub struct Playlist {
     phase: Phase,
     phase_progress: f32,
     current: AnyEffect,
-    frame: Buffer,
-    shown: Buffer,
+    canvas: Canvas,
 }
 
 impl TerminalEffect for Playlist {
@@ -142,8 +142,12 @@ impl Playlist {
             phase: Phase::Running,
             phase_progress: 0.0,
             current,
-            frame: Buffer::new(screen_size.0 as usize, screen_size.1 as usize),
-            shown: Buffer::new(screen_size.0 as usize, screen_size.1 as usize),
+            canvas: {
+                let mut canvas = Canvas::new(screen_size.0, screen_size.1);
+                canvas.clear_with(&blank_cell());
+                canvas.establish_baseline();
+                canvas
+            },
         };
         playlist.rebuild_buffers();
         playlist
@@ -190,11 +194,11 @@ impl Playlist {
     }
 
     fn rebuild_buffers(&mut self) {
-        let size = (self.screen_size.0 as usize, self.screen_size.1 as usize);
-        self.frame = Buffer::new(size.0, size.1);
-        self.frame.fill_with(&blank_cell());
-        self.shown = Buffer::new(size.0, size.1);
-        self.shown.fill_with(&blank_cell());
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
+        // This effect's blank is `Color::Reset`, not the `Cell::default()` black
+        // the canvas clears to, so it is filled explicitly on both counts.
+        self.canvas.clear_with(&blank_cell());
+        self.canvas.establish_baseline();
     }
 
     /// Wipes the effect away, swaps it, then wipes the next one in.
@@ -276,31 +280,35 @@ impl Playlist {
         &mut self,
         delta: Vec<(usize, usize, Cell)>,
     ) -> Vec<(usize, usize, Cell)> {
-        let width = self.screen_size.0 as usize;
-        let height = self.screen_size.1 as usize;
-        if self.frame.get_size() != (width, height) {
+        let width = self.canvas.width();
+        let height = self.canvas.height();
+        if (self.canvas.width(), self.canvas.height())
+            != (self.screen_size.0 as usize, self.screen_size.1 as usize)
+        {
             self.rebuild_buffers();
         }
 
+        // The canvas accumulates: each effect's diff lands on top of the frame
+        // it is building, which is what lets an effect that draws nothing this
+        // frame keep the one before it.
         for (x, y, cell) in delta {
-            if x < width && y < height {
-                self.frame.set(x, y, cell);
-            }
+            self.canvas.set(x, y, cell);
         }
 
-        let mut target = self.frame.clone();
         let wipe = match self.phase {
             Phase::Running => 0.0,
             Phase::WipeOut => self.phase_progress,
             Phase::WipeIn => 1.0 - self.phase_progress,
         };
         if wipe > 0.0 {
+            // Wiped on a copy, so the undimmed frame underneath survives and the
+            // wipe can be taken back rather than being baked in permanently.
+            let mut target = self.canvas.surface().clone();
             Self::apply_wipe(&mut target, width, height, wipe);
+            self.canvas.replace_surface(target);
         }
 
-        let diff = self.shown.diff(&target);
-        self.shown = target;
-        diff
+        self.canvas.commit()
     }
 
     /// Diagonal wipe: a cell is hidden once the wipe front has reached it.
@@ -558,8 +566,7 @@ mod tests {
         playlist.update_size(20, 8);
 
         assert_eq!(playlist.screen_size, (20, 8));
-        assert_eq!(playlist.frame.get_size(), (20, 8));
-        assert_eq!(playlist.shown.get_size(), (20, 8));
+        assert_eq!(playlist.canvas.size(), (20, 8));
     }
 
     #[test]

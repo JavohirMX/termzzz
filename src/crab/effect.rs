@@ -1,4 +1,5 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
+use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
@@ -102,7 +103,7 @@ impl Default for CrabOptions {
 pub struct Crab {
     pub screen_size: (u16, u16),
     options: CrabOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     crabs: Vec<CrabEntity>,
     rng: EffectRng,
     frame_timer: f32,
@@ -264,8 +265,7 @@ impl CrabEntity {
 
 impl TerminalEffect for Crab {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let mut curr_buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        self.canvas.clear();
 
         // Draw each crab
         for crab in &self.crabs {
@@ -276,18 +276,18 @@ impl TerminalEffect for Crab {
             // Draw each line of the crab frame
             for (y_offset, line) in frame_lines.iter().enumerate() {
                 let y = base_y + y_offset;
-                if y >= curr_buffer.height {
+                if y >= self.canvas.height() {
                     continue;
                 }
 
                 for (x_offset, ch) in line.chars().enumerate() {
                     let x = base_x + x_offset;
-                    if x >= curr_buffer.width || ch == ' ' {
+                    if x >= self.canvas.width() || ch == ' ' {
                         continue;
                     }
 
-                    // Set the character in the buffer
-                    curr_buffer.set(
+                    // Set the character in the canvas
+                    self.canvas.set(
                         x,
                         y,
                         Cell::new(ch, crab.color, style::Attribute::Bold),
@@ -296,10 +296,7 @@ impl TerminalEffect for Crab {
             }
         }
 
-        // Calculate the diff
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -316,6 +313,7 @@ impl TerminalEffect for Crab {
 
     fn update_size(&mut self, width: u16, height: u16) {
         self.screen_size = (width.max(1), height.max(1));
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
         let area = self.screen_size.0 as f32 * self.screen_size.1 as f32;
         self.options.crab_count =
             (area / 800.0 * self.options.crab_coeff).clamp(3.0, 15.0) as u16;
@@ -348,7 +346,7 @@ impl Crab {
         // One generator for the whole colony, drawn from sequentially, so the
         // crabs diverge from each other the way separate draws would.
         let mut rng = seeded_rng(options.seed, "crab");
-        let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
 
         let width = screen_size.0 as f32;
         let height = screen_size.1 as f32;
@@ -400,7 +398,7 @@ impl Crab {
         Self {
             screen_size,
             options,
-            buffer,
+            canvas,
             crabs,
             rng,
             frame_timer: 0.0,

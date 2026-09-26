@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, Cell};
+use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crate::terrain::noise::PerlinNoise;
 use crossterm::style;
@@ -31,7 +32,7 @@ impl Default for TerrainOptions {
 pub struct Terrain {
     pub screen_size: (u16, u16),
     options: TerrainOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     noise: PerlinNoise,
     generated: bool, // Only generate once
 }
@@ -39,17 +40,15 @@ pub struct Terrain {
 impl TerminalEffect for Terrain {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
         if !self.generated {
-            let mut curr_buffer = Buffer::new(
-                self.screen_size.0 as usize,
-                self.screen_size.1 as usize,
+            self.canvas.clear();
+            Self::generate_noise(
+                &self.noise,
+                self.screen_size,
+                &self.options,
+                self.canvas.surface_mut(),
             );
-
-            self.generate_noise(&mut curr_buffer);
-
-            let diff = self.buffer.diff(&curr_buffer);
-            self.buffer = curr_buffer;
             self.generated = true;
-            diff
+            self.canvas.commit()
         } else {
             Vec::new() // No changes after initial generation
         }
@@ -61,12 +60,13 @@ impl TerminalEffect for Terrain {
 
     fn update_size(&mut self, width: u16, height: u16) {
         self.screen_size = (width, height);
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
         self.reset();
     }
 
     fn reset(&mut self) {
-        self.buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        self.canvas
+            .resize(self.screen_size.0.max(1), self.screen_size.1.max(1));
         // The noise is seeded, so it has to be rebuilt too. Leaving the old one
         // in place meant a reset reused the previous terrain's landscape.
         self.noise = PerlinNoise::new(self.options.seed);
@@ -76,37 +76,42 @@ impl TerminalEffect for Terrain {
 
 impl Terrain {
     pub fn new(options: TerrainOptions, screen_size: (u16, u16)) -> Self {
-        let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
         let noise = PerlinNoise::new(options.seed);
 
         Self {
             screen_size,
             options,
-            buffer,
+            canvas,
             noise,
             generated: false,
         }
     }
 
-    fn generate_noise(&self, buffer: &mut Buffer) {
-        let width = self.screen_size.0 as usize;
-        let height = self.screen_size.1 as usize;
+    fn generate_noise(
+        noise: &PerlinNoise,
+        size: (u16, u16),
+        options: &TerrainOptions,
+        buffer: &mut Buffer,
+    ) {
+        let width = size.0 as usize;
+        let height = size.1 as usize;
 
         for y in 0..height {
             for x in 0..width {
                 // Generate noise value
-                let noise_value = self.noise.octave_noise_2d(
+                let noise_value = noise.octave_noise_2d(
                     x as f64,
                     y as f64,
-                    self.options.octaves,
-                    self.options.persistence,
-                    self.options.scale,
+                    options.octaves,
+                    options.persistence,
+                    options.scale,
                 );
 
                 // Normalize to 0-1 range
                 let normalized = (noise_value + 1.0) / 2.0;
 
-                let (character, color) = self.get_noise_visualization(normalized);
+                let (character, color) = Self::get_noise_visualization(normalized);
 
                 buffer.set(
                     x,
@@ -117,7 +122,7 @@ impl Terrain {
         }
     }
 
-    fn get_noise_visualization(&self, value: f64) -> (char, style::Color) {
+    fn get_noise_visualization(value: f64) -> (char, style::Color) {
         // Simple grayscale visualization of noise
         let intensity = (value * 255.0) as u8;
 

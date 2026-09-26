@@ -10,7 +10,8 @@
 //! Birth:
 //!     If a dead cell is surrounded by exactly three living cells,
 //!     it becomes a living cell.
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
+use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
@@ -66,7 +67,7 @@ pub struct ConwayLife {
     pub screen_size: (u16, u16),
     #[allow(dead_code)]
     options: ConwayLifeOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     cells: HashMap<(usize, usize), LifeCell>,
     pub rng: EffectRng,
     pub current_gen: u8,
@@ -108,15 +109,9 @@ impl LifeCell {
 
 impl TerminalEffect for ConwayLife {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let mut curr_buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
-
-        // fill current buffer
-        self.fill_buffer(&mut curr_buffer);
-
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.canvas.clear();
+        self.fill_buffer();
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -134,11 +129,10 @@ impl TerminalEffect for ConwayLife {
             * 0.15
             * self.options.cells_coeff) as u32;
 
-        // The previous-frame buffer has to follow the new size, and cells that no
-        // longer fit have to go. `Buffer::diff` compares the two buffers, and
-        // `fill_buffer` would otherwise index past the end of the new one.
-        self.buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        // The canvas has to follow the new size, and cells that no longer fit
+        // have to go. `Canvas::resize` blanks the baseline so the next commit
+        // repaints in full, which is what a resize needs.
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
         self.cells.retain(|(x, y), _| {
             *x < self.screen_size.0 as usize && *y < self.screen_size.1 as usize
         });
@@ -168,8 +162,7 @@ impl ConwayLife {
     fn step_generation(&mut self) {
         self.current_gen = (self.current_gen + 1) % 255;
 
-        let width = self.buffer.width;
-        let height = self.buffer.height;
+        let (width, height) = (self.canvas.width(), self.canvas.height());
 
         // Seed gliders into the generation we are about to evolve, so this
         // generation's rules apply to them. Seeding them afterwards, into the
@@ -224,7 +217,7 @@ impl ConwayLife {
     pub fn new(options: ConwayLifeOptions, screen_size: (u16, u16)) -> Self {
         let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
         let mut rng = seeded_rng(options.seed, "life");
-        let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
 
         let mut cells = HashMap::new();
         for _ in 0..options.initial_cells {
@@ -238,7 +231,7 @@ impl ConwayLife {
         Self {
             screen_size,
             options,
-            buffer,
+            canvas,
             cells,
             rng,
             current_gen: 0,
@@ -246,11 +239,12 @@ impl ConwayLife {
         }
     }
 
-    pub fn fill_buffer(&mut self, buffer: &mut Buffer) {
-        let (width, height) = buffer.get_size();
+    /// Writes every live cell into the canvas.
+    pub fn fill_buffer(&mut self) {
+        let (width, height) = (self.canvas.width(), self.canvas.height());
         for ((x, y), cell) in self.cells.iter() {
             if *x < width && *y < height {
-                buffer.set(
+                self.canvas.set(
                     *x,
                     *y,
                     Cell::new(cell.character, cell.color, style::Attribute::Bold),
@@ -392,7 +386,7 @@ mod tests {
         life.reset();
 
         assert_eq!(life.screen_size, (8, 6));
-        assert_eq!(life.buffer.get_size(), (8, 6));
+        assert_eq!(life.canvas.size(), (8, 6));
         assert!(life.cells.is_empty());
     }
 

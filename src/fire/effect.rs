@@ -1,4 +1,5 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
+use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
@@ -82,7 +83,7 @@ const MAX_STEPS_PER_FRAME: usize = 4;
 pub struct Fire {
     pub screen_size: (u16, u16),
     options: FireOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     color_palette: Vec<style::Color>,
     fire_bitmap: Vec<u8>,     // fire bitmap
     intensity_table: Vec<u8>, // Fire intensity lookup table
@@ -95,10 +96,8 @@ pub struct Fire {
 
 impl TerminalEffect for Fire {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let curr_buffer = self.draw_fire();
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        self.draw_fire();
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -118,8 +117,9 @@ impl TerminalEffect for Fire {
         let width = self.screen_size.0 as usize;
         let height = self.screen_size.1 as usize;
 
-        // Create new buffer with current size
-        self.buffer = Buffer::new(width, height);
+        // A resize invalidates the frame on screen, so the canvas blanks its
+        // baseline and the next commit repaints in full.
+        self.canvas.resize(width as u16, height as u16);
 
         // Initialize fire bitmap (double the width and height for better resolution)
         let bitmap_width = width * 2;
@@ -145,7 +145,7 @@ impl Fire {
     pub fn new(options: FireOptions, screen_size: (u16, u16)) -> Self {
         let width = screen_size.0 as usize;
         let height = screen_size.1 as usize;
-        let buffer = Buffer::new(width, height);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
 
         // Create color palette from RGB values
         let mut color_palette = Vec::with_capacity(256);
@@ -168,7 +168,7 @@ impl Fire {
             screen_size,
             rng: seeded_rng(options.seed, "fire"),
             options,
-            buffer,
+            canvas,
             color_palette,
             fire_bitmap,
             intensity_table,
@@ -312,9 +312,9 @@ impl Fire {
         }
     }
 
-    fn draw_fire(&mut self) -> Buffer {
-        let mut new_buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+    /// Maps the fire bitmap onto the canvas, one cell per 2x2 bitmap block.
+    fn draw_fire(&mut self) {
+        self.canvas.clear();
 
         // Map fire bitmap to terminal cells
         for y in 0..self.screen_size.1 as usize {
@@ -350,8 +350,7 @@ impl Fire {
                         style::Color::White
                     };
 
-                    // Set the cell in the buffer using the provided method
-                    new_buffer.set(
+                    self.canvas.set(
                         x,
                         y,
                         Cell::new(character, fg_color, style::Attribute::Bold),
@@ -359,7 +358,5 @@ impl Fire {
                 }
             }
         }
-
-        new_buffer
     }
 }

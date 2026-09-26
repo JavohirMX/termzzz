@@ -113,6 +113,15 @@ All notable changes to this project will be documented in this file.
   different seed actually changes what it draws, and that every animated effect
   renders differently at 60fps than at 20fps
 
+### Changed
+- The frame loop takes `&mut dyn TerminalEffect` instead of a generic. It was
+  monomorphised once per effect type, so the timing, input and encoding code
+  existed fifteen times over in the binary
+- All fifteen effects draw through a shared `Canvas` instead of open-coding the
+  double-buffer pattern, and none allocates a full-screen `Buffer` per frame any
+  more. The maze blits its wall template rather than cloning it, and the pipes
+  render about 8% faster at 400x200 as a side effect of simulating in `update`
+
 ### Removed
 - The `DefaultOptions` trait and its thirteen implementations. Nothing called it,
   and its hand-written copies of the per-effect defaults had drifted from the real

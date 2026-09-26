@@ -1,5 +1,6 @@
 use super::renderer::{AsciiRenderer, GlyphPalette};
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
+use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crate::runtime::{FrameContext, InputEvent, Key, KeyPhase, PointerPhase};
 use crossterm::style::Color;
@@ -38,7 +39,7 @@ struct PointerEnergy {
 pub struct AsciiField {
     screen_size: (u16, u16),
     options: AsciiFieldOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     values: Vec<f32>,
     renderer: AsciiRenderer,
     phase: f32,
@@ -50,9 +51,9 @@ pub struct AsciiField {
 
 impl TerminalEffect for AsciiField {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let previous = self.buffer.clone();
+        self.canvas.clear();
         self.render_frame();
-        previous.diff(&self.buffer)
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -90,7 +91,7 @@ impl TerminalEffect for AsciiField {
         let width = self.screen_size.0 as usize;
         let height = self.screen_size.1 as usize;
         self.values = vec![0.0; width * height];
-        self.buffer = Buffer::new(width, height);
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
         self.pointer = None;
     }
 
@@ -121,7 +122,7 @@ impl AsciiField {
         Self {
             screen_size,
             values: vec![0.0; width * height],
-            buffer: Buffer::new(width, height),
+            canvas: Canvas::new(screen_size.0, screen_size.1),
             renderer,
             phase,
             seed_state: options.seed,
@@ -170,8 +171,12 @@ impl AsciiField {
             }
         }
 
-        self.renderer
-            .render_field(&self.values, width, height, &mut self.buffer);
+        self.renderer.render_field(
+            &self.values,
+            width,
+            height,
+            self.canvas.surface_mut(),
+        );
     }
 
     fn handle_key(&mut self, key: Key) {

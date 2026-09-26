@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, Cell};
+use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crossterm::style;
 use serde::{Deserialize, Serialize};
@@ -29,23 +30,25 @@ impl Default for PlasmaOptions {
 pub struct Plasma {
     pub screen_size: (u16, u16),
     options: PlasmaOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     time: f64,
     palette: Vec<style::Color>,
 }
 
 impl TerminalEffect for Plasma {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        // Clone the previous buffer to work with
-        let mut curr_buffer = self.buffer.clone();
-
-        // Update the plasma field directly (no LUT)
-        self.update_plasma(&mut curr_buffer);
-
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-
-        diff
+        // Update the plasma field directly (no LUT). The field is fully redrawn
+        // every frame, so there is nothing to carry over from the last one.
+        self.canvas.clear();
+        Self::update_plasma(
+            self.screen_size,
+            self.time,
+            self.options.color_speed,
+            self.options.spatial_scale,
+            &self.palette,
+            self.canvas.surface_mut(),
+        );
+        self.canvas.commit()
     }
 
     fn update(&mut self) {
@@ -58,12 +61,13 @@ impl TerminalEffect for Plasma {
 
     fn update_size(&mut self, width: u16, height: u16) {
         self.screen_size = (width, height);
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
         self.reset();
     }
 
     fn reset(&mut self) {
-        self.buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        self.canvas
+            .resize(self.screen_size.0.max(1), self.screen_size.1.max(1));
         self.time = 0.0;
     }
 }
@@ -76,7 +80,7 @@ impl Plasma {
     }
 
     pub fn new(options: PlasmaOptions, screen_size: (u16, u16)) -> Self {
-        let buffer = Buffer::new(screen_size.0 as usize, screen_size.1 as usize);
+        let canvas = Canvas::new(screen_size.0, screen_size.1);
         let time = 0.0;
 
         // Generate color palette
@@ -85,7 +89,7 @@ impl Plasma {
         Self {
             screen_size,
             options,
-            buffer,
+            canvas,
             time,
             palette,
         }
@@ -123,9 +127,14 @@ impl Plasma {
     }
 
     /// Calculate plasma value using the [AWK script formula](https://rosettacode.org/wiki/Plasma_effect#AWK)
-    fn calc_plasma_value(&self, x: f64, y: f64, now: f64, w: f64, h: f64) -> u8 {
-        let scale = self.options.spatial_scale;
-
+    fn calc_plasma_value(
+        x: f64,
+        y: f64,
+        now: f64,
+        w: f64,
+        h: f64,
+        scale: f64,
+    ) -> u8 {
         let value = (128.0
             + (128.0 * ((x / 8.0) * scale - (now / 2.0).cos()).sin())
             + 128.0
@@ -146,12 +155,19 @@ impl Plasma {
     }
 
     /// Update the plasma field in the buffer
-    fn update_plasma(&mut self, buffer: &mut Buffer) {
-        let width = self.screen_size.0 as usize;
-        let height = self.screen_size.1 as usize;
+    #[allow(clippy::too_many_arguments)]
+    fn update_plasma(
+        size: (u16, u16),
+        now: f64,
+        color_speed: f64,
+        spatial_scale: f64,
+        palette: &[style::Color],
+        buffer: &mut Buffer,
+    ) {
+        let width = size.0 as usize;
+        let height = size.1 as usize;
         let w = width as f64;
         let h = height as f64;
-        let now = self.time;
 
         for y in 0..height {
             for x in 0..width {
@@ -160,14 +176,20 @@ impl Plasma {
                 let x_f64 = x as f64;
 
                 // Calculate plasma values
-                let plasma = self.calc_plasma_value(x_f64, y_f64, now, w, h * 2.0);
+                let plasma = Self::calc_plasma_value(
+                    x_f64,
+                    y_f64,
+                    now,
+                    w,
+                    h * 2.0,
+                    spatial_scale,
+                );
 
                 // Get color indices with time component
-                let color_idx = ((plasma as f64) + now * self.options.color_speed)
-                    as usize
-                    % 256;
+                let color_idx =
+                    ((plasma as f64) + now * color_speed) as usize % 256;
 
-                let cell_color = self.palette[color_idx];
+                let cell_color = palette[color_idx];
 
                 let cell = Cell::new('*', cell_color, style::Attribute::Bold);
 

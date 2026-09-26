@@ -64,13 +64,27 @@ repository and the distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **The contract refactor** (`Canvas` plus `Box<dyn TerminalEffect>`), which
-   deletes the 14 copies of the double-buffer pattern and the per-frame
-   full-screen buffer allocation, and makes dispatch a vtable. It is also what
-   makes swapping the running effect from a keypress possible.
-2. **The sub-cell renderer.** Braille first, which needs no change to `Cell`
+1. **The sub-cell renderer.** Braille first, which needs no change to `Cell`
    because it is monochrome per cell; half-block afterwards, which needs `Cell`
    to grow a background colour.
+2. **Swapping the running effect from a keypress.** The frame loop now takes
+   `&mut dyn TerminalEffect`, so this needs no new plumbing — only a key binding
+   and a rebuild. Reuse the playlist's diagonal wipe for the transition.
+
+Two smaller things, both optional:
+
+- `AnyEffect` could become `Box<dyn TerminalEffect>` now that the loop is
+  dynamic, deleting the enum and its 96 forwarding arms. It is not free: one
+  playlist test reaches into `AnyEffect::Ascii` to read `paused`, which would
+  need either an `as_any` on the trait or a new `is_paused` method that only
+  `AsciiField` would override. Judge it when something else wants the box.
+- The `run_loop*` wrappers still exist as five signatures over one loop. They
+  are each three lines, so they are cheap, but they could collapse to one
+  function with a small options struct.
+
+The `Canvas` work is done: all fifteen effects hold one instead of open-coding
+the double-buffer pattern, and none of them allocates a full-screen `Buffer` per
+frame any more.
 
 Determinism is done: all nine effects that used an unseeded generator now carry a
 `seed` option and a seeded `StdRng`, `--seed <N>` overrides all of them, and

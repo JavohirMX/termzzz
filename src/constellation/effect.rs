@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, Cell};
+use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crossterm::style;
 use rand::RngExt;
@@ -65,17 +66,35 @@ struct Star {
 pub struct Constellation {
     screen_size: (u16, u16),
     options: ConstellationOptions,
-    buffer: Buffer,
+    canvas: Canvas,
     stars: Vec<Star>,
     connect_dist: f64,
 }
 
 impl TerminalEffect for Constellation {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
-        let curr_buffer = self.draw();
-        let diff = self.buffer.diff(&curr_buffer);
-        self.buffer = curr_buffer;
-        diff
+        // Destructured so the canvas can be borrowed while the rest of the
+        // effect is read; a `&self` draw method could not also hold
+        // `&mut self.canvas`.
+        let Self {
+            stars,
+            connect_dist,
+            options,
+            screen_size,
+            canvas,
+            ..
+        } = self;
+
+        canvas.clear();
+        Self::draw_connections(
+            stars,
+            *connect_dist,
+            options,
+            *screen_size,
+            canvas.surface_mut(),
+        );
+        Self::draw_stars(stars, options, *screen_size, canvas.surface_mut());
+        canvas.commit()
     }
 
     fn update(&mut self) {
@@ -91,12 +110,13 @@ impl TerminalEffect for Constellation {
 
     fn update_size(&mut self, width: u16, height: u16) {
         self.screen_size = (width, height);
+        self.canvas.resize(self.screen_size.0, self.screen_size.1);
         self.reset();
     }
 
     fn reset(&mut self) {
-        self.buffer =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+        self.canvas
+            .resize(self.screen_size.0.max(1), self.screen_size.1.max(1));
         self.connect_dist = Self::calc_connect_dist(
             self.screen_size.0,
             self.screen_size.1,
@@ -122,7 +142,7 @@ impl Constellation {
         let mut effect = Self {
             screen_size,
             options,
-            buffer: Buffer::new(screen_size.0 as usize, screen_size.1 as usize),
+            canvas: Canvas::new(screen_size.0, screen_size.1),
             stars: Vec::new(),
             connect_dist: 0.0,
         };
@@ -206,27 +226,23 @@ impl Constellation {
         }
     }
 
-    fn draw(&self) -> Buffer {
-        let mut next =
-            Buffer::new(self.screen_size.0 as usize, self.screen_size.1 as usize);
+    fn draw_connections(
+        stars: &[Star],
+        connect_dist: f64,
+        options: &ConstellationOptions,
+        size: (u16, u16),
+        buffer: &mut Buffer,
+    ) {
+        let mut conn_count = vec![0usize; stars.len()];
 
-        self.draw_connections(&mut next);
-        self.draw_stars(&mut next);
-
-        next
-    }
-
-    fn draw_connections(&self, buffer: &mut Buffer) {
-        let mut conn_count = vec![0usize; self.stars.len()];
-
-        for i in 0..self.stars.len() {
+        for i in 0..stars.len() {
             let mut neighbors: Vec<(usize, f64)> = Vec::new();
-            for j in (i + 1)..self.stars.len() {
-                let dx = self.stars[j].x - self.stars[i].x;
-                let dy = self.stars[j].y - self.stars[i].y;
+            for j in (i + 1)..stars.len() {
+                let dx = stars[j].x - stars[i].x;
+                let dy = stars[j].y - stars[i].y;
                 let distance = (dx * dx + dy * dy).sqrt();
 
-                if distance <= self.connect_dist {
+                if distance <= connect_dist {
                     neighbors.push((j, distance));
                 }
             }
@@ -234,8 +250,8 @@ impl Constellation {
             neighbors.sort_by(|a, b| a.1.total_cmp(&b.1));
 
             for (j, distance) in neighbors {
-                if conn_count[i] >= self.options.max_connections
-                    || conn_count[j] >= self.options.max_connections
+                if conn_count[i] >= options.max_connections
+                    || conn_count[j] >= options.max_connections
                 {
                     continue;
                 }
@@ -243,30 +259,36 @@ impl Constellation {
                 conn_count[i] += 1;
                 conn_count[j] += 1;
 
-                let alpha = (1.0 - distance / self.connect_dist) * 0.55;
-                let color = self.connection_color(self.stars[i].palette_idx, alpha);
+                let alpha = (1.0 - distance / connect_dist) * 0.55;
+                let color = Self::connection_color(stars[i].palette_idx, alpha);
 
-                self.draw_dotted_line(
+                Self::draw_dotted_line(
+                    size,
                     buffer,
-                    self.stars[i].x.round() as i32,
-                    self.stars[i].y.round() as i32,
-                    self.stars[j].x.round() as i32,
-                    self.stars[j].y.round() as i32,
+                    stars[i].x.round() as i32,
+                    stars[i].y.round() as i32,
+                    stars[j].x.round() as i32,
+                    stars[j].y.round() as i32,
                     color,
                 );
             }
         }
     }
 
-    fn draw_stars(&self, buffer: &mut Buffer) {
-        for star in &self.stars {
-            let brightness = if self.options.twinkle {
+    fn draw_stars(
+        stars: &[Star],
+        options: &ConstellationOptions,
+        size: (u16, u16),
+        buffer: &mut Buffer,
+    ) {
+        for star in stars {
+            let brightness = if options.twinkle {
                 0.55 + 0.45 * star.twinkle.sin()
             } else {
                 0.85
             };
 
-            let mut color = self.star_color(star.palette_idx, brightness);
+            let mut color = Self::star_color(star.palette_idx, brightness);
             if brightness > 0.9 {
                 let pal = PALETTE[star.palette_idx % PALETTE.len()];
                 color = lerp_color(
@@ -286,7 +308,7 @@ impl Constellation {
 
             let x = star.x.round() as i32;
             let y = star.y.round() as i32;
-            if self.in_bounds(x, y) {
+            if Self::in_bounds(size, x, y) {
                 buffer.set(
                     x as usize,
                     y as usize,
@@ -301,7 +323,7 @@ impl Constellation {
     }
 
     fn draw_dotted_line(
-        &self,
+        size: (u16, u16),
         buffer: &mut Buffer,
         x0: i32,
         y0: i32,
@@ -322,7 +344,7 @@ impl Constellation {
             let x = x0 + (dx as f64 * t + 0.5) as i32;
             let y = y0 + (dy as f64 * t + 0.5) as i32;
 
-            if self.in_bounds(x, y) {
+            if Self::in_bounds(size, x, y) {
                 buffer.set(
                     x as usize,
                     y as usize,
@@ -332,7 +354,7 @@ impl Constellation {
         }
     }
 
-    fn connection_color(&self, palette_idx: usize, alpha: f64) -> style::Color {
+    fn connection_color(palette_idx: usize, alpha: f64) -> style::Color {
         let dim = DIM_PALETTE[palette_idx % DIM_PALETTE.len()];
         let pal = PALETTE[palette_idx % PALETTE.len()];
         lerp_color(
@@ -350,7 +372,7 @@ impl Constellation {
         )
     }
 
-    fn star_color(&self, palette_idx: usize, brightness: f64) -> style::Color {
+    fn star_color(palette_idx: usize, brightness: f64) -> style::Color {
         let dim = DIM_PALETTE[palette_idx % DIM_PALETTE.len()];
         let pal = PALETTE[palette_idx % PALETTE.len()];
         lerp_color(
@@ -368,11 +390,8 @@ impl Constellation {
         )
     }
 
-    fn in_bounds(&self, x: i32, y: i32) -> bool {
-        x >= 0
-            && x < self.screen_size.0 as i32
-            && y >= 0
-            && y < self.screen_size.1 as i32
+    fn in_bounds(size: (u16, u16), x: i32, y: i32) -> bool {
+        x >= 0 && x < size.0 as i32 && y >= 0 && y < size.1 as i32
     }
 }
 
