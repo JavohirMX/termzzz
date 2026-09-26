@@ -1,0 +1,101 @@
+name: Release Assets
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag (e.g., v0.1.22) to attach assets to'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build for ${{ matrix.runner }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            arch: x86_64
+      fail-fast: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get Rust toolchain version
+      id: get_toolchain_version
+      run: echo "RUST_TOOLCHAIN=$(grep 'channel =' rust-toolchain.toml | cut -d '"' -f 2)" >> $GITHUB_ENV
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        targets: ${{ matrix.target }}
+
+    - name: Ensure target std is installed
+      shell: bash
+      run: |
+        rustup target add ${{ matrix.target }} --toolchain ${{ env.RUST_TOOLCHAIN }}
+        rustup target list --installed
+
+    - name: Show toolchain info
+      run: |
+        rustc -vV
+        cargo -vV
+        rustup show
+        rustup target list --installed
+
+    - name: Resolve release tag
+      id: tag
+      shell: bash
+      run: |
+        # Prefer release event tag, else input, else ref name
+        TAG_NAME="${{ github.event.release.tag_name }}"
+        if [ -z "$TAG_NAME" ]; then
+          TAG_NAME="${{ github.event.inputs.tag_name }}"
+        fi
+        if [ -z "$TAG_NAME" ]; then
+          TAG_NAME="${{ github.ref_name }}"
+        fi
+        if [ -z "$TAG_NAME" ]; then
+          echo "Could not determine tag name" >&2
+          exit 1
+        fi
+        echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
+
+    - name: Build termzzz
+      run: cargo build --release --target ${{ matrix.target }}
+
+    - name: Create archive and checksum
+      shell: bash
+      run: |
+        # Standard naming convention for Homebrew: termzzz-{version}-{target}.tar.gz
+        ASSET_NAME="termzzz-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+        mkdir -p dist
+        cp target/${{ matrix.target }}/release/termzzz dist/termzzz
+        tar -czvf "$ASSET_NAME" -C dist termzzz
+        echo "ASSET_NAME=$ASSET_NAME" >> $GITHUB_ENV
+        # Generate sha256 checksum file alongside the archive
+        shasum -a 256 "$ASSET_NAME" | awk '{print $1}' > "$ASSET_NAME.sha256"
+
+    - name: Upload release asset
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ env.RELEASE_TAG }}
+        files: |
+          ${{ env.ASSET_NAME }}
+          ${{ env.ASSET_NAME }}.sha256
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

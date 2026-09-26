@@ -1,0 +1,13 @@
+/target
+
+# profiling/coverage garbage
+*.profraw
+*.rb
+
+# misc
+tmp/
+tags
+.DS_Store
+.amc.toml
+.direnv
+

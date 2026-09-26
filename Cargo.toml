@@ -1,0 +1,39 @@
+[package]
+name = "termzzz"
+version = "0.2.0"
+edition = "2024"
+
+authors = ["javohirmx"]
+description = "Screen savers and visual effects for terminal"
+license = "MIT"
+repository = "https://github.com/JavohirMX/termzzz"
+documentation = "https://docs.rs/termzzz"
+homepage = "https://github.com/JavohirMX/termzzz"
+
+[dependencies]
+crossterm = "0.29"
+derive_builder = "0.20"
+directories = "6.0"
+env_logger = "0.11"
+log = "0.4"
+
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1"
+
+[dev-dependencies]
+criterion = "0.8"
+tempfile = "3.27"
+
+[[bench]]
+name = "rain_benchmarks"
+harness = false
+
+# optimized to size
+[profile.release]
+panic = "abort"
+strip = true  # Automatically strip symbols from the binary.
+opt-level = "s"  # Optimize for size.
+lto = true  # enable link time optimization
+codegen-units = 1
