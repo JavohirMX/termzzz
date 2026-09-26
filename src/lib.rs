@@ -25,6 +25,7 @@
 //! | `plasma` | Plasma color wave effect                 |
 //! | `playlist` | Timed playlist with blank-wipe transitions |
 //! | `rain`   | Matrix-style digital rain                |
+//! | `render` | Sub-cell renderers: braille, half-block, dithering |
 //! | `registry`| The effect table: ids, names, durations |
 //! | `runtime`| Runtime input and frame context          |
 //! | `session`| Terminal setup, teardown and panic safety |
@@ -56,6 +57,7 @@ pub mod plasma;
 pub mod playlist;
 pub mod rain;
 pub mod registry;
+pub mod render;
 pub mod runtime;
 pub mod session;
 pub mod terrain;

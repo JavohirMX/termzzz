@@ -122,6 +122,19 @@ All notable changes to this project will be documented in this file.
   more. The maze blits its wall template rather than cloning it, and the pipes
   render about 8% faster at 400x200 as a side effect of simulating in `update`
 
+### Added
+- A sub-cell renderer in `src/render/`. `braille` packs eight dots into a cell
+  for 8x density in one colour; `halfblock` splits a cell into foreground over
+  background for 2x vertical resolution in two colours, which is what gives
+  smooth gradients; `dither` turns a hard threshold into a gradient with a
+  stable Bayer offset; `palette` holds the colour ramps effects share
+
+### Changed
+- `Cell` carries a background colour. Only the half-block glyph `▀` needs it,
+  and `Cell::new` keeps its three arguments and leaves the background at the
+  terminal default, so no existing call site changed and no effect that draws
+  one colour per cell can accidentally paint a second
+
 ### Removed
 - The `DefaultOptions` trait and its thirteen implementations. Nothing called it,
   and its hand-written copies of the per-effect defaults had drifted from the real

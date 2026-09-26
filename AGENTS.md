@@ -64,10 +64,7 @@ repository and the distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **The sub-cell renderer.** Braille first, which needs no change to `Cell`
-   because it is monochrome per cell; half-block afterwards, which needs `Cell`
-   to grow a background colour.
-2. **Swapping the running effect from a keypress.** The frame loop now takes
+1. **Swapping the running effect from a keypress.** The frame loop now takes
    `&mut dyn TerminalEffect`, so this needs no new plumbing — only a key binding
    and a rebuild. Reuse the playlist's diagonal wipe for the transition.
 
@@ -85,6 +82,14 @@ Two smaller things, both optional:
 The `Canvas` work is done: all fifteen effects hold one instead of open-coding
 the double-buffer pattern, and none of them allocates a full-screen `Buffer` per
 frame any more.
+
+The sub-cell renderer is done too, in `src/render/`: `braille` (8x density, one
+colour per cell), `halfblock` (2x vertical, two colours per cell, which is what
+gave `Cell` its background), `dither` and `palette`. Nothing uses it yet — the
+new effects are the point of it. Note the aspect-ratio caveat: both sub-cell
+modes assume a cell about twice as tall as it is wide, and DejaVu Sans Mono is
+nearer 1:1.2, so output looks vertically squashed there. That is a property of
+the technique, not a bug to fix.
 
 Determinism is done: all nine effects that used an unseeded generator now carry a
 `seed` option and a seeded `StdRng`, `--seed <N>` overrides all of them, and

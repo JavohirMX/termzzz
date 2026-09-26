@@ -3,7 +3,20 @@ use crossterm::style;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cell {
     pub symbol: char,
+    /// Foreground colour.
     pub color: style::Color,
+    /// Background colour.
+    ///
+    /// Almost every effect only ever sets the foreground, and
+    /// [`Cell::new`] leaves this at [`style::Color::Reset`] so those are
+    /// untouched. It exists because the half-block glyph `▀` paints its
+    /// foreground over the top half of the cell and its background over the
+    /// bottom, which is how a single character carries two colours -- and
+    /// therefore how a renderer gets smooth colour at 2x vertical resolution.
+    ///
+    /// [`Buffer::diff`] compares it, so a cell whose background alone changed
+    /// is still reported.
+    pub bg: style::Color,
     pub attr: style::Attribute,
 }
 
@@ -16,10 +29,32 @@ pub struct Buffer {
 }
 
 impl Cell {
+    /// A cell with the terminal's default background.
+    ///
+    /// The three-argument form every effect already used. It is kept so that
+    /// adding a background colour did not become a change to a hundred call
+    /// sites, and so an effect that only draws one colour per cell cannot
+    /// accidentally paint a second one.
     pub fn new(symbol: char, color: style::Color, attr: style::Attribute) -> Self {
         Self {
             symbol,
             color,
+            bg: style::Color::Reset,
+            attr,
+        }
+    }
+
+    /// A cell with an explicit background, for the half-block glyphs.
+    pub fn with_bg(
+        symbol: char,
+        color: style::Color,
+        bg: style::Color,
+        attr: style::Attribute,
+    ) -> Self {
+        Self {
+            symbol,
+            color,
+            bg,
             attr,
         }
     }
@@ -30,6 +65,7 @@ impl Default for Cell {
         Self {
             symbol: ' ',
             color: style::Color::Black,
+            bg: style::Color::Reset,
             attr: style::Attribute::Reset,
         }
     }
