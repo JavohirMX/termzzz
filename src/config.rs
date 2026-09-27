@@ -1,3 +1,4 @@
+use crate::common::DEFAULT_SEED;
 use crate::{
     blank::BlankOptions,
     boids::BoidsOptions,
@@ -323,6 +324,93 @@ impl Config {
         self.fire.seed = seed;
         self.terrain.seed = seed;
         self.solarsystem.seed = seed;
+        self.cube.seed = seed;
+        self.donut.seed = seed;
+        self.plasma.seed = seed;
+    }
+
+    /// Gives every *unpinned* effect its own random seed.
+    ///
+    /// A seed of [`DEFAULT_SEED`] does not mean "42" any more -- it means
+    /// **unset**, and this is the method that gives it a value. The request was
+    /// "all the effects should be random and unique every time if no seed is
+    /// set", and until now every effect that used randomness started from 42 on
+    /// every launch, so a screensaver looked the same every time you started it.
+    ///
+    /// Each effect gets a *distinct* draw rather than one shared value. Sharing
+    /// would be cheaper and perfectly reproducible, but then every effect in a
+    /// playlist would be looking at the same underlying numbers, and two effects
+    /// that both hash their seed the same way would move in step.
+    ///
+    /// ## Why `DEFAULT_SEED` means unset
+    ///
+    /// The alternative is `Option<u64>` on twelve option structs, which is the
+    /// honest shape, and it was rejected for a specific reason: it pushes the
+    /// "was this set?" question into every effect's constructor, and an effect
+    /// rebuilt on a terminal resize would draw a *new* seed and change the
+    /// picture under the user. Resolution has to happen once, on the config,
+    /// before anything is built.
+    ///
+    /// The cost of the shortcut is one thing, and it is small: a config that
+    /// pins `seed = 42` is indistinguishable from one that omits it, and both
+    /// mean "give me something different each launch". `--seed 42` is how you
+    /// pin that particular value.
+    ///
+    /// ## What this fixes about `--print-config`
+    ///
+    /// `--print-config` writes every default to disk, so a user with a generated
+    /// config pins whatever the defaults were when they generated it -- the trap
+    /// that let a 60x-too-slow donut rotation survive a default change in this
+    /// project. For seeds that trap now dissolves: 42 no longer pins anything,
+    /// so a generated config asking for 42 is asking for exactly what it should
+    /// be asking for. That is the only reason a shortcut this size is defensible.
+    pub fn randomise_seeds(&mut self) {
+        use rand::RngExt;
+        let draw = || rand::rng().random::<u64>();
+        // An effect pinned to anything *other* than the default was chosen on
+        // purpose and is left alone, which is what "if no seed is set" means.
+        if self.boids.seed == DEFAULT_SEED {
+            self.boids.seed = draw();
+        }
+        if self.crab.seed == DEFAULT_SEED {
+            self.crab.seed = draw();
+        }
+        if self.dvd.seed == DEFAULT_SEED {
+            self.dvd.seed = draw();
+        }
+        if self.fire.seed == DEFAULT_SEED {
+            self.fire.seed = draw();
+        }
+        if self.ink.seed == DEFAULT_SEED {
+            self.ink.seed = draw();
+        }
+        if self.life.seed == DEFAULT_SEED {
+            self.life.seed = draw();
+        }
+        if self.mandelbrot.seed == DEFAULT_SEED {
+            self.mandelbrot.seed = draw();
+        }
+        if self.maze.seed == DEFAULT_SEED {
+            self.maze.seed = draw();
+        }
+        if self.pipes.seed == DEFAULT_SEED {
+            self.pipes.seed = draw();
+        }
+        if self.terrain.seed == DEFAULT_SEED {
+            self.terrain.seed = draw();
+        }
+        if self.solarsystem.seed == DEFAULT_SEED {
+            self.solarsystem.seed = draw();
+        }
+        if self.cube.seed == DEFAULT_SEED {
+            self.cube.seed = draw();
+        }
+        if self.donut.seed == DEFAULT_SEED {
+            self.donut.seed = draw();
+        }
+        if self.plasma.seed == DEFAULT_SEED {
+            self.plasma.seed = draw();
+        }
     }
 }
 

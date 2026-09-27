@@ -107,8 +107,18 @@ fn main() -> Result<(), error::TermzzzError> {
     if seed_won {
         eprintln!("Note: --seed wins over --random, so this run is reproducible.");
     }
-    if let Some(seed) = chosen {
-        config.override_seed(seed);
+    match chosen {
+        Some(seed) => config.override_seed(seed),
+        // No `--seed` and no `--random`, and this is now the *default* rather
+        // than the opt-in it was when the flag was added: every effect whose
+        // seed is still at `DEFAULT_SEED` gets its own draw, so a launch looks
+        // different every time. A seed the user actually set is left alone,
+        // which is what "if no seed is set" means.
+        //
+        // `--random` is kept as a spelling for the same thing. It is now a
+        // no-op, which is a bit silly, and it is kept rather than removed
+        // because a flag that used to do something should not start erroring.
+        None => config.randomise_seeds(),
     }
     let speed = args
         .speed
@@ -401,13 +411,13 @@ fn print_help() {
     println!("        --frames <NUM>       Number of frames to run (with --check)");
     println!("        --speed <MULT>       Global speed multiplier (default 1.0)");
     println!(
-        "        --seed <N>           Seed the random effects, for a reproducible run"
+        "        --seed <N>           Seed every effect, for a reproducible run. Without \
+         it each launch differs"
     );
     println!("        --playlist <LIST>    Play effects in order, comma separated");
     println!("        --shuffle            Play the playlist in random order");
     println!(
-        "        --random             Seed this run at random, so it looks different \
-         every time"
+        "        --random             Deprecated: unseeded runs are already random"
     );
     println!("        --transition <SECS>  Seconds of blank wipe between effects");
     println!("        --print-config       Print default config as TOML to stdout");

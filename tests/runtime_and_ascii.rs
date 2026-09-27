@@ -78,6 +78,117 @@ fn input_state_bounds_held_keys_per_frame() {
     assert!(!state.is_key_pressed(Key::Char('a')));
 }
 
+/// Every effect that uses randomness gets a different seed on every launch, so
+/// the screensaver does not look identical every time it is started.
+///
+/// This is the change of meaning behind `DEFAULT_SEED`. It used to *be* 42, so
+/// every effect started from the same number on every run, and a playlist of
+/// sixteen effects was the same sixteen effects forever. Now it means "unset",
+/// and this is the method that gives it a value.
+#[test]
+fn every_seeded_effect_gets_its_own_random_seed() {
+    use termzzz::common::DEFAULT_SEED;
+
+    let mut config = Config::default();
+    assert_eq!(
+        config.life.seed, DEFAULT_SEED,
+        "the default is no longer 42, so this test is not testing the thing it \
+         was written for"
+    );
+    config.randomise_seeds();
+
+    // Collected from every section, so an effect that gains a seed later and is
+    // not added here fails rather than silently staying frozen at the default.
+    let seeds = [
+        config.boids.seed,
+        config.crab.seed,
+        config.dvd.seed,
+        config.fire.seed,
+        config.ink.seed,
+        config.life.seed,
+        config.mandelbrot.seed,
+        config.maze.seed,
+        config.pipes.seed,
+        config.terrain.seed,
+        config.solarsystem.seed,
+        config.cube.seed,
+        config.donut.seed,
+        config.plasma.seed,
+    ];
+    for (name, seed) in [
+        ("boids", seeds[0]),
+        ("crab", seeds[1]),
+        ("dvd", seeds[2]),
+        ("fire", seeds[3]),
+        ("ink", seeds[4]),
+        ("life", seeds[5]),
+        ("mandelbrot", seeds[6]),
+        ("maze", seeds[7]),
+        ("pipes", seeds[8]),
+        ("terrain", seeds[9]),
+        ("solarsystem", seeds[10]),
+        ("cube", seeds[11]),
+        ("donut", seeds[12]),
+        ("plasma", seeds[13]),
+    ] {
+        assert_ne!(seed, DEFAULT_SEED, "{name} was left on the default seed");
+    }
+
+    let distinct: std::collections::HashSet<u64> = seeds.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        seeds.len(),
+        "{}/{} seeds are unique; the rest collided, so two effects are drawing \
+         from the same numbers: {seeds:?}",
+        distinct.len(),
+        seeds.len()
+    );
+}
+
+/// A seed the user actually set survives, which is the other half of "if no seed
+/// is set", and `--seed` still wins over everything.
+#[test]
+fn a_seed_that_was_set_survives_randomisation() {
+    use termzzz::common::DEFAULT_SEED;
+    let mut config = Config::default();
+    config.life.seed = 1234;
+    config.randomise_seeds();
+    assert_eq!(config.life.seed, 1234, "a pinned seed was randomised away");
+    assert_ne!(config.boids.seed, DEFAULT_SEED);
+
+    // And `--seed` is applied after, in `main`, so it overrides whatever the
+    // randomisation did. This is the order that matters and it is not tested
+    // anywhere else.
+    config.override_seed(99);
+    assert_eq!(config.life.seed, 99);
+    assert_eq!(config.plasma.seed, 99, "a new effect missed override_seed");
+}
+
+/// `--print-config` used to be a trap: it wrote every default to disk, so a
+/// generated config pinned whatever the defaults were, and a default change
+/// never reached anyone with an existing file. That is how a 60x-too-slow donut
+/// rotation survived in this project.
+///
+/// For seeds the trap is now dissolved rather than worked around, and this is
+/// what pins that: a config that has been through a TOML round trip still
+/// randomises, because the value it carries is the one that now *means* unset.
+#[test]
+fn a_generated_config_does_not_pin_the_seeds() {
+    use termzzz::common::DEFAULT_SEED;
+
+    let rendered = toml::to_string_pretty(&Config::default()).unwrap();
+    let mut parsed: Config = toml::from_str(&rendered).unwrap();
+    parsed.randomise_seeds();
+
+    assert_ne!(
+        parsed.life.seed, DEFAULT_SEED,
+        "a config written by --print-config pinned the seeds, so a generated \
+         file makes the effect look the same every launch"
+    );
+    assert_ne!(parsed.cube.seed, DEFAULT_SEED);
+    assert_ne!(parsed.plasma.seed, DEFAULT_SEED);
+}
+
 #[test]
 fn ascii_field_is_deterministic_and_bounds_safe() {
     let options = AsciiFieldOptions {

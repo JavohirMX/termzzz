@@ -1,6 +1,6 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
-use crate::common::TerminalEffect;
+use crate::common::{DEFAULT_SEED, TerminalEffect};
 use crate::render::braille::{BrailleGrid, DOTS_X, DOTS_Y};
 use crate::render::dither::Dither;
 use crate::render::glyph_ramp::{self, GlyphRamp};
@@ -197,6 +197,14 @@ pub struct CubeOptions {
     /// face's density in raised dots rather than in ink coverage, so it has no
     /// ramp to draw from.
     pub glyphs: String,
+    /// Seed for this effect.
+    ///
+    /// [`DEFAULT_SEED`] does not mean 42 here -- it means **unset**, and
+    /// [`Config::randomise_seeds`](crate::config::Config::randomise_seeds)
+    /// gives it a fresh value at startup. Which is what makes this effect look
+    /// different on every launch, which it did not before it had a seed at all.
+    /// `--seed N` pins it.
+    pub seed: u64,
 }
 
 impl Default for CubeOptions {
@@ -208,6 +216,7 @@ impl Default for CubeOptions {
     fn default() -> Self {
         Self {
             cube_size: DEFAULT_CUBE_SIZE,
+            seed: DEFAULT_SEED,
             rotation_speed_x: 0.25,
             rotation_speed_y: 0.35,
             rotation_speed_z: 0.18,

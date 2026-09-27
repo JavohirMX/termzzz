@@ -1,6 +1,6 @@
 use crate::buffer::{Buffer, Cell};
 use crate::canvas::Canvas;
-use crate::common::TerminalEffect;
+use crate::common::{DEFAULT_SEED, TerminalEffect};
 use crate::render::glyph_ramp::{self, GlyphRamp};
 use crossterm::style;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,14 @@ pub struct PlasmaOptions {
     pub color_speed: f64,
     /// Characters the plasma value is drawn as, sparsest first.
     pub glyphs: String,
+    /// Seed for this effect.
+    ///
+    /// [`DEFAULT_SEED`] does not mean 42 here -- it means **unset**, and
+    /// [`Config::randomise_seeds`](crate::config::Config::randomise_seeds)
+    /// gives it a fresh value at startup. Which is what makes this effect look
+    /// different on every launch, which it did not before it had a seed at all.
+    /// `--seed N` pins it.
+    pub seed: u64,
 }
 
 impl Default for PlasmaOptions {
@@ -34,6 +42,7 @@ impl Default for PlasmaOptions {
     fn default() -> Self {
         Self {
             time_scale: 0.5,
+            seed: DEFAULT_SEED,
             spatial_scale: 1.0,
             color_speed: DEFAULT_COLOR_SPEED,
             glyphs: DEFAULT_GLYPHS.to_string(),

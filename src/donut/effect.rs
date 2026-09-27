@@ -1,6 +1,6 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
-use crate::common::TerminalEffect;
+use crate::common::{DEFAULT_SEED, TerminalEffect};
 use crate::render::glyph_ramp::GlyphRamp;
 use crate::render::palette::{Palette, presets as palette_presets};
 use crossterm::style;
@@ -28,6 +28,14 @@ pub struct DonutOptions {
     /// terminal profile. An unknown name falls back to `magma` rather than
     /// failing: a typo in a config file should not stop the program.
     pub palette: String,
+    /// Seed for this effect.
+    ///
+    /// [`DEFAULT_SEED`] does not mean 42 here -- it means **unset**, and
+    /// [`Config::randomise_seeds`](crate::config::Config::randomise_seeds)
+    /// gives it a fresh value at startup. Which is what makes this effect look
+    /// different on every launch, which it did not before it had a seed at all.
+    /// `--seed N` pins it.
+    pub seed: u64,
 }
 
 impl Default for DonutOptions {
@@ -47,6 +55,7 @@ impl Default for DonutOptions {
         // rest of the catalogue is tuned for. Do not "fix" them downwards.
         Self {
             inner_radius: 1.0,
+            seed: DEFAULT_SEED,
             outer_radius: 2.0,
             rotation_speed_a: 1.32,
             rotation_speed_b: 0.60,
