@@ -289,6 +289,17 @@ these were bug reports, and two of the four turned out not to be bugs at all.
 - **`life.step_generation` scans a `HashMap`** and costs about 3.94 ms on its
   `update x4` worst case at 400x200, which is the only reason `life` is over the
   2 ms budget.
+- **`plasma` is now marginally over the 2 ms budget at 400x200** — 2.05 ms, of
+  which 1.09 ms is render and 957 µs is encoding. It was under, at 1.94 ms,
+  before this round: the new glyph calibration runs once per cell and cost 310 µs
+  of that, and a lookup table has taken 180 µs of it back. What remains is four
+  sines per cell, which the effect has always evaluated, plus writing 476 KB.
+
+  Note that **the byte count is not new** — plasma emitted 466 KB before this
+  round and was already the second-largest emitter in the crate. A field peaked
+  in the middle was already rewriting most of the screen every frame; the
+  lopsided glyph histogram made the *characters* lopsided, not the cells static.
+  At 200x50 it is 134 µs of render and 111 µs of encode, well inside budget.
 - **`mandelbrot` render is 11.9 ms at 400x200**, and its cost is very close to
   linear in `max_iterations` because nearly every interior pixel spends the whole
   budget discovering it never escapes. A region-marking rewrite is where the real
