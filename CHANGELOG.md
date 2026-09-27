@@ -286,6 +286,28 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   1920 positions to choose from where a braille cell has two dots. Copying the
   reference's pace onto a medium with a hundredth of its spatial resolution does
   not copy its pace, it copies a stutter.
+- **`[terrain]` is a side-view landscape with parallax, not a cutaway.** It has
+  been rejected twice — "terrible, I don't understand what it's showing me", and
+  then "still shit" after a 2D grain was added to the underground — and both
+  times the cause was the *concept* rather than the execution. It had been a
+  cross-section of the ground, which is not what anyone means by terrain.
+
+  It is now two ridges over a sky: a distant one scrolling more slowly in a
+  dimmer, hazier colour, a nearer one at full speed with a lit top edge, and
+  shaded ground below it running to the bottom of the screen in every column.
+  Two new options: `far_relief` (default 0.5 — distance flattens) and
+  `parallax` (default 0.35 — the far ridge's scroll rate as a fraction of the
+  near one, pinned by measurement rather than taste).
+
+  The far ridge is a **second noise generator**, seeded from `seed` with a salt,
+  not a second rate on the same field. Measured: with one generator the two
+  profiles correlate at 0.89 and the far ridge is visibly the near ridge's twin;
+  with the salt they are uncorrelated.
+
+  The 2D grain is gone, which takes the frame from 1,127 changed cells back to
+  **526** at 400x200 and the render from 54,000 noise samples a frame to 800.
+  That is a round trip: the grain was added two rounds ago to make a cutaway
+  read, and it cost a factor of two in both to do it.
 - **`[crab]` has eight rows of seabed instead of three.** The slope shipped last
   round and was real, but far too small to see: the ground varied about three rows
   on a twenty-four row terminal, which is the bottom eighth of the screen.
