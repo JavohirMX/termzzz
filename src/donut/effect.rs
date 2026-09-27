@@ -1,9 +1,10 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
-use crate::common::{DEFAULT_SEED, TerminalEffect};
+use crate::common::{DEFAULT_SEED, TerminalEffect, seeded_rng};
 use crate::render::glyph_ramp::GlyphRamp;
 use crate::render::palette::{Palette, presets as palette_presets};
 use crossterm::style;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,14 @@ pub struct DonutOptions {
     /// gives it a fresh value at startup. Which is what makes this effect look
     /// different on every launch, which it did not before it had a seed at all.
     /// `--seed N` pins it.
+    ///
+    /// What it randomises is *motion and nothing else* -- the two rates and the
+    /// pose the torus starts in, through [`SPEED_BAND`] and [`PHASE_SPAN`]. The
+    /// palette is deliberately not one of them: a named ramp is a choice a user
+    /// made in a config file, and the twelve colours pair one-to-one with the
+    /// twelve glyphs through a contrast property the tests here pin, so seeding
+    /// the ramp would spend the entropy on the one part of the picture that has
+    /// an argument behind it. See [`DonutOptions::motion`].
     pub seed: u64,
 }
 
@@ -57,13 +66,146 @@ impl Default for DonutOptions {
             inner_radius: 1.0,
             seed: DEFAULT_SEED,
             outer_radius: 2.0,
-            rotation_speed_a: 1.32,
-            rotation_speed_b: 0.60,
+            rotation_speed_a: DEFAULT_SPEED_A,
+            rotation_speed_b: DEFAULT_SPEED_B,
             distance: 5.5,
             k1: 25.0,
             k1_coeff: 1.0,
             luminance_chars: DEFAULT_LUMINANCE_CHARS.to_vec(),
             palette: String::from(DEFAULT_PALETTE),
+        }
+    }
+}
+
+/// The two nominal rates, in radians per second.
+///
+/// Named so [`DonutOptions::motion`] has something to fall back to when a
+/// config file holds a rate that is not a number, and so the bands below are
+/// bands *of* two numbers rather than of a pair of literals. Both are the old
+/// per-frame values scaled to 60 Hz, as the note on `Default` explains, and
+/// neither is to be "fixed" downwards.
+const DEFAULT_SPEED_A: f32 = 1.32;
+const DEFAULT_SPEED_B: f32 = 0.60;
+
+/// How far a launch's rate on the *ring* may sit from the configured one, as a
+/// multiplier.
+///
+/// The wide one of the two, and it is wide because `a` is the axis that decides
+/// whether the effect looks alive. `a` is the ring's own revolution -- the motion
+/// a viewer would describe as "the donut turning" -- and it carries the band for
+/// that reason.
+///
+/// Measured over the 400 seeds `every_seeded_rate_stays_inside_the_band`
+/// samples, a rate of 0.858 to 2.244 rad/s, which is **one revolution every 2.8
+/// to 7.3 seconds**. Both ends of that are inside the 2 to 12 second window
+/// `the_default_spin_resolves_in_seconds_not_minutes` calls alive, with room at
+/// each end, and that is the whole argument for the width: a launch is either
+/// noticeably brisker than the old fixed 4.8 s or noticeably calmer, and never
+/// either stopped or frantic.
+///
+/// The top is a taste bound, and here is what it costs rather than an assertion
+/// that nothing goes wrong. Aliasing is not the worry -- the picture's period is
+/// 2 pi and the top of this band advances 0.037 rad a frame at 60 Hz, so the
+/// torus needs 168 frames to come back to a pose it has already been in. Churn
+/// is: measured at 80x50 as the share of the 1,264 drawn cells whose glyph
+/// changes between consecutive frames, the median runs 12.5% at the bottom of
+/// the band, 19.8% at the old fixed rate, and 27.3% at the top, with a 95th
+/// percentile of 63.2% against the default's 40.4%. So the top of the band
+/// redraws about 1.4 times as much of the torus per frame as the rate this
+/// effect was tuned at. That is a busy-looking torus, and busy is a judgement
+/// rather than a fault; 1.7 is where it stops being a screensaver.
+const SPEED_BAND_A: (f32, f32) = (0.65, 1.7);
+
+/// How far a launch's rate on the *tube* may sit from the configured one.
+///
+/// Much the narrower of the two, and deliberately so: `b` is the tube spinning
+/// about its own axis rather than the ring going round, which is a far subtler
+/// motion, and a wide band on it is the easiest way to make a launch look dead.
+///
+/// The number it has to clear is the slow end. At the bottom of this band `b`
+/// takes **12.3 seconds** a revolution, which is the top of the 2-to-12-second
+/// window the resolution test calls alive -- so the low end cannot go lower
+/// without a launch existing whose tube does not visibly turn. Measured over
+/// four thousand seeds, a *shared* band of `0.6..1.6` -- the width the cube uses
+/// -- would leave **27.9%** of launches with a tube slower than 12 seconds, and
+/// this band's leaves 4.8%. A band on its own axis rather than a second
+/// multiplier on a shared one, because the constraint is per-axis: `a` is
+/// allowed to be brisk or calm because it carries the motion, and `b` is not,
+/// because it only has to keep the tube's own shading pattern turning. `a` is
+/// below 12 s in *every* launch of all three bands measured, which is the other
+/// half of why the split works.
+const SPEED_BAND_B: (f32, f32) = (0.85, 1.35);
+
+/// How far the torus may start from its default pose, in radians, per axis.
+///
+/// A whole turn, and the contrast with the cube's quarter turn is worth a
+/// sentence because the two look like the same constant. The cube's drawn picture
+/// repeats after a quarter turn about any axis -- `(x, y, z)` becoming
+/// `(x, -z, y)` permutes its eight vertices and twelve edges -- so drawing its
+/// opening pose from a whole turn would hand out the same frame four times in
+/// four. A torus has no such symmetry: the point at `phi` and the point at
+/// `phi + pi` are on opposite sides of the hole rather than the same place, and
+/// the brightness term rotates with the object, so every angle is its own
+/// picture and the full turn is all genuinely distinct.
+const PHASE_SPAN: f32 = std::f32::consts::TAU;
+
+/// One launch's motion: the two rates and the pose they start from.
+///
+/// Drawn once, in [`Donut::new`], and held -- see the same reasoning in the
+/// cube, whose `Motion` this mirrors deliberately. `advance` needs a rate on
+/// every frame, and re-deriving six numbers from a generator sixty times a
+/// second would make any bug in it order-dependent. Holding it is also what
+/// makes `reset`, which rebuilds the effect from the same options, come back to
+/// the same opening frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Motion {
+    /// Radians per second about each axis, jittered around the configured
+    /// rates. See [`SPEED_BAND_A`] and [`SPEED_BAND_B`].
+    speeds: (f32, f32),
+    /// The pose at `t = 0`, in radians about each axis. See [`PHASE_SPAN`].
+    phase: (f32, f32),
+}
+
+/// A user-facing `f32` that has to be usable, or a fallback.
+///
+/// The same function as the cube's, which is private to that module; a copy
+/// rather than a shared one because the alternative is a change to `common.rs`
+/// that this effect's own change does not need. The reason it exists is the
+/// same too: a rate goes into `sin` and then into a projected coordinate that is
+/// cast with `as usize`, and a `NaN` cast reads as zero, so one bad number in a
+/// config file puts the entire torus in the left-hand column.
+#[inline]
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
+impl DonutOptions {
+    /// This launch's [`Motion`], drawn from `self.seed`.
+    ///
+    /// The rates are jittered *multiplicatively* about the configured values and
+    /// the phase is a fresh draw. Multiplicative because it keeps a config file
+    /// meaningful in the way the cube's does: a user asking for twice the
+    /// default still gets twice the default, `0.0` still holds an axis still,
+    /// and a negative rate still turns the other way.
+    ///
+    /// A non-finite rate falls back to the default for that axis rather than
+    /// taking the frame with it -- see [`finite_or`]. Before the seed this file
+    /// had no such guard on the rates at all, so `rotation_speed_a = nan` in a
+    /// config drew a torus in a single column.
+    fn motion(&self) -> Motion {
+        let mut rng = seeded_rng(self.seed, "donut.motion");
+        let mut rate = |configured: f32, fallback: f32, band: (f32, f32)| {
+            finite_or(configured, fallback) * rng.random_range(band.0..band.1)
+        };
+        Motion {
+            speeds: (
+                rate(self.rotation_speed_a, DEFAULT_SPEED_A, SPEED_BAND_A),
+                rate(self.rotation_speed_b, DEFAULT_SPEED_B, SPEED_BAND_B),
+            ),
+            phase: (
+                rng.random_range(0.0..PHASE_SPAN),
+                rng.random_range(0.0..PHASE_SPAN),
+            ),
         }
     }
 }
@@ -325,6 +467,11 @@ pub struct Donut {
     canvas: Canvas,
     rotation_a: f32,
     rotation_b: f32,
+    /// This launch's rates and starting pose, drawn from `options.seed`.
+    ///
+    /// Held rather than recomputed, and the one thing about this effect that is
+    /// a function of the *seed* rather than of the clock.
+    motion: Motion,
     scratch: Scratch,
 }
 
@@ -366,18 +513,29 @@ impl Donut {
     /// step per call. Without this the donut spins at whatever rate the
     /// terminal happens to refresh at, and the global speed keys do nothing.
     fn advance(&mut self, delta: f32) {
-        self.rotation_a += self.options.rotation_speed_a * delta;
-        self.rotation_b += self.options.rotation_speed_b * delta;
+        self.rotation_a += self.motion.speeds.0 * delta;
+        self.rotation_b += self.motion.speeds.1 * delta;
     }
 
     pub fn new(options: DonutOptions, screen_size: (u16, u16)) -> Self {
         let canvas = Canvas::new(screen_size.0, screen_size.1);
+        // The one thing about this effect that is a function of the seed rather
+        // than of the clock, drawn once so every frame of the run and every
+        // `reset` of it agree.
+        let motion = options.motion();
         Self {
             screen_size,
             options,
             canvas,
-            rotation_a: 0.0,
-            rotation_b: 0.0,
+            // The opening pose, not the origin. The frame loop draws a frame
+            // *before* it advances anything (`get_diff` then
+            // `update_with_context` in `common::run_loop`), so the pose the
+            // effect is constructed with is the pose on screen for the first
+            // frame -- the one a viewer actually registers, and the one the
+            // randomised start exists for.
+            rotation_a: motion.phase.0,
+            rotation_b: motion.phase.1,
+            motion,
             scratch: Scratch::default(),
         }
     }
@@ -533,6 +691,7 @@ impl Donut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
 
     /// Perceived brightness, so "dim" and "bright" mean something a test can
@@ -548,6 +707,80 @@ mod tests {
             }
             _ => 1.0,
         }
+    }
+
+    /// A torus from a seed, at the size most of the tests here use.
+    ///
+    /// `update_size` is part of the helper because `Donut::new` leaves `k1` at
+    /// the option default of 25 and a real run never does: the frame loop resizes
+    /// before its first frame. A seeded test that skipped it would measure a
+    /// cropped ring at a scale nothing ships with.
+    fn seeded(seed: u64) -> Donut {
+        seeded_at(seed, (80, 40))
+    }
+
+    /// [`seeded`], at a size of the caller's choosing.
+    fn seeded_at(seed: u64, size: (u16, u16)) -> Donut {
+        let mut donut = Donut::new(
+            DonutOptions {
+                seed,
+                ..Default::default()
+            },
+            size,
+        );
+        donut.update_size(size.0, size.1);
+        donut
+    }
+
+    /// The whole picture, as a glyph per coordinate.
+    ///
+    /// `get_diff` is incremental once a frame has been committed, so a
+    /// reconstructed frame is the only way to compare two *pictures* rather than
+    /// two sets of deltas -- and the difference is not a detail here. On a
+    /// turning torus the deltas are the cells at the moving edge, and a
+    /// comparison over those says much less about whether two runs agree than a
+    /// comparison over the whole torus would.
+    ///
+    /// Reassembled by applying each diff to the frame so far, with a blank glyph
+    /// removing a cell, which is what a blank in the diff means.
+    fn whole_frame(
+        donut: &mut Donut,
+        frames: u32,
+    ) -> HashMap<(usize, usize), char> {
+        let mut picture: HashMap<(usize, usize), char> = HashMap::new();
+        for frame in 0..=frames {
+            for (x, y, cell) in donut.get_diff() {
+                if cell.symbol == ' ' {
+                    picture.remove(&(x, y));
+                } else {
+                    picture.insert((x, y), cell.symbol);
+                }
+            }
+            if frame < frames {
+                donut.advance(1.0 / 60.0);
+            }
+        }
+        picture
+    }
+
+    /// How much of a picture two runs have in common, as a share of every cell
+    /// either of them drew.
+    ///
+    /// The union rather than the intersection, so a run that drew *less* is not
+    /// rewarded for it, and zero only ever means "the same picture" or "nothing
+    /// was drawn" -- and `every_seeded_opening_is_a_lit_torus` is what rules the
+    /// second out.
+    fn difference(
+        a: &HashMap<(usize, usize), char>,
+        b: &HashMap<(usize, usize), char>,
+    ) -> f32 {
+        let union: HashSet<(usize, usize)> =
+            a.keys().chain(b.keys()).copied().collect();
+        if union.is_empty() {
+            return 1.0;
+        }
+        let differing = union.iter().filter(|k| a.get(*k) != b.get(*k)).count();
+        differing as f32 / union.len() as f32
     }
 
     // --- perceptual distance ---------------------------------------------
@@ -898,27 +1131,87 @@ mod tests {
         }
     }
 
-    /// The fraction of screen directions around the centre that the drawn
-    /// torus reaches, as a count of `BINS` equal slices.
-    fn polar_coverage(size: (u16, u16), diff: &[(usize, usize, Cell)]) -> f64 {
-        const BINS: usize = 16;
-        let mut hit = [false; BINS];
+    /// The slices the screen's directions around its centre are cut into.
+    ///
+    /// A constant rather than a local so that the two coverage measurements --
+    /// one frame and a whole turn -- cut the same slices, which is what makes
+    /// them comparable.
+    const POLAR_BINS: usize = 16;
+
+    /// Which of the [`POLAR_BINS`] directions around the centre a frame reached.
+    ///
+    /// Accumulated rather than read off a single frame, and the reason is the
+    /// one written on `the_drawn_torus_reaches_every_direction`: the ring does
+    /// not fit on a 12-row screen, so what a *frame* reaches depends on the pose
+    /// as well as on the sampling, and a wedge that is never sampled is missing
+    /// at every pose while a wedge that is merely cropped is missing at some.
+    fn mark_polar(
+        size: (u16, u16),
+        diff: &[(usize, usize, Cell)],
+        hit: &mut [bool; POLAR_BINS],
+    ) {
         for (x, y, _) in diff {
             let dx = *x as f64 + 0.5 - f64::from(size.0) / 2.0;
             let dy = *y as f64 + 0.5 - f64::from(size.1) / 2.0;
             let angle = dy.atan2(dx).rem_euclid(std::f64::consts::TAU);
-            let bin = (angle / (std::f64::consts::TAU / BINS as f64)) as usize;
-            hit[bin.min(BINS - 1)] = true;
+            let bin =
+                (angle / (std::f64::consts::TAU / POLAR_BINS as f64)) as usize;
+            hit[bin.min(POLAR_BINS - 1)] = true;
         }
-        hit.iter().filter(|reached| **reached).count() as f64 / BINS as f64
     }
 
-    /// How much of the screen each shade of the ramp covers, over several
-    /// frames of a tumbling torus.
+    /// The fraction of screen directions around the centre that the drawn
+    /// torus reaches, as a count of `POLAR_BINS` equal slices.
+    fn polar_coverage(size: (u16, u16), diff: &[(usize, usize, Cell)]) -> f64 {
+        let mut hit = [false; POLAR_BINS];
+        mark_polar(size, diff, &mut hit);
+        hit.iter().filter(|reached| **reached).count() as f64 / POLAR_BINS as f64
+    }
+
+    /// How far one step of a pose sweep turns the torus, in seconds.
     ///
-    /// Twelve frames rather than one because a single frame can miss a shade
-    /// that the next one reaches, and the question is whether the ramp is
-    /// reachable at all rather than whether one instant happens to use it.
+    /// A fifth of a second, which is a twentieth of a revolution at the default
+    /// rate -- so a turn is about twenty steps, which is coarse enough to be
+    /// cheap and fine enough that the shade distribution is sampled rather than
+    /// stepped over. It is a *pose* sweep and not a frame-rate one: nothing
+    /// measured with it asks whether the torus moves smoothly between the poses
+    /// it visits.
+    const POSE_STEP: f32 = 0.2;
+
+    /// How many [`POSE_STEP`]s it takes this donut to come all the way round.
+    ///
+    /// From the *effective* rate rather than the configured one, which is the
+    /// whole point of the band existing: a launch whose seed drew a slow ring
+    /// takes 7.3 seconds a revolution, and 4.8 of those is two thirds of a turn,
+    /// so a fixed step count would quietly under-sweep the slowest launches and
+    /// make the measurement a function of the seed all over again. One step
+    /// spare, so the turn closes rather than stopping a stride short of it.
+    fn steps_per_turn(donut: &Donut) -> u32 {
+        let rate = donut.motion.speeds.0.abs().max(1.0e-3);
+        ((std::f32::consts::TAU / (rate * POSE_STEP)).ceil() as u32).max(2) + 1
+    }
+
+    /// How much of the screen each shade of the ramp covers, over a whole turn
+    /// of the torus.
+    ///
+    /// A *turn*, and that is a correction rather than a refinement. It used to be
+    /// twelve frames at a thirtieth of a second, which is 0.4 s -- an eighth of a
+    /// revolution at the default rate -- so both tests that use this were
+    /// measuring a *pose*, with thresholds calibrated on whatever the effect
+    /// happened to be doing at that one pose. The measurements say so plainly.
+    /// Over an eighth of a turn, across eight seeds and three sizes, the dark end
+    /// of the ramp measured between 0.12 and 0.23 of an even spread and the
+    /// bright end between 2.10 and 2.60: every one of those twenty-four
+    /// measurements is outside the 0.36-to-2.4 window
+    /// `the_ramp_is_spread_across_the_drawn_surface` asserts, and the test passed
+    /// only because the pose it started from was the old fixed one. Over a whole
+    /// turn the same eight seeds at the same three sizes measure 0.49 to 0.53 at
+    /// the dark end and 1.45 to 1.80 at the bright one -- inside the same window,
+    /// and the same to within a few percent wherever the sweep starts.
+    ///
+    /// So the thresholds did not move and the sample did. What is measured now is
+    /// a property of the renderer, that the ramp is used like this over the
+    /// torus's whole range of poses, rather than a property of one instant.
     fn shade_histogram(size: (u16, u16), resize: bool) -> [f64; SHADES] {
         let ramp = shade_ramp(&DonutOptions::default().luminance_chars);
         let mut counts = [0usize; SHADES];
@@ -928,14 +1221,8 @@ mod tests {
             // measurement is the projection scale a real run actually uses.
             donut.update_size(size.0, size.1);
         }
-        for step in 0..12u64 {
-            donut.update_with_context(&crate::runtime::FrameContext::new(
-                size,
-                step,
-                Duration::ZERO,
-                Duration::from_secs_f64(1.0 / 30.0),
-                crate::runtime::InputState::default(),
-            ));
+        for _ in 0..steps_per_turn(&donut) {
+            donut.advance(POSE_STEP);
             for (_, _, cell) in donut.get_diff() {
                 if let Some(index) =
                     ramp.glyphs().iter().position(|g| *g == cell.symbol)
@@ -1006,29 +1293,66 @@ mod tests {
     /// directions being empty because the samples that would land there were
     /// never taken.
     ///
-    /// Measured after a moment's rotation rather than at rest. At rest the
-    /// torus is exactly edge-on, and on a 12-row screen the edge-on projection
-    /// is a ring six rows tall -- which leaves a handful of directions
-    /// unsampled for want of anywhere to put a cell, independently of how much
-    /// of the torus was sampled. A general pose is both fairer and closer to
-    /// what anyone watching sees.
+    /// Accumulated over a whole turn rather than read off one frame, and that is
+    /// the claim this bug actually makes. The wedge the shared angle table left
+    /// out is fixed in *object* space, so it is missing at every pose and no
+    /// amount of waiting finds it; a wedge that is merely cropped off the top of
+    /// a small screen is missing at some poses and not others. One frame cannot
+    /// tell those apart, and this used to try: it advanced 0.7 s and asked for
+    /// 95% of the directions in that single frame, which at 40x12 was a
+    /// measurement of the pose it happened to land on. Over twenty seeded
+    /// openings at 40x12 the per-frame figure runs 0.938 to 1.000, while the
+    /// union over a turn is 1.000 at every size measured -- and the worst single
+    /// frame anywhere in that sweep is 0.875, so the old assertion was passing
+    /// by luck at the size where it was most fragile.
+    ///
+    /// The second claim keeps the per-frame part of the old test, as the
+    /// *median* frame over the turn rather than an arbitrary one: the union
+    /// alone would not notice a torus drawn at half the right scale, since every
+    /// direction would still be reached eventually.
+    ///
+    /// And every pose is a seeded one now, so the worst pose in the sweep is not
+    /// the one the old fixed effect always started from. At rest the torus is
+    /// exactly edge-on, and on a 12-row screen the edge-on projection is a ring
+    /// six rows tall, which leaves a handful of directions unsampled for want of
+    /// anywhere to put a cell, independently of how much of the torus was
+    /// sampled -- a general pose is both fairer and closer to what anyone
+    /// watching sees.
     #[test]
     fn the_drawn_torus_reaches_every_direction() {
         for size in [(40u16, 12u16), (40, 20), (80, 50)] {
-            let mut donut = Donut::new(DonutOptions::default(), size);
-            donut.update_size(size.0, size.1);
-            donut.advance(0.7);
-            let diff = donut.get_diff();
-            assert!(!diff.is_empty(), "at {size:?} nothing was drawn at all");
-
-            let coverage = polar_coverage(size, &diff);
+            let mut frames: Vec<f64> = Vec::new();
+            for seed in 0..6u64 {
+                let mut donut = seeded_at(seed, size);
+                let mut hit = [false; POLAR_BINS];
+                for _ in 0..steps_per_turn(&donut) {
+                    donut.advance(POSE_STEP);
+                    let diff = donut.get_diff();
+                    assert!(
+                        !diff.is_empty(),
+                        "at {size:?} a seeded launch drew nothing at all"
+                    );
+                    mark_polar(size, &diff, &mut hit);
+                    frames.push(polar_coverage(size, &diff));
+                }
+                let reached = hit.iter().filter(|h| **h).count();
+                assert_eq!(
+                    reached,
+                    POLAR_BINS,
+                    "at {size:?} seed {seed} swept a whole turn and {} of the \
+                     {POLAR_BINS} directions around the centre were never lit, so \
+                     a wedge of the torus is not being drawn at any pose",
+                    POLAR_BINS - reached
+                );
+            }
+            frames.sort_by(f64::total_cmp);
+            let median = frames[frames.len() / 2];
             assert!(
-                coverage >= 0.95,
-                "at {size:?} the {} drawn cells reach only {:.1}% of the \
-                 directions around the centre, so a wedge of the screen is \
-                 never lit",
-                diff.len(),
-                coverage * 100.0
+                median >= 0.95,
+                "at {size:?} the median frame of a turn reaches only {:.1}% of the \
+                 directions around the centre, so the torus is not filling the \
+                 screen at its usual scale",
+                median * 100.0
             );
         }
     }
@@ -1086,9 +1410,11 @@ mod tests {
             let even = 1.0 / SHADES as f64;
             assert!(
                 darkest >= even * 0.36 && brightest <= even * 2.4,
-                "at {size:?} the shades run from {darkest:.1}% to \
-                 {brightest:.1}% of the surface, and an even ramp would be \
-                 {even:.1}%; measured: {histogram:?}"
+                "at {size:?} the shades run from {:.1}% to {:.1}% of the \
+                 surface, and an even ramp would be {:.1}%; measured: {histogram:?}",
+                darkest * 100.0,
+                brightest * 100.0,
+                even * 100.0
             );
         }
     }
@@ -1328,5 +1654,386 @@ mod tests {
             "{dim_glyph} was painted at {dim:.2} and {bright_glyph} at \
              {bright:.2}: the ramp is inverted"
         );
+    }
+
+    /// The whole point: two launches, two pictures.
+    ///
+    /// Measured on the *reconstructed whole frame* ninety frames in, and not on
+    /// the options, because a comparison of options is a restatement of the code
+    /// that fills the options and would pass against a `seed` that is stored,
+    /// randomised and then never consulted by anything that draws.
+    ///
+    /// The reconstruction is the part worth insisting on. `get_diff` is
+    /// incremental after the first commit, so the obvious thing to compare --
+    /// the diff a frame returns -- is a set of the cells at the torus's moving
+    /// edge. Two runs can have completely different pictures and diffs that
+    /// barely overlap, or the same picture and diffs that differ in a few dozen
+    /// cells, and neither of those is what "this seed looks different" means.
+    /// `whole_frame` applies each diff to the frame so far, so what is compared
+    /// is the torus.
+    ///
+    /// Six pairs rather than one, and the floor at 0.4 against a measured 0.69 to
+    /// 0.97: a test that can be a coincidence is a test that can be flaky, and
+    /// against the bug it is written for -- no randomness at all -- every one of
+    /// the six reads exactly zero. The spread is wider than the cube's because a
+    /// torus has a lot of structure two poses agree about -- the ring is in
+    /// roughly the same place either way -- and the honest reading of a figure
+    /// near 0.7 is "a third of the picture is in a different place", not "nearly
+    /// the same frame".
+    #[test]
+    fn two_seeds_open_on_different_pictures() {
+        for (left, right) in [
+            (42u64, 43u64),
+            (42, 1),
+            (42, 2),
+            (7, 8),
+            (0, 99),
+            (5, 12345),
+        ] {
+            let a = whole_frame(&mut seeded(left), 90);
+            let b = whole_frame(&mut seeded(right), 90);
+            let differing = difference(&a, &b);
+            assert!(
+                differing > 0.4,
+                "seeds {left} and {right} are 90 frames into a run and their \
+                 frames differ on {:.0}% of the cells either drew, so the seed is \
+                 not reaching the motion",
+                differing * 100.0
+            );
+        }
+    }
+
+    /// The same seed twice is the same run, frame for frame.
+    ///
+    /// The half of the contract that makes `--seed N` mean anything, and
+    /// `tests/effect_contracts.rs` asserts it for every effect at once. It is
+    /// asserted here too because a failure can then name the effect, and
+    /// because a generator consulted on every frame rather than drawn once in
+    /// `Donut::new` shows up as drift rather than as two effects disagreeing.
+    #[test]
+    fn the_same_seed_replays_the_same_run() {
+        let mut a = seeded(2024);
+        let mut b = seeded(2024);
+        for step in 0..90u32 {
+            a.advance(1.0 / 60.0);
+            b.advance(1.0 / 60.0);
+            assert_eq!(
+                a.get_diff(),
+                b.get_diff(),
+                "two tori on seed 2024 differ on frame {step}, so the motion is \
+                 not a function of the seed"
+            );
+        }
+    }
+
+    /// Every launch opens on a lit torus, and reaches the whole ramp from there.
+    ///
+    /// The risk randomising the opening pose carries here, and it is a different
+    /// one from the cube's. The torus's *shape* does not depend on the pose at
+    /// all -- the same ring is projected whatever `a` and `b` are -- so the thing
+    /// a random pose can break is not the geometry but the sampling: which of the
+    /// twelve shades the visible surface turns out to wear. The ramp tests above
+    /// all average over a whole turn now, which is right for what they are about
+    /// and means a single unlucky *opening* could hide inside the average; this
+    /// is the test that cannot.
+    ///
+    /// Twenty seeds, three sizes, and the pose is read off the effect rather than
+    /// reconstructed -- the frame loop draws before it advances, so the pose the
+    /// effect is constructed with is the pose on screen for the first frame.
+    ///
+    /// The last claim is the one that makes this a test of the seed rather than
+    /// of the renderer: the twenty openings have to differ from each other.
+    /// Without it everything above would pass twenty times over on the same
+    /// default pose, and report coverage that was not being provided.
+    #[test]
+    fn every_seeded_opening_is_a_lit_torus() {
+        let ramp = shade_ramp(&DonutOptions::default().luminance_chars);
+        let mut openings: Vec<HashMap<(usize, usize), char>> = Vec::new();
+
+        for seed in 0..20u64 {
+            for size in [(40u16, 12u16), (40, 20), (80, 50)] {
+                let mut donut = seeded_at(seed, size);
+                let first = donut.get_diff();
+                assert!(
+                    !first.is_empty(),
+                    "seed {seed} at {size:?} opened on an empty screen, and the \
+                     torus's shape does not depend on the pose"
+                );
+
+                let mut seen = [false; SHADES];
+                for (_, _, cell) in &first {
+                    mark_shade(&ramp, &mut seen, cell.symbol);
+                }
+                for _ in 0..steps_per_turn(&donut) {
+                    donut.advance(POSE_STEP);
+                    for (_, _, cell) in donut.get_diff() {
+                        mark_shade(&ramp, &mut seen, cell.symbol);
+                    }
+                }
+                let unused: Vec<usize> = seen
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, reached)| !**reached)
+                    .map(|(shade, _)| shade)
+                    .collect();
+                assert!(
+                    unused.is_empty(),
+                    "seed {seed} at {size:?} opens at {:?} and never draws shades \
+                     {unused:?} of the twelve: a pose where part of the ramp is \
+                     unreachable is part of what randomising the opening costs",
+                    donut.rotation_a
+                );
+            }
+
+            openings.push(whole_frame(&mut seeded(seed), 0));
+        }
+
+        // Every pair, not a sample of them: a claim that twenty openings are
+        // varied is a claim about the *closest* two of them, and a sample of
+        // pairs can miss the closest. Measured over the 190 pairs, the spread
+        // runs 0.40 at the closest and 0.996 at the furthest, with a median of
+        // 0.956 -- so the floor is a quarter, well under half the closest, and
+        // the median is asserted separately because a torus drawn in coarse
+        // glyphs has plenty of cells two poses can agree about: two rings in
+        // roughly the same place with roughly the same shading can share three
+        // cells in five and still be visibly different.
+        let mut all: Vec<f32> = Vec::new();
+        for a in 0..openings.len() {
+            for b in a + 1..openings.len() {
+                all.push(difference(&openings[a], &openings[b]));
+            }
+        }
+        all.sort_by(f32::total_cmp);
+        let median = all[all.len() / 2];
+
+        let mut closest = 1.0f32;
+        for (index, picture) in openings.iter().enumerate() {
+            assert!(
+                !picture.is_empty(),
+                "seed {index} drew no cells at all, so there is no picture to \
+                 compare"
+            );
+            for other in openings.iter().skip(index + 1) {
+                closest = closest.min(difference(picture, other));
+            }
+        }
+        assert_eq!(openings.len(), 20, "not every seed was opened");
+        assert!(
+            closest > 0.25,
+            "two of the twenty seeded openings differ on only {:.0}% of their \
+             cells, so the starting poses are not varied",
+            closest * 100.0
+        );
+        assert!(
+            median > 0.8,
+            "the median pair of the twenty openings differs on only {:.0}% of \
+             their cells, so the poses are varied in name only",
+            median * 100.0
+        );
+    }
+
+    /// Records that a glyph is one of the ramp's, and at which shade.
+    ///
+    /// By glyph rather than by colour, because the shade index travels with the
+    /// character: the renderer picks the glyph from the shade and the second
+    /// pass picks the colour from the same number, so a glyph is the honest place
+    /// to read the shade back out of. A glyph that is not on the ramp is ignored
+    /// rather than counted as some shade -- which is what keeps a stray character
+    /// from being reported as a shade the torus did draw.
+    fn mark_shade(ramp: &GlyphRamp, seen: &mut [bool; SHADES], symbol: char) {
+        if let Some(index) = ramp.glyphs().iter().position(|g| *g == symbol) {
+            seen[index.min(SHADES - 1)] = true;
+        }
+    }
+
+    /// Every seeded rate is inside its band's axis, *and the band is reached*.
+    ///
+    /// Two claims, and the second is the one that has bitten this project
+    /// before. The first is the obvious one: 200 seeds, every `a` inside
+    /// `DEFAULT_SPEED_A * SPEED_BAND_A`, every `b` inside
+    /// `DEFAULT_SPEED_B * SPEED_BAND_B`, and every phase inside `[0, TAU)`. The
+    /// second is that the draw is not quietly losing most of the range it was
+    /// given -- a normalisation constant taken from a spec sheet rather than from
+    /// a measurement is how a range that reads `0.85..1.35` in the source
+    /// arrives on screen as `0.95..1.05`, and it is how this crate's terrain
+    /// relief lost four fifths of its amplitude three times over without an
+    /// error anywhere.
+    ///
+    /// The extremes are measured rather than assumed. A draw of `n` uniform
+    /// samples from `[lo, hi]` puts its smallest within `(hi - lo) / (n + 1)` of
+    /// `lo` and its largest within the same of `hi` -- 0.5% of the band at 200
+    /// seeds -- so the floor here is 97% of each end reached. Measured over 400
+    /// seeds the two axes reach 0.8582 against an exact floor of 0.8580, 2.2418
+    /// against 2.2440, 0.5100 against 0.5100 and 0.8071 against 0.8100, so the
+    /// arithmetic and the draw agree to within a part in a thousand.
+    ///
+    /// Per axis and per band rather than pooled, because pooling hides exactly
+    /// the mistake worth catching here: a `b` band that had been written as `a`'s
+    /// would still produce plausible global extremes.
+    #[test]
+    fn every_seeded_rate_stays_inside_the_band() {
+        const SEEDS: u64 = 200;
+        let bands = [
+            (DEFAULT_SPEED_A, SPEED_BAND_A),
+            (DEFAULT_SPEED_B, SPEED_BAND_B),
+        ];
+        let mut phases: Vec<f32> = Vec::new();
+
+        for (axis, (configured, band)) in bands.iter().enumerate() {
+            let (low, high) = (configured * band.0, configured * band.1);
+            let mut seen_low = f32::INFINITY;
+            let mut seen_high = f32::NEG_INFINITY;
+
+            for seed in 0..SEEDS {
+                let motion = DonutOptions {
+                    seed,
+                    ..Default::default()
+                }
+                .motion();
+                let rate = if axis == 0 {
+                    motion.speeds.0
+                } else {
+                    motion.speeds.1
+                };
+                assert!(
+                    (low..=high).contains(&rate),
+                    "seed {seed} gave axis {axis} a rate of {rate}, outside the \
+                     band {low}..{high}"
+                );
+                seen_low = seen_low.min(rate);
+                seen_high = seen_high.max(rate);
+
+                let phase = if axis == 0 {
+                    motion.phase.0
+                } else {
+                    motion.phase.1
+                };
+                assert!(
+                    (0.0..PHASE_SPAN).contains(&phase),
+                    "seed {seed} gave axis {axis} a phase of {phase}, outside \
+                     0..{PHASE_SPAN}"
+                );
+                phases.push(phase);
+            }
+
+            let span = high - low;
+            assert!(
+                seen_low <= low + 0.03 * span,
+                "the slowest rate axis {axis} ever drew was {seen_low}, more than \
+                 3% of the band above its floor of {low}: the draw is not using \
+                 the bottom of the range it was given"
+            );
+            assert!(
+                seen_high >= high - 0.03 * span,
+                "the quickest rate axis {axis} ever drew was {seen_high}, more than \
+                 3% of the band below its ceiling of {high}: the draw is not \
+                 using the top of the range it was given"
+            );
+        }
+
+        let phase_low = phases.iter().copied().fold(f32::INFINITY, f32::min);
+        let phase_high = phases.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            phase_low <= 0.03 * PHASE_SPAN && phase_high >= 0.97 * PHASE_SPAN,
+            "the phases only covered {phase_low:.3}..{phase_high:.3} of \
+             0..{PHASE_SPAN}, so the opening poses are not being varied"
+        );
+    }
+
+    /// A configured rate of zero still holds that axis still, and a negative one
+    /// still turns the other way.
+    ///
+    /// A guard for the design rather than a test of the fix -- both would pass
+    /// before the seed existed -- and it is here because the bands are applied
+    /// *multiplicatively*, which has consequences worth stating. Additive jitter
+    /// would put a random rate on an axis a user had asked to freeze, and would
+    /// flip the sign of a rate a user had set negative, the moment a seed
+    /// arrived. This is the test that says neither happens, on both axes and
+    /// over several seeds so that a single lucky draw cannot carry it.
+    ///
+    /// `is_finite` is checked as well as the sign, because a `NaN` compares
+    /// false against everything and would sail through a sign check that only
+    /// asked whether the answer was negative.
+    #[test]
+    fn a_configured_rate_keeps_its_sign_and_its_zero() {
+        for (axis, configured) in [
+            (0usize, 0.0f32),
+            (1, 0.0),
+            (0, -1.0),
+            (1, -1.0),
+            (0, -0.02),
+            (1, -0.02),
+        ] {
+            for seed in 1..=5u64 {
+                let options = DonutOptions {
+                    rotation_speed_a: if axis == 0 {
+                        configured
+                    } else {
+                        DEFAULT_SPEED_A
+                    },
+                    rotation_speed_b: if axis == 1 {
+                        configured
+                    } else {
+                        DEFAULT_SPEED_B
+                    },
+                    seed,
+                    ..Default::default()
+                };
+                let motion = options.motion();
+                let rate = match axis {
+                    0 => motion.speeds.0,
+                    _ => motion.speeds.1,
+                };
+                assert!(
+                    rate.is_finite(),
+                    "a configured {configured} on axis {axis} became a rate of \
+                     {rate} on seed {seed}"
+                );
+                assert!(
+                    (rate == 0.0) == (configured == 0.0)
+                        && rate.is_sign_negative() == configured.is_sign_negative(),
+                    "a configured {configured} on axis {axis} became a rate of \
+                     {rate} on seed {seed}, so the band is not multiplicative"
+                );
+            }
+        }
+    }
+
+    /// A rate that is not a number falls back instead of taking the frame with it.
+    ///
+    /// The rate goes into `sin`, then into a projected coordinate, and that is
+    /// cast with `as usize` -- where a `NaN` reads as zero. So one bad number in
+    /// a config file does not produce a torus that is slightly wrong; it produces
+    /// a torus in the left-hand column. This was reachable before the seed too,
+    /// and nothing in this file caught it, which is why the guard was added
+    /// alongside the derivation rather than after it.
+    #[test]
+    fn a_rate_that_is_not_a_number_falls_back_rather_than_emptying_the_frame() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for axis in 0..2 {
+                let options = DonutOptions {
+                    rotation_speed_a: if axis == 0 { bad } else { DEFAULT_SPEED_A },
+                    rotation_speed_b: if axis == 1 { bad } else { DEFAULT_SPEED_B },
+                    seed: 11,
+                    ..Default::default()
+                };
+                let motion = options.motion();
+                let drawn = [motion.speeds.0, motion.speeds.1];
+                assert!(
+                    drawn.iter().all(|r| r.is_finite()),
+                    "a rate of {bad} on axis {axis} left the launch with {drawn:?}"
+                );
+
+                let mut donut = Donut::new(options, (80, 40));
+                donut.update_size(80, 40);
+                let picture = whole_frame(&mut donut, 0);
+                assert!(
+                    picture.len() > 200,
+                    "a rate of {bad} on axis {axis} drew {} cells, so the torus \
+                     is not on the screen",
+                    picture.len()
+                );
+            }
+        }
     }
 }

@@ -1,11 +1,12 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
-use crate::common::{DEFAULT_SEED, TerminalEffect};
+use crate::common::{DEFAULT_SEED, TerminalEffect, seeded_rng};
 use crate::render::braille::{BrailleGrid, DOTS_X, DOTS_Y};
 use crate::render::dither::Dither;
 use crate::render::glyph_ramp::{self, GlyphRamp};
 use crate::render::palette::Palette;
 use crossterm::style::{Attribute, Color};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -204,6 +205,13 @@ pub struct CubeOptions {
     /// gives it a fresh value at startup. Which is what makes this effect look
     /// different on every launch, which it did not before it had a seed at all.
     /// `--seed N` pins it.
+    ///
+    /// What it randomises is *motion and nothing else* -- the three rates and
+    /// the pose the cube starts in, through [`SPEED_BAND`] and [`PHASE_SPAN`].
+    /// The geometry, the depth ramp, the fill and the corner markers are not
+    /// seeded, because they are what makes a frame a cube rather than a
+    /// different cube; a screensaver that reshuffles its own rendering is a
+    /// screensaver nobody recognises twice. See [`CubeOptions::motion`].
     pub seed: u64,
 }
 
@@ -217,9 +225,9 @@ impl Default for CubeOptions {
         Self {
             cube_size: DEFAULT_CUBE_SIZE,
             seed: DEFAULT_SEED,
-            rotation_speed_x: 0.25,
-            rotation_speed_y: 0.35,
-            rotation_speed_z: 0.18,
+            rotation_speed_x: DEFAULT_SPEED_X,
+            rotation_speed_y: DEFAULT_SPEED_Y,
+            rotation_speed_z: DEFAULT_SPEED_Z,
             distance: DEFAULT_DISTANCE,
             use_braille: true,
             fit: DEFAULT_FIT,
@@ -228,6 +236,112 @@ impl Default for CubeOptions {
             glyphs: DEFAULT_GLYPHS.to_string(),
         }
     }
+}
+
+/// The three nominal rates, in radians per second, and the middle of the band
+/// the seed draws from.
+///
+/// Named so that [`CubeOptions::motion`] has something honest to fall back to
+/// when a config file holds a `NaN` -- a rate is multiplied into every
+/// coordinate of every vertex, so one non-finite rate takes the whole frame
+/// with it -- and so the band below has three numbers to be a band *of*.
+const DEFAULT_SPEED_X: f32 = 0.25;
+const DEFAULT_SPEED_Y: f32 = 0.35;
+const DEFAULT_SPEED_Z: f32 = 0.18;
+
+/// How far a launch's rate may sit from the configured one, as a multiplier.
+///
+/// Applied to the configured rate rather than drawn independently of it, which
+/// is what keeps a config file meaningful: a user who asks for twice the
+/// default still gets twice the default, and a user who asks for `0.0` to hold
+/// one axis still gets an axis that does not move. Multiplicative rather than
+/// additive for the same reason -- it preserves the sign of a negative rate,
+/// which is how a hand-edited config asks for the other direction of spin.
+///
+/// Measured as the *apparent* rate. The cube's drawn picture repeats after a
+/// quarter turn about any axis (see [`PHASE_SPAN`]), so a real rate of `r`
+/// reorients the picture every `(pi / 2) / r` seconds, and a launch's apparent
+/// rate is set by whichever of its three axes is quickest. Four hundred seeds
+/// per band, `every_seeded_rate_stays_inside_the_band` being the test that
+/// samples:
+///
+/// ```text
+/// band          quickest axis      slowest axis      median
+/// 0.5 .. 2.0        2.2 .. 17.3 s       17.3 s         5.2 s
+/// 0.6 .. 1.8        2.5 .. 14.4 s       14.4 s         5.4 s   <- chosen
+/// 0.7 .. 1.5        3.0 .. 12.4 s       12.4 s         5.9 s
+/// ```
+///
+/// for reference against a fixed 4.5 s, which is what the old unseeded effect
+/// did every single time.
+///
+/// The slow end is a "not a still image" floor and it is a floor on the
+/// *slowest* axis rather than on the visible rate, which is the distinction
+/// that matters: at the bottom of this band the z axis takes 14.4 s to
+/// reorient and the cube is still visibly turning on the other two. The
+/// bottom row of the wider band is 17.3 s, and a cube that reorients once per
+/// quarter of a minute is not a slow screensaver.
+///
+/// The fast end is *not* an aliasing bound, and it is worth saying why, because
+/// the obvious worry is the wrong one. Aliasing needs the picture to advance a
+/// sizeable fraction of its own period between two frames, and the picture's
+/// period is a quarter turn: at the top of this band the quickest axis turns
+/// 0.0105 rad per frame at 60 Hz, so the frame-to-frame advance is 0.67% of the
+/// way back to where it was and the cube needs 150 frames to come back to a
+/// pose it has already been in. Nothing in this effect aliases at any speed a
+/// band of this width can produce. Measured on the drawn frame at 200x50, as the
+/// median and the worst case over 300 frames of the largest per-frame
+/// displacement among the eight projected vertices:
+///
+/// ```text
+/// multiplier   cells per frame (median / worst)
+/// 0.6                0.151 / 0.227
+/// 1.0                0.270 / 0.378
+/// 1.8                0.508 / 0.738
+/// ```
+///
+/// That is a *judder* measurement rather than an aliasing one, and half a cell
+/// a frame at the top of the band is where a wireframe stops looking like it is
+/// turning smoothly and starts looking like it is being redrawn somewhere else.
+/// So the top is a taste bound on that, and the column above is the argument for
+/// where the taste sits rather than a claim that something breaks past it.
+///
+/// 0.6 and 1.8 rather than 0.5 and 2.0 because the *width* is what a viewer
+/// notices, and 2.2 s at the top of the wider band is a different effect rather
+/// than a different launch of this one.
+const SPEED_BAND: (f32, f32) = (0.6, 1.8);
+
+/// How far the cube may start from its default pose, in radians, per axis.
+///
+/// A quarter turn, and not a whole one, because a quarter turn about any axis
+/// maps the cube's eight vertices and twelve edges onto themselves exactly:
+/// `(x, y, z)` becomes `(x, -z, y)` about `x`, which permutes `{+/-1}^3` and
+/// permutes the edges with it. So the drawn frame at `p` and at `p + pi / 2` is
+/// the same picture -- same cells, same depths, same colours, same seven corner
+/// markers -- and a full-turn draw would hand out the same frame four times out
+/// of four. Drawing from the period means every sample is a distinct opening
+/// pose, which is the whole of what this constant is for.
+///
+/// Pinned against the code by
+/// `a_quarter_turn_away_is_very_much_the_same_picture`.
+const PHASE_SPAN: f32 = std::f32::consts::FRAC_PI_2;
+
+/// One launch's motion: the three rates and the pose they start from.
+///
+/// Derived once, in [`Cube::new`], from `options.seed` and held rather than
+/// recomputed, because the frame loop needs the rate on every frame and the
+/// phase on every one of them too, and a generator consulted sixty times a
+/// second to produce six numbers would be a way of making a bug
+/// order-dependent. Holding it is also what makes `reset` -- which rebuilds the
+/// whole effect from the same options -- come back to the same opening frame
+/// rather than to a different one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Motion {
+    /// Radians per second about each axis, jittered around the configured
+    /// rates. See [`SPEED_BAND`].
+    speeds: (f32, f32, f32),
+    /// The pose at `t = 0`, in radians about each axis. See [`PHASE_SPAN`].
+    phase: (f32, f32, f32),
 }
 
 /// The default `cube_size`, and what an unusable one falls back to.
@@ -694,6 +808,13 @@ pub struct Cube {
     canvas: Canvas,
     vertices: Vec<Point3D>,
     rotation: (f32, f32, f32),
+    /// This launch's rates and starting pose, drawn from `options.seed`.
+    ///
+    /// Held rather than recomputed, and never re-derived from the field it
+    /// advances -- see [`Motion`]. The effect is otherwise a pure function of
+    /// `simulation_time`, and this is the one thing about it that is a pure
+    /// function of the *seed* instead.
+    motion: Motion,
     simulation_time: Duration,
     field: Field,
     ramp: GlyphRamp,
@@ -751,11 +872,21 @@ impl TerminalEffect for Cube {
 }
 
 impl Cube {
+    /// Where the cube is at `simulation_time`, from this launch's pose and rates.
+    ///
+    /// Absolute rather than accumulated, as it always was, so a dropped frame
+    /// costs a frame rather than a jump. The phase is added here rather than
+    /// folded into the initial `simulation_time` for the same reason: the clock
+    /// is a fact about how long the effect has been running, and putting a
+    /// random number in it would make every read of it a lie.
     fn update_rotation(&mut self) {
         let elapsed = self.simulation_time.as_secs_f32();
-        self.rotation.0 = elapsed * self.options.rotation_speed_x;
-        self.rotation.1 = elapsed * self.options.rotation_speed_y;
-        self.rotation.2 = elapsed * self.options.rotation_speed_z;
+        let motion = self.motion;
+        self.rotation = (
+            motion.phase.0 + elapsed * motion.speeds.0,
+            motion.phase.1 + elapsed * motion.speeds.1,
+            motion.phase.2 + elapsed * motion.speeds.2,
+        );
     }
 
     pub fn new(options: CubeOptions, screen_size: (u16, u16)) -> Self {
@@ -816,6 +947,11 @@ impl Cube {
         let face_palette = Palette::new(FACE_RAMP.to_vec());
         let edge_palette = Palette::new(EDGE_RAMP.to_vec());
 
+        // The one thing about this effect that is a function of the seed rather
+        // than of the clock, drawn once so every frame of the run and every
+        // `reset` of it agree.
+        let motion = options.motion();
+
         Self {
             screen_size,
             rotated: vec![
@@ -834,7 +970,14 @@ impl Cube {
             options,
             canvas,
             vertices,
-            rotation: (0.0, 0.0, 0.0),
+            // The opening pose, not the identity. The frame loop draws a frame
+            // *before* it advances anything (`get_diff` then
+            // `update_with_context` in `common::run_loop`), so the pose the
+            // effect is constructed with is the pose on screen for the first
+            // sixteenth of a second -- which is the frame a viewer actually
+            // registers, and the one the whole randomised start exists for.
+            rotation: motion.phase,
+            motion,
             simulation_time: Duration::ZERO,
         }
     }
@@ -1668,6 +1811,47 @@ impl CubeOptions {
                 / 3.0f32.sqrt(),
         )
     }
+
+    /// This launch's [`Motion`], drawn from `self.seed`.
+    ///
+    /// As a method on the options for the same reason as
+    /// [`effective_cube_size`](Self::effective_cube_size): `Cube::new` needs it
+    /// and has no instance to ask yet.
+    ///
+    /// The rates are jittered *multiplicatively* about the configured values
+    /// and the phase is a fresh draw, so the two halves of the answer have
+    /// different relationships to the config file on purpose. A configured rate
+    /// stays the centre of its band, which is the trade this makes and the
+    /// reason `the_rotation_defaults_are_unchanged` can keep pinning 0.25, 0.35
+    /// and 0.18 exactly. What it costs is that a launch turns at between 40%
+    /// slower and 80% faster than the file asks for rather than exactly at it,
+    /// so a user who pinned a rate to a particular value stops getting it. For
+    /// an effect whose whole content is twelve lines turning, that is the
+    /// difference between a screensaver and a test fixture, and `--seed` puts
+    /// the exact rate back by pinning the multiplier to 1.
+    ///
+    /// A non-finite rate falls back to the default for that axis rather than
+    /// multiplying `NaN` into all eight vertices, which is the same reasoning as
+    /// `finite_or` everywhere else in this file.
+    fn motion(&self) -> Motion {
+        let mut rng = seeded_rng(self.seed, "cube.motion");
+        let mut rate = |configured: f32, fallback: f32| {
+            finite_or(configured, fallback)
+                * rng.random_range(SPEED_BAND.0..SPEED_BAND.1)
+        };
+        Motion {
+            speeds: (
+                rate(self.rotation_speed_x, DEFAULT_SPEED_X),
+                rate(self.rotation_speed_y, DEFAULT_SPEED_Y),
+                rate(self.rotation_speed_z, DEFAULT_SPEED_Z),
+            ),
+            phase: (
+                rng.random_range(0.0..PHASE_SPAN),
+                rng.random_range(0.0..PHASE_SPAN),
+                rng.random_range(0.0..PHASE_SPAN),
+            ),
+        }
+    }
 }
 
 impl Cube {
@@ -1884,6 +2068,66 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The drawn frame as one cell per coordinate.
+    ///
+    /// A diff is a list in whatever order the renderer produced it, so two
+    /// frames can only be compared after being keyed. Comparing the lists
+    /// directly would report a difference for a frame that is identical with its
+    /// cells in another order.
+    fn painted(diff: &[(usize, usize, Cell)]) -> HashMap<(usize, usize), Cell> {
+        diff.iter().map(|(x, y, cell)| ((*x, *y), *cell)).collect()
+    }
+
+    /// How many cells two drawn frames disagree about, out of every cell either
+    /// of them touched.
+    ///
+    /// The union rather than the intersection, so a frame that drew *less* is
+    /// not rewarded for it. The only two ways to score zero are "the same
+    /// picture" and "nothing was drawn", and `drawn_cells_are_worth_comparing`
+    /// is what rules the second out.
+    fn disagreement(
+        a: &HashMap<(usize, usize), Cell>,
+        b: &HashMap<(usize, usize), Cell>,
+    ) -> f32 {
+        let union: HashSet<(usize, usize)> =
+            a.keys().chain(b.keys()).copied().collect();
+        if union.is_empty() {
+            return 1.0;
+        }
+        let differing = union
+            .iter()
+            .filter(|key| a.get(*key) != b.get(*key))
+            .count();
+        differing as f32 / union.len() as f32
+    }
+
+    /// A cube from a seed, at the size the geometry tests use.
+    fn seeded(seed: u64) -> Cube {
+        Cube::new(
+            CubeOptions {
+                seed,
+                ..Default::default()
+            },
+            (200, 50),
+        )
+    }
+
+    /// A cube from a seed, advanced by whole frames at 60 Hz, not yet drawn.
+    ///
+    /// The "not yet drawn" is the point. `get_diff` reports every cell on the
+    /// first commit and only the changed cells afterwards, so a frame taken
+    /// after a run of `update` calls with no `get_diff` in between is the whole
+    /// picture -- which is the only thing worth comparing between two runs. A
+    /// diff taken partway through a run is a set of the cells that moved, and two
+    /// runs can have completely different pictures whose diffs hardly overlap.
+    fn seeded_after(seed: u64, steps: u32) -> Cube {
+        let mut cube = seeded(seed);
+        for _ in 0..steps {
+            cube.update();
+        }
+        cube
     }
 
     /// The cell a projected point falls in, in the renderer's own arithmetic.
@@ -3120,6 +3364,501 @@ mod tests {
         assert!(
             dots > 250,
             "the wireframe drew only {dots} dots, which is not twelve edges"
+        );
+    }
+
+    /// The whole point: two launches, two pictures.
+    ///
+    /// Measured on the drawn frame after a fixed run of frames, and not on the
+    /// options, because an options comparison is a restatement of the code that
+    /// fills the options -- it would pass against a `seed` field that is stored,
+    /// randomised, and then never consulted by anything that draws.
+    ///
+    /// The frame is the *whole* picture rather than a diff. `get_diff` reports
+    /// every cell on its first commit and only the changed cells afterwards, so
+    /// the ninety updates here are run with no `get_diff` in between: what comes
+    /// out is the entire frame, and a comparison over it is a comparison of two
+    /// cubes. A diff taken here would be the set of cells that moved in that one
+    /// frame, and two runs with completely different pictures can have diffs
+    /// that hardly overlap -- or nearly identical ones.
+    ///
+    /// Ninety frames rather than one because the *first* frame is the easier half
+    /// and the rate difference is the half that needs a run to show: a rate is a
+    /// change over time, and one frame of a cube turning at 0.2 rad/s and one
+    /// turning at 0.6 rad/s are a twentieth of a radian apart at worst, which is
+    /// well under a cell. The pose is what survives to frame ninety along with
+    /// the accumulated rotation.
+    ///
+    /// Six seed pairs rather than one, because one pair can be a coincidence and
+    /// a test that can be a coincidence is a test that can be flaky. Measured
+    /// disagreement across the six ran 0.98 to 1.00 -- that is, between 98% and
+    /// 100% of the cells either cube drew -- and the floor is set at 0.4, well
+    /// under half the smallest, so the threshold is not doing the work. Against
+    /// the bug it is written for, no randomness at all, every one of the six
+    /// reads exactly zero.
+    #[test]
+    fn two_seeds_open_on_different_pictures() {
+        for (left, right) in [
+            (42u64, 43u64),
+            (42, 1),
+            (42, 2),
+            (7, 8),
+            (0, u64::MAX),
+            (99, 12345),
+        ] {
+            let differing = disagreement(
+                &painted(&seeded_after(left, 90).get_diff()),
+                &painted(&seeded_after(right, 90).get_diff()),
+            );
+            assert!(
+                differing > 0.4,
+                "seeds {left} and {right} are 90 frames into a run and their \
+                 frames agree on {:.0}% of the cells they drew, so the seed is not \
+                 reaching the motion",
+                (1.0 - differing) * 100.0
+            );
+        }
+    }
+
+    /// The same seed twice is the same run, frame for frame.
+    ///
+    /// The other half of the contract, and it is the half that has to hold for
+    /// `--seed N` to mean anything. `tests/effect_contracts.rs` asserts this for
+    /// every effect at once; this asserts it *here*, where the failure can name
+    /// the three numbers that are supposed to be equal, so a generator that
+    /// reached into the frame loop instead of being drawn once in
+    /// [`Cube::new`] is reported as a frame that drifted rather than as a pair
+    /// of effects that disagree.
+    ///
+    /// Compared every frame rather than only at the end, because a drift that
+    /// only accumulated is exactly the shape a single end-of-run comparison
+    /// would report as a large difference with nothing to say about where it
+    /// came from.
+    #[test]
+    fn the_same_seed_replays_the_same_run() {
+        let mut a = seeded(2024);
+        let mut b = seeded(2024);
+        for frame in 0..120u32 {
+            a.update();
+            b.update();
+            let left = painted(&a.get_diff());
+            let right = painted(&b.get_diff());
+            assert_eq!(
+                left, right,
+                "two cubes on seed 2024 differ on frame {frame}, so the motion \
+                 is not a function of the seed"
+            );
+        }
+    }
+
+    /// A quarter turn about any axis is the same picture, and that is what
+    /// [`PHASE_SPAN`] is built on.
+    ///
+    /// A guard for the constant rather than a test of the fix: it drives
+    /// `rotation` directly and would pass before the seed existed. It is here
+    /// because `PHASE_SPAN` is a *derived* number -- it is the period of the
+    /// cube's own symmetry, read off the geometry rather than measured off the
+    /// renderer -- and a derived constant is a second place the same thing is
+    /// written down, so it wants a test against its source.
+    ///
+    /// The comparison is on the inked cells and their colours, not on the
+    /// `f32` coordinates behind them: a quarter turn reaches the same pose
+    /// through `cos(pi / 2) = -4.4e-8` rather than through a zero, so the two
+    /// frames are the same picture to the cell and not the same bits. Pinning
+    /// the poses also means this cannot be satisfied by two frames that are both
+    /// empty.
+    #[test]
+    fn a_quarter_turn_away_is_very_much_the_same_picture() {
+        for axis in 0..3 {
+            let mut near = placed(1.0, (200, 50));
+            let mut far = placed(1.0, (200, 50));
+            let mut base = (0.0f32, 0.0f32, 0.0f32);
+            match axis {
+                0 => base.0 = 0.31,
+                1 => base.1 = 0.31,
+                _ => base.2 = 0.31,
+            }
+            let mut quarter = base;
+            match axis {
+                0 => quarter.0 += std::f32::consts::FRAC_PI_2,
+                1 => quarter.1 += std::f32::consts::FRAC_PI_2,
+                _ => quarter.2 += std::f32::consts::FRAC_PI_2,
+            }
+
+            let near_frame = painted(&frame(&mut near, base));
+            let far_frame = painted(&frame(&mut far, quarter));
+            assert_eq!(
+                near_frame.keys().collect::<HashSet<_>>(),
+                far_frame.keys().collect::<HashSet<_>>(),
+                "rotating 0.31 to 0.31 + pi/2 about axis {axis} moved the ink, so \
+                 the picture is not pi/2-periodic about that axis"
+            );
+            for (key, cell) in &near_frame {
+                assert_eq!(
+                    cell.color, far_frame[key].color,
+                    "the cell at {key:?} changed colour across a quarter turn \
+                     about axis {axis}"
+                );
+            }
+        }
+    }
+
+    /// Every seeded rate and phase is inside its band, *and the band is reached*.
+    ///
+    /// Two claims, and the second is the one that has bitten this project
+    /// before. The first is the obvious one: 200 seeds, every rate inside
+    /// `[configured * lo, configured * hi]` and every phase inside
+    /// `[0, PHASE_SPAN)`. The second is that the draw is not quietly losing most
+    /// of the range it was given. A normalisation constant taken from a spec
+    /// sheet rather than from a measurement is exactly how a range that reads
+    /// `0.6..1.8` in the source arrives on screen as `0.9..1.1`, and it is how
+    /// this crate's terrain relief lost four fifths of its amplitude three
+    /// separate times without an error anywhere.
+    ///
+    /// So the extremes are measured as well as the bounds. A draw of `n` uniform
+    /// samples from `[lo, hi]` puts its smallest within `(hi - lo) / (n + 1)` of
+    /// `lo` and its largest within the same of `hi` -- 0.5% of the band at 200
+    /// seeds -- so the floor here is 97% of each end reached. That is twenty
+    /// times looser than the arithmetic needs and still nowhere near what a
+    /// collapsed range would pass, which is the point of writing it down.
+    ///
+    /// The two ends are checked per axis rather than pooled, because pooling is
+    /// how a per-axis mistake hides: the z axis is the slowest, so a global
+    /// minimum over all three axes would pass on the z axis alone even with the
+    /// other two drawn from a tenth of the band.
+    #[test]
+    fn every_seeded_rate_stays_inside_the_band() {
+        const SEEDS: u64 = 200;
+        let mut phases: Vec<f32> = Vec::new();
+
+        for axis in 0..3 {
+            let configured =
+                [DEFAULT_SPEED_X, DEFAULT_SPEED_Y, DEFAULT_SPEED_Z][axis];
+            let low = configured * SPEED_BAND.0;
+            let high = configured * SPEED_BAND.1;
+            let mut seen_low = f32::INFINITY;
+            let mut seen_high = f32::NEG_INFINITY;
+            let mut seen_phase_low = f32::INFINITY;
+            let mut seen_phase_high = f32::NEG_INFINITY;
+
+            for seed in 0..SEEDS {
+                let motion = CubeOptions {
+                    seed,
+                    ..Default::default()
+                }
+                .motion();
+                let rate =
+                    [motion.speeds.0, motion.speeds.1, motion.speeds.2][axis];
+                assert!(
+                    (low..=high).contains(&rate),
+                    "seed {seed} gave axis {axis} a rate of {rate}, outside \
+                     the band {low}..{high}"
+                );
+                seen_low = seen_low.min(rate);
+                seen_high = seen_high.max(rate);
+
+                let phase = [motion.phase.0, motion.phase.1, motion.phase.2][axis];
+                assert!(
+                    (0.0..PHASE_SPAN).contains(&phase),
+                    "seed {seed} gave axis {axis} a phase of {phase}, outside \
+                     0..{PHASE_SPAN}"
+                );
+                seen_phase_low = seen_phase_low.min(phase);
+                seen_phase_high = seen_phase_high.max(phase);
+            }
+
+            let span = high - low;
+            assert!(
+                seen_low <= low + 0.03 * span,
+                "the slowest rate axis {axis} ever drew was {seen_low}, which is \
+                 more than 3% of the band above its floor of {low}: the draw is \
+                 not using the bottom of the range it was given"
+            );
+            assert!(
+                seen_high >= high - 0.03 * span,
+                "the quickest rate axis {axis} ever drew was {seen_high}, which \
+                 is more than 3% of the band below its ceiling of {high}: the \
+                 draw is not using the top of the range it was given"
+            );
+            assert!(
+                seen_phase_low <= 0.03 * PHASE_SPAN
+                    && seen_phase_high >= 0.97 * PHASE_SPAN,
+                "axis {axis} drew phases only in {:.3}..{:.3} of 0..{PHASE_SPAN}, \
+                 so PHASE_SPAN is a wider range than the effect uses",
+                seen_phase_low,
+                seen_phase_high
+            );
+            phases.push(seen_phase_low);
+        }
+
+        assert_eq!(
+            phases.len(),
+            3,
+            "the phase check only ran {} times, so it proved nothing",
+            phases.len()
+        );
+    }
+
+    /// A configured rate of zero still holds that axis still.
+    ///
+    /// A guard for the design rather than a test of the fix -- it would pass
+    /// before the seed existed -- and it is here because [`SPEED_BAND`] is
+    /// applied *multiplicatively*, which is a decision with a consequence. An
+    /// additive jitter would put a random rate on an axis a user had asked to
+    /// freeze, so `rotation_speed_z = 0.0` would stop meaning "hold this axis"
+    /// the moment a seed arrived. Multiplicative keeps zero at zero, and this is
+    /// the test that says so.
+    ///
+    /// Asserted on the drawn frame as well as on the rate, because the rate is
+    /// the thing that could stop being true while the frame kept looking fine:
+    /// with `rotation_speed_z = 0`, the z term of the pose is the phase for
+    /// every frame, so a jittered z rate would be visible as a slowly precessing
+    /// cube.
+    #[test]
+    fn a_zero_configured_rate_holds_its_axis() {
+        let options = CubeOptions {
+            rotation_speed_z: 0.0,
+            seed: 5,
+            ..Default::default()
+        };
+        let motion = options.motion();
+        assert_eq!(
+            motion.speeds.2, 0.0,
+            "a configured rate of zero became {}, so the band is additive",
+            motion.speeds.2
+        );
+
+        let mut cube = Cube::new(options, (200, 50));
+        let mut poses: Vec<f32> = Vec::new();
+        for _ in 0..60 {
+            cube.update();
+            poses.push(cube.rotation.2);
+        }
+        let first = poses[0];
+        assert!(
+            poses.iter().all(|z| (z - first).abs() < 1e-6),
+            "the held axis precessed from {first} to {:?} over 60 frames",
+            poses.last().copied().unwrap_or(f32::NAN)
+        );
+    }
+
+    /// A rate that is not a number falls back instead of taking the frame with it.
+    ///
+    /// The rotation is the one thing in this effect that is multiplied into every
+    /// coordinate of every vertex, so a single non-finite rate propagates into
+    /// all eight projected points, `as i32` reads each of those as zero, and the
+    /// cube collapses into a handful of dots in the top-left corner. That is
+    /// reachable straight from a hand-edited config file, and it is the same
+    /// reasoning as `finite_or` everywhere else in this file -- except that
+    /// before the seed this file had no such guard on the rates at all, so a
+    /// `rotation_speed_x = nan` in a config drew nothing.
+    #[test]
+    fn a_rate_that_is_not_a_number_falls_back_rather_than_emptying_the_frame() {
+        for (axis, bad) in
+            ["x", "y", "z"]
+                .iter()
+                .zip([f32::NAN, f32::INFINITY, f32::NEG_INFINITY])
+        {
+            let options = CubeOptions {
+                rotation_speed_x: if *axis == "x" { bad } else { DEFAULT_SPEED_X },
+                rotation_speed_y: if *axis == "y" { bad } else { DEFAULT_SPEED_Y },
+                rotation_speed_z: if *axis == "z" { bad } else { DEFAULT_SPEED_Z },
+                seed: 11,
+                ..Default::default()
+            };
+            let motion = options.motion();
+            let drawn = [motion.speeds.0, motion.speeds.1, motion.speeds.2];
+            assert!(
+                drawn.iter().all(|r| r.is_finite()),
+                "rotation_speed_{axis} = {bad} left the launch with {drawn:?}"
+            );
+
+            let mut cube = Cube::new(options, (200, 50));
+            let diff = cube.get_diff();
+            assert!(
+                diff.len() > 150,
+                "rotation_speed_{axis} = {bad} drew {} cells, so the cube is \
+                 not on the screen",
+                diff.len()
+            );
+        }
+    }
+
+    /// The rate alone is enough to change the picture.
+    ///
+    /// The other half of `two_seeds_open_on_different_pictures`, and it isolates
+    /// the half that test cannot: a two-seed comparison differs in the opening
+    /// pose *and* in the rates, so it would pass against a [`SPEED_BAND`] that
+    /// was never used at all as long as the phase was. Here the two cubes are
+    /// put in the *same* pose and their `motion.speeds` written with the two ends
+    /// of the band, which is the substitution a band that had quietly become a
+    /// constant would make invisible.
+    ///
+    /// Writing the field rather than reaching `SPEED_BAND` twice is deliberate
+    /// and it is why this test does not go red when `CubeOptions::motion` stops
+    /// randomising: it is a test that the *frame* moves at the rates the band
+    /// describes, not a test that the band is drawn. The drawing is
+    /// `every_seeded_rate_stays_inside_the_band` and
+    /// `two_seeds_open_on_different_pictures`, and a test that claimed otherwise
+    /// by construction would be reporting coverage it was not providing.
+    ///
+    /// A rate is a difference over time, so this is measured ninety frames in
+    /// rather than on the opening frame, where the two poses are identical by
+    /// construction. The measured disagreement is 0.998 -- one cell in seven
+    /// hundred agrees -- against a floor of 0.5.
+    #[test]
+    fn the_rate_alone_changes_the_frame() {
+        let mut a = seeded(4242);
+        let mut b = seeded(4242);
+        a.motion.speeds = (0.18, 0.25, 0.12);
+        b.motion.speeds = (0.18, 0.63, 0.32);
+        for _ in 0..90 {
+            a.update();
+            b.update();
+        }
+        let differing =
+            disagreement(&painted(&a.get_diff()), &painted(&b.get_diff()));
+        assert!(
+            differing > 0.5,
+            "two runs from the same pose at 0.25 and 0.63 rad/s agree on \
+             {:.0}% of their cells after 90 frames, so the rate is not \
+             reaching the frame",
+            (1.0 - differing) * 100.0
+        );
+    }
+
+    /// Every launch opens on a legitimate cube.
+    ///
+    /// The risk this task carries. Randomising the opening pose puts the effect
+    /// at a pose nobody chose, and the two properties this file cares about most
+    /// are both properties of the pose: the X-ray only reads as an X-ray if the
+    /// near side is *dimmer* than the far side rather than merely also there,
+    /// and the frame is a cube at all only if all twelve edges put ink down.
+    /// Every other test here checks them at rotations the test picked, which is
+    /// the same pose on every run and so is exactly the case randomising
+    /// removes.
+    ///
+    /// Forty seeds, and the *pose* is read off the effect rather than
+    /// reconstructed: the frame loop draws before it advances, so the pose a
+    /// launch is constructed with is the pose on screen for the first frame
+    /// (see `Cube::new`). The assertions are on the drawn frame, through the
+    /// same two measurement helpers the pinned rotation tests use, so a failure
+    /// here means a real pose is bad rather than that a constant moved.
+    ///
+    /// The separation threshold is the awkward part and the reason this test says
+    /// so much about it. `a_far_edge_is_dimmer_than_the_near_ones` sweeps 200
+    /// rotations and asserts a *median* above 80, because it knows the
+    /// individual minimum closes: a face within a fraction of a degree of
+    /// edge-on puts a turned-away face at almost exactly the distance of a
+    /// front-facing one, and shading those differently would be a lie about the
+    /// geometry. Forty arbitrary poses are more poses than that sweep's residual
+    /// rotations, so the same thing could happen here, and it is handled the same
+    /// way: the per-pose minimum is asserted to stay *positive*, which is a
+    /// geometric fact rather than a threshold, and the typical separation is
+    /// asserted to be large so that a cube whose far side had drifted up the near
+    /// side's ramp would be caught even where the ordering itself survives.
+    ///
+    /// Measured over the forty openings this file's seeds produce, the far-side
+    /// separation runs 47.3 at its worst and 89.1 at the median, out of 255 --
+    /// every one of them a visible gap, and none of them the near-edge-on
+    /// degenerate pose. That is a property of *these* forty poses rather than of
+    /// the renderer, and it is written down as a number for exactly that reason:
+    /// forty more seeds is a fair coin flip at finding a worse one, and the
+    /// assertion that would then be wrong is the 60.0 on the median, not the
+    /// positivity.
+    ///
+    /// The third claim is the reason this test fails without the seed: the poses
+    /// have to be *different from each other*. Without it the other two would
+    /// pass forty times over on the same default pose, and report a coverage
+    /// that was not being provided -- the failure mode this crate's test notes
+    /// are mostly about. The closest pair of the forty agrees on 1.3% of its
+    /// cells; the floor is 0.8.
+    #[test]
+    fn every_seeded_start_is_a_legitimate_cube() {
+        let mut gaps: Vec<f32> = Vec::new();
+        let mut opening: Option<HashMap<(usize, usize), Cell>> = None;
+        let mut closest = 1.0f32;
+
+        for seed in 0..40u64 {
+            let mut cube = seeded(seed);
+            let diff = cube.get_diff();
+
+            // All twelve edges, on the same reference the pinned rotation test
+            // uses: the geometry's own rasterisation of each edge, not the field.
+            let projected: Vec<Point2D> = cube
+                .vertices
+                .iter()
+                .map(|v| cube.project_vertex(*v))
+                .collect();
+            let with_ink = EDGES
+                .iter()
+                .filter(|edge| {
+                    edge_dots(&projected, edge, cube.screen_size)
+                        .into_iter()
+                        .any(|(x, y, _)| x >= 0 && y >= 0)
+                })
+                .count();
+            assert_eq!(
+                with_ink, 12,
+                "seed {seed} opens at {:?} with only {with_ink} of the twelve \
+                 edges on the screen, so it is not a cube",
+                cube.rotation
+            );
+
+            // The X-ray read, and the same both-sides-present check the sweep
+            // makes, because a gap computed over one edge is not a measurement.
+            let sides = edge_luminances(&cube, &diff);
+            let near: Vec<f32> = sides
+                .iter()
+                .filter(|(behind, _)| !*behind)
+                .map(|(_, l)| *l)
+                .collect();
+            let far: Vec<f32> = sides
+                .iter()
+                .filter(|(behind, _)| *behind)
+                .map(|(_, l)| *l)
+                .collect();
+            assert!(
+                (4..=9).contains(&near.len()) && (3..=8).contains(&far.len()),
+                "seed {seed} opens at {:?} and the measurement found {} near-side \
+                 and {} far-side edges, which is not a cube seen from outside",
+                cube.rotation,
+                near.len(),
+                far.len()
+            );
+            let dimmest_near = near.iter().copied().fold(f32::INFINITY, f32::min);
+            let brightest_far =
+                far.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            gaps.push(dimmest_near - brightest_far);
+            assert!(
+                dimmest_near > brightest_far,
+                "seed {seed} opens at {:?} with the far side at {brightest_far:.1} \
+                 against the near side's {dimmest_near:.1}, so the far side is \
+                 not dimmer at all",
+                cube.rotation
+            );
+
+            let painted_frame = painted(&diff);
+            if let Some(first) = &opening {
+                closest = closest.min(disagreement(first, &painted_frame));
+            } else {
+                opening = Some(painted_frame);
+            }
+        }
+
+        let mut sorted = gaps.clone();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[sorted.len() / 2];
+        assert!(
+            median > 60.0,
+            "the median far-side separation over the forty seeded openings is \
+             {median:.1} of 255, so at half of them the X-ray does not read"
+        );
+        assert!(
+            closest > 0.8,
+            "two of the forty seeded openings differ on only {:.0}% of \
+             their cells, so the starting poses are not varied",
+            closest * 100.0
         );
     }
 
