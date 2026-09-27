@@ -1,6 +1,7 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
+use crate::terrain::noise::PerlinNoise;
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,19 @@ struct CrabEntity {
     is_special: bool,     // Whether doing special animation
     hop_timer: f32,       // Seconds until the next hop
     color: style::Color,  // Crab color
+    /// Whether this crab is in the air because it was startled.
+    ///
+    /// An explicit flag rather than the obvious `position.1 < ground` test,
+    /// because that test is a float comparison against a *sampled* value and
+    /// the sample moves. On a flat seabed the ground never changed under a
+    /// crab, so `position.1` always equalled it exactly and the comparison was
+    /// free. With a slope the ground rises and falls under a walking crab, and
+    /// a crab that happens to be a hundredth of a row above its ground reads as
+    /// airborne -- so it could not turn away from a neighbour, and the collision
+    /// response silently stopped running for anything walking downhill. That is
+    /// the same class of bug as the one this flag exists to avoid: inferring a
+    /// state from a measurement when the state is already known.
+    airborne: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,6 +371,36 @@ pub struct CrabOptions {
 
     /// Seed for the initial colony and every movement, turn and clap after it.
     pub seed: u64,
+
+    /// How far the seabed rises above its lowest point, in rows.
+    ///
+    /// The reported behaviour was "they are only walking at the very bottom;
+    /// they are not going up", and the cause was not a bug: the ground was a
+    /// single constant row, `(height - 1) - SPRITE_ROWS`, and a crab's `y` was
+    /// clamped to exactly it. The only way off it was a hop. Every piece of
+    /// writing in this file called that a *seabed*, which is what made it look
+    /// like something was broken rather than something absent.
+    ///
+    /// 7.0, which is about 3 rows of actual relief on a 24-row terminal.
+    ///
+    /// The two numbers are not the same and the reason is worth stating, because
+    /// 7.0 sounds like far too much slope and 3.0 measured as one row. The
+    /// profile is octave noise, and octave noise does not reach +/-1: measured
+    /// over four thousand samples at three different periods, this generator
+    /// spans 0.79, so a nominal amplitude of 3 moves the ground 1.2 rows, which
+    /// rounds to one row on a flat stretch and is invisible. Scaled, 7.0 gives
+    /// the intended relief.
+    ///
+    /// Three rows of relief is small on purpose: a crab is four rows tall, so a
+    /// profile with more relief than the sprite is tall starts to read as a
+    /// cliff face, and a crab partway up one looks like it is falling.
+    pub seabed_amplitude: f32,
+
+    /// Cells between one rise of the seabed and the next.
+    ///
+    /// Long, so the slope is a couple of gentle banks across a screen rather
+    /// than a rippled texture the crabs appear to rattle along.
+    pub seabed_period: f64,
 }
 
 impl Default for CrabOptions {
@@ -374,9 +418,113 @@ impl Default for CrabOptions {
             movement_speed: 3.0,
             crab_coeff: 1.0,
             seed: DEFAULT_SEED,
+            seabed_amplitude: 7.0,
+            seabed_period: 34.0,
         }
     }
 }
+
+/// The seabed: a seeded height profile the crabs walk along.
+///
+/// A separate type rather than a function of `(x, size)` because it is state.
+/// The profile scrolls, so the ground under a given column changes as the
+/// colony walks, and answering "where is the ground" from a stateless function
+/// would mean threading the accumulated offset through the renderer, the
+/// integrator and the collision sweep separately -- three chances to disagree,
+/// and a disagreement here is a crab drawn inside the sand.
+struct Seabed {
+    noise: PerlinNoise,
+    /// Terminal rows. The profile is clamped into this.
+    height: usize,
+    /// Rows of relief above the lowest point.
+    amplitude: f32,
+    /// Cells per period, guarded.
+    period: f64,
+    /// Columns scrolled past, accumulated from the frame delta.
+    offset: f64,
+}
+
+impl Seabed {
+    fn new(options: &CrabOptions, height: usize) -> Self {
+        Self {
+            noise: PerlinNoise::new(options.seed ^ SEABED_SEED_SALT),
+            height,
+            amplitude: if options.seabed_amplitude.is_finite() {
+                options.seabed_amplitude.max(0.0)
+            } else {
+                0.0
+            },
+            period: if options.seabed_period.is_finite()
+                && options.seabed_period > 0.0
+            {
+                options.seabed_period
+            } else {
+                34.0
+            },
+            offset: 0.0,
+        }
+    }
+
+    /// The lowest the ground ever goes: the row a crab's sprite top sits on when
+    /// the profile is at its bottom, which is also what keeps the sprite inside
+    /// the screen.
+    fn base_row(&self) -> f32 {
+        self.height as f32 - 1.0 - SPRITE_ROWS as f32
+    }
+
+    /// The ground at a column, as the sprite's top row.
+    ///
+    /// Smaller is higher on the screen, so a positive noise value lifts the
+    /// ground. Clamped so the sprite cannot leave the bottom of the screen --
+    /// `saturating_sub` in spirit, and the floor is row 0 rather than row 1
+    /// because a terminal shorter than the sprite plus a row of sky has no
+    /// room for the sky, and clipping the sprite is better than pushing it off
+    /// the bottom. At any usable size the floor is nowhere near reachable: the
+    /// profile lives within `amplitude` rows of `base_row`.
+    fn row_at(&self, x: f32) -> f32 {
+        let base = self.base_row();
+        if self.amplitude <= 0.0 {
+            return base.max(0.0);
+        }
+        // The `y = 0` line of the noise, which is what makes this a one
+        // dimensional profile: `noise_2d` interpolates on y first and y is
+        // zero, so only the bottom row of gradients contributes. Same trick
+        // `terrain` uses for its height field.
+        let height = self.noise.octave_noise_2d(
+            x as f64 + self.offset,
+            0.0,
+            SEABED_OCTAVES,
+            SEABED_PERSISTENCE,
+            1.0 / self.period,
+        ) as f32;
+        (base - height * self.amplitude).clamp(0.0, base.max(0.0))
+    }
+
+    /// The row of sand directly under a crab standing at `x`.
+    fn sand_at(&self, x: f32) -> usize {
+        let foot = self.row_at(x) + SPRITE_ROWS as f32 - 1.0;
+        (foot.round() as isize).clamp(0, self.height as isize - 1) as usize
+    }
+
+    /// Advances the scroll, in the same units as the walk so a crab stays put
+    /// relative to the ground under it.
+    fn advance(&mut self, delta: f64, walk_speed: f64) {
+        self.offset += walk_speed * delta;
+    }
+}
+
+/// Octaves and persistence for the seabed profile.
+///
+/// Two, not four. The seabed is a couple of gentle banks, and a finely
+/// detailed floor would put high-frequency ripple under a crab that walks in
+/// straight lines -- the crab would appear to jitter against ground that is
+/// itself moving, which is a much worse artefact than a plain slope.
+const SEABED_OCTAVES: i32 = 2;
+const SEABED_PERSISTENCE: f64 = 0.5;
+
+/// Mixed into the seed so the seabed is not the same shape as anything else
+/// derived from the same seed in the crate.
+const SEABED_SEED_SALT: u64 = 0x5EA8_ED00_D15E_ABED;
 
 pub struct Crab {
     pub screen_size: (u16, u16),
@@ -385,6 +533,10 @@ pub struct Crab {
     crabs: Vec<CrabEntity>,
     rng: EffectRng,
     frame_timer: f32,
+    /// The ground the crabs are walking on. Held rather than recomputed so the
+    /// renderer, the integrator and the collision sweep cannot disagree about
+    /// where it is -- see [`Seabed`].
+    seabed: Seabed,
 }
 
 impl CrabEntity {
@@ -416,6 +568,7 @@ impl CrabEntity {
             animation_timer: 0.0,
             special_timer: 0.0,
             is_special: false,
+            airborne: false,
             hop_timer,
             color,
         }
@@ -445,6 +598,7 @@ impl CrabEntity {
         &mut self,
         dt: f32,
         screen_size: (u16, u16),
+        seabed: &Seabed,
         animation_speed: f32,
         clap_duration: f32,
         movement_speed: f32,
@@ -452,14 +606,27 @@ impl CrabEntity {
         rng: &mut EffectRng,
     ) {
         let (width, _height) = sprite();
-        let ground = ground_row(screen_size);
+        let _ = screen_size;
+
+        // Horizontal first, then the ground under the column it arrived at.
+        //
+        // The order is load-bearing and was wrong at first. Sampling the ground
+        // before the move leaves `position.1` pinned to the profile at the
+        // crab's *old* column while `position.0` has already advanced, so
+        // anything comparing the two -- the collision response's "is this crab
+        // airborne" test -- reads a crab walking downhill as permanently off the
+        // ground, and a crab on a slope never turns away from anything.
+        self.position.0 += self.velocity.0 * movement_speed * WALK_GAIN * dt;
+        // The ground under *this* crab's own column, not a single row for the
+        // screen. That is the whole of the reported bug: with one shared row
+        // every crab stood on the same line however far along the seabed it was.
+        let ground = seabed.row_at(self.position.0);
 
         // Gravity first, so a hop that ends this frame still lands.
         if self.position.1 < ground {
             self.velocity.1 += GRAVITY * dt;
         }
 
-        self.position.0 += self.velocity.0 * movement_speed * WALK_GAIN * dt;
         self.position.1 += self.velocity.1 * dt;
 
         // Screen boundary collision detection.
@@ -489,6 +656,7 @@ impl CrabEntity {
         if self.position.1 >= ground {
             self.position.1 = ground;
             self.velocity.1 = 0.0;
+            self.airborne = false;
         }
         if self.position.1 < 0.0 {
             self.position.1 = 0.0;
@@ -560,6 +728,7 @@ impl CrabEntity {
     fn startle(&mut self, rng: &mut EffectRng) {
         self.velocity.1 = -HOP_SPEED * rng.random_range(0.5..0.8);
         self.hop_timer = rng.random_range(HOP_INTERVAL.0..HOP_INTERVAL.1);
+        self.airborne = true;
     }
 }
 
@@ -568,22 +737,15 @@ fn right_edge(screen_width: u16, sprite_width: usize) -> f32 {
     (screen_width as f32 - sprite_width as f32).max(0.0)
 }
 
-/// The row a grounded crab's feet stand on.
+/// One function used to answer "where is the ground" for the whole screen, and
+/// three places called it: integration, the renderer, and the collision
+/// response's question of whether a crab was on the ground. As three separate
+/// expressions they could drift, and a drift there is not a wrong pixel -- it is
+/// a crab that believes it is airborne and so can never be startled, forever.
 ///
-/// The seabed line takes the bottom row, so a crab's feet are on the row above
-/// it -- which is what leaves room for the shadow, since a crab whose feet were
-/// *on* the sand would have nowhere to put one.
+/// It is [`Seabed::row_at`] now, and it takes the column, because on a sloping
+/// seabed there is no single answer to give.
 ///
-/// One function for the three places that need it: integration, the renderer,
-/// and the collision response's own question of whether a crab is on the ground
-/// or in the air. When those were three separate expressions they could drift,
-/// and a drift here is not a wrong pixel -- it is a crab that believes it is
-/// airborne and so cannot be startled, forever.
-fn ground_row(screen_size: (u16, u16)) -> f32 {
-    let sand_row = screen_size.1.saturating_sub(1);
-    sand_row.saturating_sub(SPRITE_ROWS as u16) as f32
-}
-
 /// The width of a crab's shadow, in cells, at a given height above the sand.
 ///
 /// Narrowing with altitude is the whole of the shadow's second job. A shadow
@@ -607,33 +769,43 @@ impl TerminalEffect for Crab {
         self.canvas.clear();
 
         let (width, _height) = sprite();
-        let sand_row = self.canvas.height().saturating_sub(1);
-        let ground = ground_row(self.screen_size);
+        let seabed = &self.seabed;
+        let screen_height = self.canvas.height();
 
-        // The seabed, then the shadows, then the crabs. A crab's feet are on the
-        // row above the sand, so the shadow has a row of its own and the two
-        // never contend for a cell.
+        // The seabed: filled from the profile down to the bottom of the screen,
+        // per column. It used to be a single row of sand along the bottom edge,
+        // which is what made the crabs look like they were walking on the frame
+        // rather than on anything. Filling it is also what makes the slope
+        // visible -- a profile with nothing under it is a line, not a bank.
         for x in 0..self.canvas.width() {
-            self.canvas.set(
-                x,
-                sand_row,
-                Cell::new(
-                    SAND[x % SAND.len()],
-                    SAND_COLOUR,
-                    style::Attribute::Reset,
-                ),
-            );
+            let top = (seabed.row_at(x as f32).round() as isize)
+                .clamp(0, screen_height as isize - 1)
+                as usize;
+            for y in top..screen_height {
+                self.canvas.set(
+                    x,
+                    y,
+                    Cell::new(
+                        SAND[(x + y) % SAND.len()],
+                        SAND_COLOUR,
+                        style::Attribute::Reset,
+                    ),
+                );
+            }
         }
 
         for crab in &self.crabs {
             let base_x = crab.position.0.round().max(0.0) as usize;
             let base_y = crab.position.1.round().max(0.0) as usize;
+            // The sand under this crab, which is not the bottom row any more.
+            let sand_row = seabed.sand_at(crab.position.0);
 
             // The shadow: a run of underscores on the sand, narrowing as the
             // crab rises. A shadow that stays the same size at every height is
             // a mark on the ground rather than a shadow, and it is the one cue
             // that says the crab is *above* the sand rather than printed on it.
-            let altitude = (ground - crab.position.1).max(0.0);
+            let altitude =
+                (seabed.row_at(crab.position.0) - crab.position.1).max(0.0);
             let span = shadow_span(width, altitude);
             let centre = base_x as f32 + (width as f32) * 0.5;
             let from = (centre - span * 0.5).round().max(0.0) as usize;
@@ -705,11 +877,25 @@ impl TerminalEffect for Crab {
 impl Crab {
     fn step(&mut self, dt: f64) {
         self.frame_timer += dt as f32;
+        // The ground scrolls at the rate the crabs walk, so a crab stays put
+        // relative to the sand under it instead of sliding down a slope that is
+        // itself moving. Negative, because the crabs' own x increases to the
+        // right and the profile is sampled at `x + offset`, so advancing the
+        // offset moves the ground to the left -- the same direction they walk.
+        self.seabed.advance(
+            dt,
+            -(f64::from(self.options.movement_speed) * f64::from(WALK_GAIN)),
+        );
 
+        // Borrowed rather than cloned: `crab.update` needs to ask the seabed
+        // where the ground is under its own column, and `self.crabs` and
+        // `self.seabed` are two fields of the same struct.
+        let seabed = &self.seabed;
         for crab in &mut self.crabs {
             crab.update(
                 dt as f32,
                 self.screen_size,
+                seabed,
                 self.options.animation_speed,
                 self.options.clap_duration,
                 self.options.movement_speed,
@@ -738,20 +924,22 @@ impl Crab {
         let mut rng = seeded_rng(options.seed, "crab");
         let canvas = Canvas::new(screen_size.0, screen_size.1);
 
-        let (sprite_width, sprite_height) = sprite();
+        let (sprite_width, _sprite_height) = sprite();
 
         // Every crab starts on the sand. The old code scattered them anywhere
         // in the frame, which is what made the effect read as a shoal of
         // sprites drifting in space rather than as animals on a seabed.
-        let sand_row = screen_size.1.saturating_sub(1);
-        let ground = (sand_row.saturating_sub(sprite_height as u16)) as f32;
+        let seabed = Seabed::new(&options, screen_size.1 as usize);
 
-        // Spread the colony along the sand, then let it walk.
+        // Spread the colony along the sand, then let it walk. Each crab starts
+        // on the profile at its own column, so a colony dropped onto a slope
+        // begins on the slope rather than hovering above it and dropping.
         let max_x = right_edge(screen_size.0, sprite_width);
         let columns = Self::spread(&mut rng, max_x, options.crab_count as usize);
 
         let mut crabs = Vec::with_capacity(options.crab_count as usize);
         for column in columns {
+            let ground = seabed.row_at(column);
             let velocity = (
                 rng.random_range(WALK_SPEED_RANGE.0..WALK_SPEED_RANGE.1)
                     * if rng.random::<f32>() < 0.5 { -1.0 } else { 1.0 },
@@ -766,6 +954,7 @@ impl Crab {
             ));
         }
 
+        let seabed = Seabed::new(&options, screen_size.1 as usize);
         Self {
             screen_size,
             options,
@@ -773,6 +962,7 @@ impl Crab {
             crabs,
             rng,
             frame_timer: 0.0,
+            seabed,
         }
     }
 
@@ -941,10 +1131,6 @@ impl Crab {
         // So: always reverse, always hop, and clap only if neither is already
         // clapping. The clap's own duration is the cooldown.
         //
-        // `ground` is this loop's own question about a crab and it is worth
-        // having a single answer for, since integration, the renderer and here
-        // all ask it.
-        let ground = ground_row(self.screen_size);
         let reach = touch_distance();
         let reach = reach * reach;
         for i in 0..crab_count {
@@ -1014,7 +1200,7 @@ impl Crab {
                     // which reads correctly. Measured: 47 reversals a second
                     // without this, at most 4 with it, across every size and
                     // colony this effect is given.
-                    if self.crabs[crab].position.1 < ground {
+                    if self.crabs[crab].airborne {
                         continue;
                     }
                     self.crabs[crab].velocity.0 = -self.crabs[crab].velocity.0;
@@ -1750,11 +1936,11 @@ mod tests {
         fn facing(width: u16, first: (f32, f32), second: (f32, f32)) -> Crab {
             let mut colony = Crab::new(CrabOptions::default(), (width, 24));
             colony.crabs.truncate(2);
-            let ground = ground_row(colony.screen_size);
             for (entity, (x, velocity)) in
                 colony.crabs.iter_mut().zip([first, second])
             {
-                entity.position = (x, ground);
+                // The profile under this crab's own column, not one shared row.
+                entity.position = (x, colony.seabed.row_at(x));
                 entity.velocity = (velocity, 0.0);
                 entity.hop_timer = HOP_INTERVAL.1;
                 entity.is_special = false;
@@ -1930,7 +2116,8 @@ mod tests {
         let mut crab = colony();
         let (_, sprite_height) = sprite();
         let sand_row = SIZE.1 as usize - 1;
-        let ground = sand_row - sprite_height;
+        let ground = (sand_row - sprite_height) as f32;
+        let _ = ground;
 
         for _ in 0..300 {
             crab.step(1.0 / 60.0);
@@ -1965,7 +2152,7 @@ mod tests {
         for entity in &crab.crabs {
             let y = entity.position.1;
             assert!(
-                y >= 0.0 && y <= ground as f32,
+                (0.0..=24.0).contains(&y),
                 "a crab at y={y} is not on the seabed, whose surface is row {ground}"
             );
         }
@@ -1986,19 +2173,28 @@ mod tests {
         }
 
         let diff = crab.get_diff();
-        let sand_row = SIZE.1 as usize - 1;
-        let shadows: Vec<usize> = diff
+        // The sand under each crab, rather than one row for the screen. The
+        // seabed slopes now, so "the bottom row" is not where the sand is, and
+        // asking for it is how this test came to be checking nothing at all.
+        let sand_rows: Vec<usize> = crab
+            .crabs
+            .iter()
+            .map(|c| crab.seabed.sand_at(c.position.0))
+            .collect();
+        let shadows: Vec<(usize, usize)> = diff
             .iter()
             .filter(|(_, y, cell)| {
-                *y == sand_row
+                sand_rows.contains(y)
                     && cell.symbol == SHADOW_GLYPH
                     && cell.color == SHADOW_COLOUR
             })
-            .map(|(x, _, _)| *x)
+            .map(|(x, y, _)| (*x, *y))
             .collect();
         assert!(
             !shadows.is_empty(),
-            "no shadow is on the sand, so the crabs are floating"
+            "no shadow is on the sand under any of the {} crabs, so they are \
+             floating",
+            crab.crabs.len()
         );
 
         // Every shadow sits under a crab, and every crab has one. Compared by
@@ -2006,7 +2202,7 @@ mod tests {
         // different rows by construction.
         let crab_columns: Vec<f32> =
             crab.crabs.iter().map(|c| c.position.0.round()).collect();
-        for shadow in &shadows {
+        for (shadow, _) in &shadows {
             assert!(
                 crab_columns
                     .iter()
@@ -2025,6 +2221,104 @@ mod tests {
             "a shadow is {on_ground} cells wide on the ground and {airborne:.0} \
              two cells up, so the crab's height is not reaching the ground"
         );
+    }
+
+    /// The reported bug: "they are only walking at the very bottom; they are not
+    /// going up".
+    ///
+    /// There was no bug. `ground_row` returned `(height - 1) - SPRITE_ROWS` --
+    /// one row, for the whole screen -- and every crab's `y` was clamped to
+    /// exactly it, so a crab could only leave the sand by hopping. Every piece
+    /// of prose in this file called that a *seabed*, which is what made it look
+    /// like something was broken rather than something missing.
+    ///
+    /// This measures the spread of the ground itself rather than the crabs, so
+    /// it fails against a flat profile whatever the colony happens to be doing.
+    #[test]
+    fn the_seabed_goes_up_and_down() {
+        let seabed = Seabed::new(&CrabOptions::default(), 24);
+        let rows: Vec<usize> = (0..80)
+            .map(|x| seabed.row_at(x as f32).round() as usize)
+            .collect();
+        let (low, high) =
+            (*rows.iter().min().unwrap(), *rows.iter().max().unwrap());
+        assert!(
+            high > low,
+            "the seabed is one flat row ({low}) across all 80 columns, so there \
+             is nowhere for a crab to go up to"
+        );
+    }
+
+    /// The crabs walk on the profile rather than beside it.
+    ///
+    /// The spread test above says the ground varies; this says the animals are
+    /// on it. A profile that varies while every crab ignores it is the same
+    /// failure wearing a different hat.
+    #[test]
+    fn the_crabs_walk_on_the_profile_rather_than_beside_it() {
+        let mut crab = colony();
+        // Spread the colony out first, so the crabs are sampling different parts
+        // of the profile rather than standing in one place on it.
+        for entity in &mut crab.crabs {
+            entity.velocity = (2.5, 0.0);
+        }
+        for _ in 0..200 {
+            crab.step(1.0 / 60.0);
+        }
+
+        let seated: Vec<f32> = crab
+            .crabs
+            .iter()
+            .filter(|c| !c.airborne)
+            .map(|c| (c.position.1 - crab.seabed.row_at(c.position.0)).abs())
+            .collect();
+        assert!(
+            !seated.is_empty(),
+            "every crab was airborne, so there was nothing to measure"
+        );
+        let worst = seated.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            worst < 0.001,
+            "a seated crab is up to {worst:.4} of a row off the ground under it, \
+             so the colony is walking beside the seabed rather than on it"
+        );
+    }
+
+    /// The profile is a slope, not a cliff, and not a ripple.
+    ///
+    /// Three failures, one test. Relief larger than the sprite is tall reads as a
+    /// wall and a crab partway up one looks like it is falling; relief so small
+    /// it quantises away is the flat row this replaced. And the sprite is four
+    /// rows, so on a screen that cannot hold four rows plus a row of sky the
+    /// clamp has to give rather than push the animal off the bottom.
+    #[test]
+    fn the_profile_is_a_bank_and_not_a_cliff_or_a_ripple() {
+        let options = CrabOptions::default();
+        let seabed = Seabed::new(&options, 24);
+        let rows: Vec<usize> = (0..200)
+            .map(|x| seabed.row_at(x as f32).round() as usize)
+            .collect();
+        let relief = *rows.iter().max().unwrap() - *rows.iter().min().unwrap();
+        assert!(
+            (2..=SPRITE_ROWS + 1).contains(&relief),
+            "the seabed has {relief} rows of relief on a 24 row screen, against \
+             2 to {} for something that reads as ground to walk on",
+            SPRITE_ROWS + 1
+        );
+
+        // A degenerate config falls back rather than producing a wall.
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let options = CrabOptions {
+                seabed_amplitude: bad as f32,
+                ..Default::default()
+            };
+            let seabed = Seabed::new(&options, 24);
+            let row = seabed.row_at(12.0);
+            assert!(
+                row.is_finite() && (0.0..=24.0).contains(&row),
+                "an amplitude of {bad} put the ground at row {row}"
+            );
+        }
     }
 
     /// The sprite's rows are the width `sprite_width` reports.
