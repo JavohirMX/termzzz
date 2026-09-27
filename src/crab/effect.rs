@@ -877,11 +877,23 @@ impl TerminalEffect for Crab {
 impl Crab {
     fn step(&mut self, dt: f64) {
         self.frame_timer += dt as f32;
-        // The ground scrolls at the rate the crabs walk, so a crab stays put
-        // relative to the sand under it instead of sliding down a slope that is
-        // itself moving. Negative, because the crabs' own x increases to the
-        // right and the profile is sampled at `x + offset`, so advancing the
-        // offset moves the ground to the left -- the same direction they walk.
+        // The ground scrolls at exactly the rate the crabs walk, so a crab holds
+        // one contour of the seabed instead of walking across a slope that is
+        // itself moving underneath it.
+        //
+        // Negative, and the direction is worth deriving rather than guessing
+        // because the first version of this comment had it backwards. The profile
+        // is sampled at `x + offset`. A feature sitting at column `x1` when the
+        // offset is `o1` is the same feature at column `x2` when it is `o2` when
+        // `x2 + o2 == x1 + o1`. So as the offset *falls*, every feature moves to
+        // **higher** columns: the ground travels right, which is the direction a
+        // crab with positive velocity walks. The two rates match, so a crab is
+        // stationary in profile coordinates.
+        //
+        // `the_ground_scrolls_with_the_colony_rather_than_against_it` measures
+        // that rather than trusting the algebra, because reversed is invisible in
+        // a still frame: the crab is still exactly on the ground under it, it
+        // just descends slopes it never climbed, at twice the colony's speed.
         self.seabed.advance(
             dt,
             -(f64::from(self.options.movement_speed) * f64::from(WALK_GAIN)),
@@ -2281,6 +2293,62 @@ mod tests {
             worst < 0.001,
             "a seated crab is up to {worst:.4} of a row off the ground under it, \
              so the colony is walking beside the seabed rather than on it"
+        );
+    }
+
+    /// The ground scrolls *with* the colony, so a crab holds its contour.
+    ///
+    /// The sign of the scroll is load-bearing and was worth measuring rather than
+    /// deriving, because backwards is invisible in a still frame and obvious in
+    /// motion: the ground slides left while the crabs walk right, so every crab
+    /// descends slopes it never climbed, at twice the colony's speed.
+    ///
+    /// The consequence is measurable, and sharply so. The profile is sampled at
+    /// `x + offset`, so a crab walking right at `w` while the offset falls at `w`
+    /// is *stationary in profile coordinates*: it holds one contour, and its row
+    /// is not merely close to constant, it is exactly constant. With the sign
+    /// reversed it travels through the profile at `2w` and its row wanders over
+    /// the full relief. A crab is always exactly on the ground under it either
+    /// way, so a test asserting *that* cannot tell them apart -- only the drift
+    /// can.
+    ///
+    /// Measured over a window the crab cannot walk out of. A crab reflected off a
+    /// wall reverses while the ground keeps scrolling the other way, so it stops
+    /// holding a contour for reasons that have nothing to do with the sign; the
+    /// first version of this ran for ten seconds on an 80 column screen, hit the
+    /// right edge twice, and reported 1.09 rows of drift for that reason alone.
+    #[test]
+    fn the_ground_scrolls_with_the_colony_rather_than_against_it() {
+        let size = (200u16, 24);
+        let mut crab = Crab::new(CrabOptions::default(), size);
+        crab.crabs.truncate(1);
+        // Centred, so the walk has `width/2` of room on either side.
+        let centre = f32::from(size.0) * 0.5;
+        for entity in &mut crab.crabs {
+            entity.position = (centre, crab.seabed.row_at(centre));
+            entity.velocity = (1.0, 0.0);
+            entity.hop_timer = f32::MAX;
+        }
+
+        // Five cells of travel, which is a sixth of the profile's 34 cell period
+        // and well short of either wall at 3 cells a second.
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            crab.step(1.0 / 60.0);
+            assert!(
+                !crab.crabs[0].airborne,
+                "the crab left the ground, so there is no contour to hold"
+            );
+            rows.push(crab.crabs[0].position.1);
+        }
+        let swing = rows.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - rows.iter().copied().fold(f32::INFINITY, f32::min);
+
+        assert!(
+            swing < 0.01,
+            "a crab walking in a straight line changed row by {swing:.4} over five \
+             cells of travel, so the seabed is sliding past it rather than \
+             travelling with it -- the scroll sign is reversed"
         );
     }
 
