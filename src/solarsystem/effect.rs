@@ -120,8 +120,8 @@ impl Default for SolarSystemOptions {
             tilt: 60.0,
             camera_speed: 4.0,
             year_speed: 0.1,
-            radius_exponent: 0.6,
-            sun_size: 4.5,
+            radius_exponent: 0.55,
+            sun_size: 1.8,
             orbits: true,
             rings: true,
             stars: 160,
@@ -242,6 +242,13 @@ const RING_TILT: f64 = 26.73;
 const RING_INNER: f64 = 1.24;
 const RING_OUTER: f64 = 2.27;
 
+/// The sun's glow, as a multiple of its core radius.
+///
+/// Small on purpose. The glow is what makes the sun read as bright rather than
+/// as a disc, and a large one stops being a glow: at 2.4 it reached 11 cells on
+/// an 80x24 screen and filled a third of the picture.
+const SUN_GLOW_REACH: f64 = 1.9;
+
 /// The sun's core colour, and the colour its glow falls off towards.
 const SUN: [u8; 3] = [255, 238, 176];
 const GLOW: [u8; 3] = [150, 96, 34];
@@ -249,10 +256,13 @@ const GLOW: [u8; 3] = [150, 96, 34];
 /// Exponent applied to body radii, gentler than the orbital one.
 const BODY_EXPONENT: f64 = 0.45;
 
-/// A planet's drawn radius in Earths, before projection. Earth is the unit, so
-/// the ratio carries the size differences and the exponent decides how much of
-/// the real eleven-fold span survives.
-const BODY_GAIN: f64 = 0.22;
+/// Earth's drawn radius, in cells. Every other body's size is this times its
+/// size relative to Earth's, compressed by [`BODY_EXPONENT`], so the ratios come
+/// from the data and only the absolute size is a choice.
+const BODY_GAIN_CELLS: f64 = 0.85;
+
+/// The sun's core radius in cells, per unit of `sun_size`.
+const SUN_GAIN_CELLS: f64 = 0.45;
 
 /// Camera distance, in units of the outermost drawn orbit.
 ///
@@ -271,10 +281,18 @@ const STAR_SHELL_RATIO: f64 = 1.2;
 ///
 /// The orbits are drawn dashed rather than solid, and the dash is measured in
 /// *dots travelled* rather than in samples. Measuring in samples would make the
-/// dash length depend on the orbit's size, so Mercury's 9-dot circumference and
-/// Neptune's 128-dot one would get the same number of dashes and the inner
-/// orbits would come out as solid blobs.
-const ORBIT_DASH_DOTS: f64 = 2.0;
+/// dash length depend on the orbit's size, so Mercury's circumference and
+/// Neptune's would get the same number of dashes and the inner orbits would come
+/// out as solid blobs.
+///
+/// 3.0 rather than something tighter, and that is measured rather than chosen.
+/// The inner four orbits all live within six cells of the centre, so their
+/// circumferences are 30 to 75 dots; at a 2 dot gap they were half covered,
+/// which is to say visually solid, and four near-solid rings nested inside each
+/// other and inside the sun's halo read as one grey mass rather than as four
+/// orbits. A third of the dots raised is the point where a ring looks like a
+/// ring.
+const ORBIT_DASH_DOTS: f64 = 3.0;
 
 /// The orbit the scale is fitted to.
 ///
@@ -498,9 +516,27 @@ impl SolarSystem {
         planet.semi_major.powf(self.exponent())
     }
 
-    /// A body's drawn radius, in compressed world units, before projection.
-    fn body_radius(&self, radius_km: f64) -> f64 {
-        (radius_km / 6371.0).powf(BODY_EXPONENT) * BODY_GAIN
+    /// A body's drawn radius, in **cells**.
+    ///
+    /// In cells rather than in the world units the orbits are measured in, and
+    /// that distinction is the whole point. Orbit radii must scale with the
+    /// screen, or the system does not fill it. Body radii must *not*: a planet is
+    /// a mark of a fixed size, and scaling it with the terminal made Jupiter 2.9
+    /// cells across on an 80x24 and 27 on a 400x200, where it was wider than
+    /// Mercury's entire orbit and the inner system was a smear of overlapping
+    /// discs. Measured with the sizes proportional, the sun's halo alone covered
+    /// 64 rows of a 200 row screen.
+    fn body_radius_cells(&self, radius_km: f64) -> f64 {
+        (radius_km / 6371.0).powf(BODY_EXPONENT) * BODY_GAIN_CELLS
+    }
+
+    /// The sun's core radius, in cells.
+    fn sun_radius_cells(&self) -> f64 {
+        let size = self.options.sun_size;
+        if !(size.is_finite() && size > 0.0) {
+            return 0.0;
+        }
+        size * SUN_GAIN_CELLS
     }
 
     /// Display units per world unit, fitted to the screen.
@@ -570,8 +606,12 @@ impl SolarSystem {
 
     /// Raises one dot, and claims its cell if nothing nearer has it.
     fn raise(&mut self, dot_x: isize, dot_y: isize, depth: f64, color: Color) {
-        let (dot_width, dot_height) = (self.dots.dot_width(), self.dots.dot_height());
-        if dot_x < 0 || dot_y < 0 || dot_x as usize >= dot_width || dot_y as usize >= dot_height
+        let (dot_width, dot_height) =
+            (self.dots.dot_width(), self.dots.dot_height());
+        if dot_x < 0
+            || dot_y < 0
+            || dot_x as usize >= dot_width
+            || dot_y as usize >= dot_height
         {
             return;
         }
@@ -674,14 +714,19 @@ impl SolarSystem {
 
     /// The angle a planet has reached, in radians.
     fn mean_anomaly(&self, planet: &Body) -> f64 {
-        if !(planet.period > 0.0) {
+        if !planet.period.is_finite() || planet.period <= 0.0 {
             return 0.0;
         }
         (self.years / planet.period * TAU) % TAU
     }
 
     /// A point on a planet's orbit, with its inclination and node applied.
-    fn orbit_point(&self, planet: &Body, radius: f64, angle: f64) -> (f64, f64, f64) {
+    fn orbit_point(
+        &self,
+        planet: &Body,
+        radius: f64,
+        angle: f64,
+    ) -> (f64, f64, f64) {
         let inclination = planet.inclination.to_radians();
         let node = planet.node.to_radians();
         let (sin_i, cos_i) = inclination.sin_cos();
@@ -715,7 +760,8 @@ impl SolarSystem {
             .enumerate()
             .map(|(index, planet)| {
                 let radius = self.drawn_radius(planet);
-                let point = self.orbit_point(planet, radius, self.mean_anomaly(planet));
+                let point =
+                    self.orbit_point(planet, radius, self.mean_anomaly(planet));
                 let depth = self
                     .project(point, scale)
                     .map_or(f64::INFINITY, |p| p.depth);
@@ -728,27 +774,43 @@ impl SolarSystem {
         for (_, index) in order {
             let planet = &PLANETS[index];
             let radius = self.drawn_radius(planet);
-            let centre = self.orbit_point(planet, radius, self.mean_anomaly(planet));
+            let centre =
+                self.orbit_point(planet, radius, self.mean_anomaly(planet));
             if index == SATURN && self.options.rings {
                 self.draw_rings(planet, centre, scale);
             }
-            self.draw_disc(centre, self.body_radius(planet.radius_km), planet.color, scale);
+            self.draw_disc(
+                centre,
+                self.body_radius_cells(planet.radius_km),
+                planet.color,
+                scale,
+            );
         }
     }
 
     /// The sun: a bright core with a glow falling off around it.
+    ///
+    /// The glow is *speckled*, not solid, and that is the difference between a
+    /// sun and a hole in the picture. Every dot inside the reach used to be
+    /// raised, so the halo was a filled disc of the glow colour with a hard
+    /// circular edge -- and on a 24 row screen it covered the full height and
+    /// swallowed every planet within ten cells of it. A halo is thin, so it is
+    /// drawn thin: past the core, a dot is raised only if a hash of its own
+    /// coordinates falls under a probability that falls away with distance.
+    /// Deterministic and stable frame to frame, which an RNG would not be here.
     fn draw_sun(&mut self, scale: f64) {
-        let size = self.options.sun_size;
-        if !(size.is_finite() && size > 0.0) {
+        let core = self.sun_radius_cells();
+        if core <= 0.0 {
             return;
         }
-        let core = self.body_radius(6371.0) * size;
         let Some(centre) = self.project((0.0, 0.0, 0.0), scale) else {
             return;
         };
-        let reach = core * 2.4;
-        let on_screen = reach * scale;
-        if !(on_screen > 0.0) {
+        // Already in cells, so no `scale` here. That is the point of
+        // `sun_radius_cells`: a sun that grows with the terminal stops being a
+        // sun.
+        let on_screen = core * SUN_GLOW_REACH;
+        if !on_screen.is_finite() || on_screen <= 0.0 {
             return;
         }
 
@@ -758,7 +820,9 @@ impl SolarSystem {
         let dot_reach = (on_screen * DOTS_X as f64).ceil() as isize;
         let dot_x0 = (centre.x * DOTS_X as f64).floor() as isize;
         let dot_y0 = (centre.y * DOTS_Y as f64).floor() as isize;
-        let core_fraction = (core / reach).clamp(0.0, 1.0);
+        // `core_fraction` is where the solid disc ends and the speckled halo
+        // begins, as a fraction of the halo's reach.
+        let core_fraction = (1.0 / SUN_GLOW_REACH).clamp(0.0, 1.0);
 
         for dy in -dot_reach..=dot_reach {
             for dx in -dot_reach..=dot_reach {
@@ -768,8 +832,15 @@ impl SolarSystem {
                 }
                 // A linear ramp from the core out to the glow, so the edge of the
                 // disc is not a hard circle of one colour.
-                let t = ((distance / on_screen - core_fraction) / (1.0 - core_fraction))
-                    .clamp(0.0, 1.0);
+                let falloff =
+                    (distance / on_screen - core_fraction) / (1.0 - core_fraction);
+                let t = falloff.clamp(0.0, 1.0);
+                if falloff > 0.0 && speckle(dx as u32, dy as u32) > 1.0 - t {
+                    // Speckled halo: a dot survives with a probability that falls
+                    // to nothing at the rim, so the glow has no hard edge and
+                    // does not read as a second, larger disc.
+                    continue;
+                }
                 let color = [
                     (SUN[0] as f64 + (GLOW[0] as f64 - SUN[0] as f64) * t) as u8,
                     (SUN[1] as f64 + (GLOW[1] as f64 - SUN[1] as f64) * t) as u8,
@@ -782,7 +853,7 @@ impl SolarSystem {
 
     /// Saturn's rings, as an annulus in a plane tilted to its own orbit.
     fn draw_rings(&mut self, planet: &Body, centre: (f64, f64, f64), scale: f64) {
-        let body = self.body_radius(planet.radius_km);
+        let body = self.body_radius_cells(planet.radius_km);
         let tilt = RING_TILT.to_radians();
         let (sin_t, cos_t) = tilt.sin_cos();
         let color = rgb(dim(planet.color, 0.8));
@@ -808,10 +879,13 @@ impl SolarSystem {
     }
 
     /// A filled disc on the dot grid, so it is round at sub-cell size.
+    ///
+    /// `radius_cells` is in cells, not world units -- see
+    /// [`Self::body_radius_cells`].
     fn draw_disc(
         &mut self,
         centre: (f64, f64, f64),
-        radius: f64,
+        radius_cells: f64,
         color: [u8; 3],
         scale: f64,
     ) {
@@ -821,14 +895,15 @@ impl SolarSystem {
         // Floored at half a dot rather than allowed to fall between one dot and
         // the next: a planet smaller than a dot would otherwise be invisible on
         // most frames and blink on the rest.
-        let on_screen = (radius * scale).max(0.5 / DOTS_X as f64);
+        let on_screen = radius_cells.max(0.5 / DOTS_X as f64);
         let dot_x0 = (p.x * DOTS_X as f64).floor() as isize;
         let dot_y0 = (p.y * DOTS_Y as f64).floor() as isize;
         let reach = (on_screen * DOTS_X as f64).ceil() as isize;
         // Cells are about twice as tall as wide, so a dot is too; a circle in
         // *dot* coordinates is an ellipse on screen unless the vertical reach is
         // stretched to match.
-        let vertical = (reach as f64 * DOTS_Y as f64 / DOTS_X as f64).ceil() as isize;
+        let vertical =
+            (reach as f64 * DOTS_Y as f64 / DOTS_X as f64).ceil() as isize;
 
         for dy in -vertical..=vertical {
             for dx in -reach..=reach {
@@ -863,6 +938,28 @@ impl SolarSystem {
             }
         }
     }
+}
+
+/// A stable pseudo-random value in `[0, 1)` for one dot of the sun's halo.
+///
+/// Hashed from the dot's own coordinates rather than drawn from a generator, for
+/// two reasons: the halo has to be identical on every frame or it would crawl,
+/// and it has to be identical between two `SolarSystem` instances or the
+/// determinism contract would fail. Both rules out an RNG, since the number of
+/// dots raised depends on the screen size and the camera distance.
+///
+/// A whole-number mix rather than a sine of the coordinates, which is the usual
+/// shortcut and which visibly bands into diagonal stripes on a lattice this
+/// regular.
+fn speckle(x: u32, y: u32) -> f64 {
+    let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    // The top 24 bits, as a fraction. Fewer than 24 would quantise the halo into
+    // visible rings.
+    (h >> 40) as f64 / (1u64 << 24) as f64
 }
 
 /// A radius exponent a config cannot break.
@@ -1124,7 +1221,14 @@ mod tests {
     /// microscopic system, which passes every "does it draw" test in this file.
     #[test]
     fn the_fit_uses_the_screen_without_running_off_it() {
-        for size in [(80u16, 24u16), (200, 50), (400, 200), (40, 12), (12, 40), (200, 8)] {
+        for size in [
+            (80u16, 24u16),
+            (200, 50),
+            (400, 200),
+            (40, 12),
+            (12, 40),
+            (200, 8),
+        ] {
             let system = SolarSystem::new(SolarSystemOptions::default(), size);
             let scale = system.fit_scale();
             assert!(
@@ -1182,14 +1286,16 @@ mod tests {
     /// what it costs.
     #[test]
     fn true_scale_is_available_and_is_a_dot() {
-        let mut options = SolarSystemOptions::default();
-        options.radius_exponent = 1.0;
+        let true_scale_options = SolarSystemOptions {
+            radius_exponent: 1.0,
+            ..Default::default()
+        };
         let compressed = {
             let system = SolarSystem::new(SolarSystemOptions::default(), (80, 24));
             system.drawn_radius(&PLANETS[0]) * system.fit_scale()
         };
         let true_scale = {
-            let system = SolarSystem::new(options.clone(), (80, 24));
+            let system = SolarSystem::new(true_scale_options, (80, 24));
             system.drawn_radius(&PLANETS[0]) * system.fit_scale()
         };
 
@@ -1323,7 +1429,9 @@ mod tests {
                 Color::Rgb { r, g, b } => {
                     seen.insert((r, g, b));
                 }
-                other => panic!("cell ({x}, {y}) is {other:?}, not a truecolor triple"),
+                other => {
+                    panic!("cell ({x}, {y}) is {other:?}, not a truecolor triple")
+                }
             }
         }
         assert!(
@@ -1393,7 +1501,12 @@ mod tests {
     /// the frame with them.
     #[test]
     fn a_degenerate_config_draws_something_anyway() {
-        let fields: [(&str, fn(&mut SolarSystemOptions, f64)); 4] = [
+        /// A named setter, so the loop below can drive one field per entry
+        /// without capturing -- a closure that captures `bad` cannot be a
+        /// `fn` pointer.
+        type Setter = (&'static str, fn(&mut SolarSystemOptions, f64));
+
+        let fields: [Setter; 4] = [
             ("radius_exponent", |o, v| o.radius_exponent = v),
             ("tilt", |o, v| o.tilt = v),
             ("sun_size", |o, v| o.sun_size = v),

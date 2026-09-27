@@ -349,7 +349,13 @@ impl Terrain {
     /// happens to be at an extreme can reach the top of the screen or the bottom,
     /// and a screen with no sky in one column and no ground in the next does not
     /// read as a landscape either -- it reads as a tear.
-    fn surface_row(&self, x: usize, offset: f64, horizon: usize, span: f64) -> usize {
+    fn surface_row(
+        &self,
+        x: usize,
+        offset: f64,
+        horizon: usize,
+        span: f64,
+    ) -> usize {
         let period = Self::noise_period(self.options.scale);
         // The scroll enters the *first* noise axis, so the landscape travels
         // sideways past a stationary camera. The alternative -- advancing the
@@ -493,16 +499,7 @@ impl Terrain {
         steps as f64 / (rows.len() - 1) as f64
     }
 
-    /// The spread of the surface, in rows: highest crest to lowest valley.
-    #[cfg(test)]
-    fn silhouette_spread(size: (u16, u16)) -> usize {
-        let terrain = Terrain::new(TerrainOptions::default(), size);
-        let horizon = Self::horizon_row(size);
-        let rows = terrain.surface_rows(0.0, horizon);
-        rows.iter().max().copied().unwrap_or(0)
-            - rows.iter().min().copied().unwrap_or(0)
-    }
-
+    /// Paints one frame, `offset` ground rows further on than the last.
     /// The surface row for every column, computed once per frame.
     ///
     /// Hoisted out of the fill loop because it is the only part of the frame
@@ -544,8 +541,8 @@ impl Terrain {
             // palette samples a frame.
             let sky_colour = Self::sky_colour(y, horizon, &self.sky);
 
-            for x in 0..width {
-                if y < surface_rows[x] {
+            for (x, &top) in surface_rows.iter().enumerate().take(width) {
+                if y < top {
                     // A space, and a deliberate one: sky is where the *absence*
                     // of ground is, and drawing it as a ramp character would put
                     // texture in the sky and make the horizon ambiguous.
@@ -557,7 +554,7 @@ impl Terrain {
                     continue;
                 }
 
-                let depth = (y - surface_rows[x]) as f32 / ground_depth;
+                let depth = (y - top) as f32 / ground_depth;
                 let t = depth.clamp(0.0, 1.0);
                 surface.set(
                     x,
@@ -741,14 +738,17 @@ mod tests {
         // `grid.iter()` and treating each row as a column -- which is what this
         // did first -- reads the wrong axis entirely and reports a sky cell in
         // one column as a glyph from a different column's crest.
-        for x in 0..size.0 as usize {
-            for y in 0..rows[x] {
+        for (x, &top) in rows.iter().enumerate() {
+            for (y, cell) in grid
+                .iter()
+                .take(top)
+                .enumerate()
+                .map(|(y, row)| (y, row[x]))
+            {
                 assert_eq!(
-                    grid[y][x], ' ',
-                    "at ({x}, {y}) the ground starts at row {} but this cell was \
-                     drawn as {:?}",
-                    rows[x],
-                    grid[y][x]
+                    cell, ' ',
+                    "at ({x}, {y}) the ground starts at row {top} but this cell \
+                     was drawn as {cell:?}"
                 );
             }
         }
@@ -799,8 +799,10 @@ mod tests {
     #[test]
     fn relief_zero_is_a_slab_and_more_relief_moves_the_surface_more() {
         let spread_at = |relief: f64| {
-            let mut options = TerrainOptions::default();
-            options.relief = relief;
+            let options = TerrainOptions {
+                relief,
+                ..Default::default()
+            };
             let terrain = Terrain::new(options, (80, 24));
             let rows = terrain.surface_rows(0.0, Terrain::horizon_row((80, 24)));
             rows.iter().max().unwrap() - rows.iter().min().unwrap()
@@ -845,8 +847,10 @@ mod tests {
     #[test]
     fn the_landscape_has_the_same_shape_at_every_screen_height() {
         let density = |size: (u16, u16)| {
-            let mut options = TerrainOptions::default();
-            options.relief = 0.5;
+            let options = TerrainOptions {
+                relief: 0.5,
+                ..Default::default()
+            };
             // Below the cap at every one of these sizes, so what is being compared
             // is the requested amplitude and not the clamp.
             let terrain = Terrain::new(options, size);
@@ -872,8 +876,10 @@ mod tests {
     #[test]
     fn a_degenerate_relief_falls_back_rather_than_drawing_nothing() {
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -3.0, 7.0] {
-            let mut options = TerrainOptions::default();
-            options.relief = bad;
+            let options = TerrainOptions {
+                relief: bad,
+                ..Default::default()
+            };
             let terrain = Terrain::new(options, (80, 24));
             let span = terrain.surface_span(Terrain::horizon_row((80, 24)));
             assert!(
@@ -903,10 +909,17 @@ mod tests {
         let ramp = terrain.ramp.clone();
         let palette = terrain.ground.clone();
 
-        let density = |t: f32| ramp.glyphs().iter().position(|&g| g == ramp.sample(t)).unwrap();
+        let density = |t: f32| {
+            ramp.glyphs()
+                .iter()
+                .position(|&g| g == ramp.sample(t))
+                .unwrap()
+        };
         let luminance = |t: f32| match palette.sample(t) {
             style::Color::Rgb { r, g, b } => {
-                0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
+                0.2126 * f32::from(r)
+                    + 0.7152 * f32::from(g)
+                    + 0.0722 * f32::from(b)
             }
             _ => f32::NAN,
         };
@@ -1026,13 +1039,17 @@ mod tests {
         let rows = surface(size);
         let grid = drawn(size, 0);
         // A column is a stride through a row-major grid, not a row.
-        for x in 0..size.0 as usize {
-            for y in rows[x]..size.1 as usize {
+        for (x, &top) in rows.iter().enumerate() {
+            for (y, cell) in grid
+                .iter()
+                .enumerate()
+                .skip(top)
+                .map(|(y, row)| (y, row[x]))
+            {
                 assert_ne!(
-                    grid[y][x], ' ',
-                    "cell ({x}, {y}) is below the surface at row {} but drew as a \
-                     space, so the ground has a hole in it",
-                    rows[x]
+                    cell, ' ',
+                    "cell ({x}, {y}) is below the surface at row {top} but drew \
+                     as a space, so the ground has a hole in it"
                 );
             }
         }
@@ -1074,7 +1091,8 @@ mod tests {
 
         for (index, pair) in frames.windows(2).enumerate() {
             assert_ne!(
-                pair[0], pair[1],
+                pair[0],
+                pair[1],
                 "frames {index} and {} are identical, so the scroll stalled",
                 index + 1
             );
@@ -1131,11 +1149,7 @@ mod tests {
         }
         let later = terrain.surface_rows(terrain.offset, horizon);
 
-        let moved = first
-            .iter()
-            .zip(&later)
-            .filter(|(a, b)| a != b)
-            .count();
+        let moved = first.iter().zip(&later).filter(|(a, b)| a != b).count();
         assert!(
             moved > 0,
             "after two seconds at the default scroll speed not one column's \
@@ -1179,8 +1193,14 @@ mod tests {
         let at = Terrain::noise_frequency;
         let base = at(8.0);
 
-        assert!((at(4.0) - base * 2.0).abs() < 1.0e-12, "half the period, twice the frequency");
-        assert!((at(16.0) - base / 2.0).abs() < 1.0e-12, "double the period, half the frequency");
+        assert!(
+            (at(4.0) - base * 2.0).abs() < 1.0e-12,
+            "half the period, twice the frequency"
+        );
+        assert!(
+            (at(16.0) - base / 2.0).abs() < 1.0e-12,
+            "double the period, half the frequency"
+        );
         assert_eq!(at(8.0), base);
         assert!(
             at(2.0) > at(16.0),
@@ -1211,14 +1231,14 @@ mod tests {
     #[test]
     fn a_smaller_period_gives_a_more_jagged_silhouette() {
         let density_at = |scale: f64| {
-            let mut options = TerrainOptions::default();
-            options.scale = scale;
-            options.relief = 4.0 / scale;
+            let options = TerrainOptions {
+                scale,
+                relief: 4.0 / scale,
+                ..Default::default()
+            };
             let terrain = Terrain::new(options, (80, 24));
             let rows = terrain.surface_rows(0.0, Terrain::horizon_row((80, 24)));
-            rows.windows(2)
-                .filter(|w| w[0] != w[1])
-                .count() as f64
+            rows.windows(2).filter(|w| w[0] != w[1]).count() as f64
                 / (rows.len() - 1) as f64
         };
 
@@ -1416,9 +1436,10 @@ mod tests {
     /// be in that list or it arrives as a key the user's file does not have.
     #[test]
     fn the_new_keys_round_trip_through_toml() {
-        let options: TerrainOptions =
-            toml::from_str("scroll_speed = 2.5\nrelief = 0.3\nglyphs = \" .oO@\"\n")
-                .expect("three keys parse");
+        let options: TerrainOptions = toml::from_str(
+            "scroll_speed = 2.5\nrelief = 0.3\nglyphs = \" .oO@\"\n",
+        )
+        .expect("three keys parse");
         assert_eq!(options.scroll_speed, 2.5);
         assert_eq!(options.relief, 0.3);
         assert_eq!(options.glyphs, " .oO@");
@@ -1493,5 +1514,3 @@ mod tests {
         );
     }
 }
-
-
