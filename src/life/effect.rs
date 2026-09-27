@@ -60,20 +60,25 @@ const MAX_AGE: u8 = 8;
 /// nothing about the *shape* of a cell changes; a character cannot, because
 /// shape is exactly what the eye tracks.
 ///
-/// `@` rather than `O`, and it is a reading of the request rather than a
-/// default. "One big circle" has two ASCII candidates and they are not
-/// equivalent: `O` is a hollow ring, so a run of live cells draws as a row of
-/// outlines with the background showing through each one, which is a lattice
-/// rather than a population. `@` is the densest round character ASCII has -- it
-/// fills its cell box -- so a run of live cells reads as a solid mass and the
-/// structures between them are the gaps. It is also single-width in every
-/// terminal ever shipped, which `O` also is and which is the one thing this
-/// choice does not have to argue.
+/// `●` U+25CF BLACK CIRCLE, chosen by the user.
 ///
-/// Not a configurable field, deliberately. It was never one -- the ramp was a
-/// private static, not a `ConwayLifeOptions` key -- and adding one now would
-/// mean exposing exactly the knob this change exists to close.
-const LIVE_GLYPH: char = '@';
+/// The whole of the age is out of the character and this is what is left. A
+/// filled disc rather than a hollow one, so a run of live cells reads as a mass
+/// and the structures between them are the gaps.
+///
+/// `@` was tried here first, and it was this file's own reading of "one big
+/// circle" rather than the request: `@` is the densest round character ASCII
+/// has, and the reasoning for it was about *lattice versus population* -- `O` is
+/// a hollow ring, so a row of live cells draws as a row of outlines with the
+/// background showing through each one. That argument was answered twice with
+/// the same reply, which is the character itself. The glyph is not a judgement
+/// call about how a population should read; it is a picture the user can see,
+/// and `@` is a picture of a matrix, not of a cell.
+///
+/// Which is also why the character is not configurable. It was never a
+/// `ConwayLifeOptions` key -- the ramp was a private static -- and the age ramp
+/// became a colour-only function. One constant, one glyph, one place.
+const LIVE_GLYPH: char = '\u{25CF}';
 
 /// The colours a live cell is drawn in, by how long it has been alive.
 ///
@@ -619,7 +624,8 @@ mod tests {
     /// The user's own brief: "don't change the characters at all; just have one
     /// big circle for one live cell", and the disambiguation that went with it
     /// -- one constant round glyph for every age, with the age carried entirely
-    /// by the colour ramp.
+    /// by the colour ramp. The circle is U+25CF BLACK CIRCLE, named the second
+    /// time the request was made after `@` was tried and not what was asked for.
     ///
     /// The name of this test used to be `a_live_cells_glyph_depends_on_how_long_
     /// it_has_been_alive` and it asserted the exact opposite, deliberately
@@ -643,6 +649,13 @@ mod tests {
     /// [`MAX_AGE`] exists to warn about on the colour side, and it is the
     /// saturating end here that a still life lives at.
     ///
+    /// The set is compared against the literal `\u{25CF}` and not against
+    /// [`LIVE_GLYPH`], so this is a statement about the *picture* and the constant
+    /// is the thing that has to agree with it. Asserting only the constant would
+    /// let a future "improve" of the character pass here and fail in the width
+    /// test; asserting only the set length would have passed unchanged when the
+    /// glyph went from `@` to `●`, which is the change this test had to survive.
+    ///
     /// Then the other half, which is the claim that actually has content: the
     /// colour still drifts, and it is what the age is now visible *in*. Two
     /// assertions in each direction, because each alone is satisfiable by
@@ -658,13 +671,14 @@ mod tests {
     /// colour would be caught here.
     #[test]
     fn every_live_cell_is_one_glyph_and_its_colour_is_its_age() {
-        // One character, for every age, and the same one for all of them.
+        // One character, for every age, and it is the circle that was asked for.
         let glyphs: HashSet<char> = (0..=MAX_AGE).map(glyph_for_age).collect();
         assert_eq!(
-            glyphs.len(),
-            1,
+            glyphs,
+            HashSet::from(['\u{25CF}']),
             "the nine ages 0..={MAX_AGE} resolve to {glyphs:?} rather than one \
-             character, so a cell's appearance still changes as it ages"
+             character, and that character is not U+25CF BLACK CIRCLE, so a cell's \
+             appearance still changes as it ages"
         );
         assert_eq!(
             glyph_for_age(0),
@@ -1028,29 +1042,50 @@ mod tests {
         );
     }
 
-    /// The glyph is ASCII, so it cannot shear a cell-indexed grid.
+    /// The one glyph is the big circle the user asked for, and it will not
+    /// shear a cell-indexed grid.
     ///
-    /// The old set was thirty-two halfwidth katakana, U+FF8A and neighbours.
-    /// Halfwidth katakana occupy one column in a Latin-configured terminal and
+    /// The glyph used to be `@`, and the width half of this test used to be
+    /// `is_ascii()`. That was a stronger claim than the crate could support and
+    /// it is now false in the interesting direction: `●` is U+25CF, which is
+    /// outside ASCII, and the *reason* ASCII was used is gone with the reason for
+    /// the old glyph. The old set was thirty-two halfwidth katakana, U+FF8A and
+    /// neighbours, all of which are one column in a Latin-configured terminal and
     /// two in a CJK-configured one, so the same run of live cells came out one
     /// column wide in one terminal and two in the next. Whether a glyph is
-    /// double-width is not something this crate can decide without a width
-    /// table, which is the other reason the replacement is ASCII: it is the one
-    /// range guaranteed single-width everywhere.
+    /// double-width is not something this crate can decide without a width table,
+    /// so this borrows the one it has:
+    /// [`is_ambiguous_or_narrow`](crate::render::glyph_ramp::is_ambiguous_or_narrow)
+    /// is the predicate for the subset that is one cell in every terminal, and it
+    /// accepts `●` -- U+25CF is inside its `\u{2190}..=\u{2BFF}` range.
     ///
-    /// One glyph rather than a ramp, so this is now a check on a single constant
-    /// -- and that is the point of asserting it rather than trusting it. It is a
-    /// one-line constant someone will eventually "improve", and the three
-    /// properties below are the three ways that goes wrong: a box-drawing or
-    /// block character that is ambiguous-width, a control code, and a space,
-    /// which is an invisible cell in the middle of a live structure.
+    /// What the predicate does *not* settle, and what this test therefore has to
+    /// say out loud, is the remaining risk. `●` is East_Asian_Width =
+    /// *Ambiguous*: one column in a Latin-configured terminal, two in a
+    /// CJK-configured one. So it is not in the safe subset in the strict sense,
+    /// it is in it by the convention that ambiguous characters are drawn narrow,
+    /// and a terminal configured the other way will shear the picture -- which
+    /// `glyph_ramp`'s module docs are explicit is "not merely looking wrong".
+    /// That is accepted rather than fixed: the glyph was chosen, twice, by
+    /// someone who wanted this circle, and the alternative is a character that
+    /// is not a circle. Not a way to argue the choice is wrong, just the
+    /// remaining scope of what the assertion covers.
+    ///
+    /// The two properties that used to ride on `is_ascii()` and still have to
+    /// hold on their own: not a control code, and not a space. A space is an
+    /// invisible cell in the middle of a live structure, and a control code
+    /// moves the cursor. Neither is about width, so neither is weakened by
+    /// borrowing a narrower predicate.
     #[test]
-    fn the_live_glyph_is_ascii_visible_and_not_a_control_code() {
+    fn the_live_glyph_is_the_big_circle_and_will_not_shear_a_grid() {
+        use crate::render::glyph_ramp::is_ambiguous_or_narrow;
+
         for age in 0..=MAX_AGE {
             let glyph = glyph_for_age(age);
             assert!(
-                glyph.is_ascii(),
-                "age {age} draws {glyph:?} (U+{:04X}), which is not ASCII",
+                is_ambiguous_or_narrow(glyph),
+                "age {age} draws {glyph:?} (U+{:04X}), which is double-width in at \
+                 least one terminal, so a cell-indexed grid shears after it",
                 glyph as u32
             );
             assert!(
@@ -1066,10 +1101,10 @@ mod tests {
         // that the property is about `LIVE_GLYPH` and not about a wrapper that
         // happens to normalise it away.
         assert_eq!(
-            LIVE_GLYPH, '@',
-            "the one live glyph is {LIVE_GLYPH:?}; `@` is the densest round ASCII \
-             character, and `O` is a hollow ring that draws a run of live cells as \
-             a lattice rather than as a population"
+            LIVE_GLYPH, '\u{25CF}',
+            "the one live glyph is {LIVE_GLYPH:?} (U+{:04X}), not U+25CF BLACK \
+             CIRCLE -- the request was one big filled circle for one live cell",
+            LIVE_GLYPH as u32
         );
     }
 
