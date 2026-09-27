@@ -496,7 +496,6 @@ mod tests {
         assert_eq!(args.seed, Some(1234));
     }
 
-    #[test]
     /// `--random` is its own flag rather than a value for `--seed`, and the two
     /// are separate booleans in `AppArgs` so that "neither given" and "both
     /// given" are distinguishable. That distinction is the whole of the
@@ -583,6 +582,12 @@ mod tests {
         );
     }
 
+    /// The `#[test]` here was eaten by a scripted insertion and the function sat
+    /// in the test module as dead code for a whole commit, passing clippy's
+    /// reachability and running nothing. `cargo test --bin termzzz` reported one
+    /// fewer test than it should have and nobody compared the number, because
+    /// "tests pass" and "the right tests ran" are different claims.
+    #[test]
     fn seed_defaults_to_none_and_rejects_nonsense() {
         let untouched =
             parse_args_from(["matrix".to_string()].into_iter()).unwrap();

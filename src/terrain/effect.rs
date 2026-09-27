@@ -161,6 +161,23 @@ const GROUND_DEPTH_BIAS: f32 = 0.22;
 /// `relief` is 7.0 for three rows of surface.
 const NOISE_PRACTICAL_RANGE: f32 = 0.4;
 
+// Checked when the crate is compiled rather than when a test runs.
+//
+// Both of these were runtime `assert!`s in a test, which is `assert!(true)` --
+// clippy says so, and it is right: the compiler evaluates the condition and
+// drops the check, so the test could never fail. A `const` block is checked for
+// real and fails the build, which is what an invariant between two named
+// constants wants. The messages cannot be formatted here, because const panic
+// takes a literal, so they live on the constants instead.
+const _: () = assert!(
+    GRAIN_PERIOD_Y < GRAIN_PERIOD_X,
+    "the grain's vertical period must be the shorter of the two or the ground reads as fluting"
+);
+const _: () = assert!(
+    0.5 + GRAIN_WEIGHT < 1.0 && 0.5 - GRAIN_WEIGHT > 0.0,
+    "the grain must be able to reach both ends of the ramp or the calibration does nothing"
+);
+
 /// The largest fraction of the ground's depth the surface amplitude may take.
 ///
 /// Binds only on short terminals, where the requested amplitude in rows would
@@ -1225,34 +1242,90 @@ mod tests {
         );
     }
 
-    /// The grain's vertical period is shorter than its horizontal one, which is
-    /// what makes it banded.
+    /// The grain is banded, measured on the generator rather than on the frame.
     ///
-    /// Asserted on the constants rather than on the output, and the reason is
-    /// worth stating: a measured version cannot separate the two. Walking down a
-    /// column changes the depth, and the depth bias changes the glyph with it, so
-    /// a vertically-varying measure is dominated by the bias whether or not there
-    /// is any banding at all. The flat body this replaced passed a measured
-    /// banding test for exactly that reason.
+    /// The obvious way to measure this is on the drawn picture, and it does not
+    /// work: walking down a column changes the depth, and the depth bias changes
+    /// the glyph with it, so any vertically-varying measure is dominated by the
+    /// bias whether or not there is banding at all. The flat body this replaced
+    /// passed a measured banding test for exactly that reason.
     ///
-    /// What is being claimed is a property of the sampling, and the sampling is
-    /// two named constants. If the vertical period is the longer of the two the
-    /// features are stretched the other way and the ground reads as vertical
-    /// fluting rather than as sediment.
+    /// So: sample the noise directly, at a fixed depth, and estimate how far it
+    /// takes the field to become *unrecognisably different* along each axis.
+    /// Depth is held constant and so is the other axis, so neither measurement
+    /// can see the other's period.
+    ///
+    /// The first two attempts at the estimator were both wrong in the same way,
+    /// and the second one is the one worth recording. Measuring "the last offset
+    /// at which the field changed by more than a threshold" looks like a
+    /// correlation length and is not one: over a long enough baseline the field
+    /// changes by more than any fixed threshold *somewhere*, so the answer grows
+    /// with the length of the sweep and saturates at its end. Over 40 steps it
+    /// reported 38 against 38 for the banded case and failed; over 200 it
+    /// reported 196 against 199 and still failed, having found no separation at
+    /// all. Both were a real estimator returning a meaningless number.
+    ///
+    /// What is used instead is the standard one: the mean absolute difference
+    /// from the origin as a function of offset, and the offset at which it
+    /// crosses half its value at the far end. That rises monotonically to a
+    /// limit, so it does not depend on how far the sweep goes, and it is
+    /// genuinely a length.
     #[test]
-    fn the_grain_periods_make_it_banded() {
+    fn the_grain_is_banded_rather_than_isotropic() {
+        let noise = PerlinNoise::new(TerrainOptions::default().seed);
+        let at = |x: f64, y: f64| {
+            noise.octave_noise_2d(
+                x / GRAIN_PERIOD_X,
+                y / GRAIN_PERIOD_Y,
+                GRAIN_OCTAVES,
+                GRAIN_PERSISTENCE,
+                1.0,
+            )
+        };
+
+        // Mean absolute departure from the origin at a given offset, along one
+        // axis. 96 base positions, which is a whole number of periods at this
+        // size so no base is favoured.
+        let departure = |offset: f64, along_horizontal: bool| -> f64 {
+            let mut total = 0.0;
+            for base in 0..96 {
+                let b = f64::from(base) * 0.25;
+                let (x0, y0) = if along_horizontal { (b, 0.0) } else { (0.0, b) };
+                let (x1, y1) = if along_horizontal {
+                    (b + offset, 0.0)
+                } else {
+                    (0.0, b + offset)
+                };
+                total += (at(x1, y1) - at(x0, y0)).abs();
+            }
+            total / 96.0
+        };
+
+        // Half-departure distance, by bisection on a monotonically rising curve.
+        let half = |along_horizontal: bool| -> f64 {
+            let far = departure(40.0, along_horizontal);
+            let target = far * 0.5;
+            let (mut low, mut high) = (0.0f64, 40.0f64);
+            for _ in 0..40 {
+                let mid = (low + high) * 0.5;
+                if departure(mid, along_horizontal) < target {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            (low + high) * 0.5
+        };
+        let (across, down) = (half(true), half(false));
+
         assert!(
-            GRAIN_PERIOD_Y < GRAIN_PERIOD_X,
-            "the grain's vertical period is {GRAIN_PERIOD_Y} and its horizontal is \
-             {GRAIN_PERIOD_X}, so the features are stretched vertically. Equal \
-             periods give isotropic blobs, which read as static; the vertical \
-             period has to be the shorter one for bands."
-        );
-        // And the grain must be able to reach both ends of the ramp, or the
-        // re-spacing that motivated it does nothing.
-        assert!(
-            0.5 + GRAIN_WEIGHT < 1.0 && 0.5 - GRAIN_WEIGHT > 0.0,
-            "a grain weight of {GRAIN_WEIGHT} on a ramp centred at 0.5 cannot reach              both ends of the scale"
+            across > down * 1.25,
+            "the grain takes {across:.1} cells to become unrecognisably different \
+             across and only {down:.1} down, a ratio of {:.2}. The vertical period \
+             is {GRAIN_PERIOD_Y} and the horizontal {GRAIN_PERIOD_X}; for bands the \
+             features have to be wider than they are tall, or the ground reads as \
+             vertical fluting.",
+            across / down
         );
     }
 
