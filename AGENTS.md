@@ -218,14 +218,24 @@ the matrix drop tails were all one saturated colour because a truncating cast
 destroyed the fade. A byte count is only meaningful next to what is on screen.
 
 Two numbers then went sharply *down*, and both are worth understanding rather
-than just noting. `terrain` fell from 554 KB to 17 KB because the height-field
+than just noting. `terrain` fell from 554 KB to 11 KB because the height-field
 rewrite leaves the sky as a space that matches the cleared cell, so unchanged sky
-drops out of the diff entirely — the effect got *more* structured and 32x cheaper
+drops out of the diff entirely — the effect got *more* structured and 50x cheaper
 to emit. `dvd` is 596 bytes at 400x200 for the same reason in braille: a cell with
 no raised dot is not written. **Not writing a cell is the cheapest rendering
 optimisation there is**, and both of these found it by accident rather than by
 looking for it. Check whether an effect is writing cells that did not change before
 optimising anything it computes.
+
+**And that terrain number then went back up, for a good reason.** Giving the
+ground a body — a two-dimensional grain rather than a function of depth — took it
+from 11 KB to **24 KB** at 400x200, and from 519 changed cells a frame to 1,127.
+That is the direct cost of the structure being real: a body whose glyph was a pure
+function of depth barely changed from frame to frame, and a picture that changes
+519 cells a second is a picture not doing anything. The old number was cheap
+*because* it was featureless, which is the same lesson as the mandelbrot's flat
+wash in the other direction. At 200x50 it is 3 KB, so this only matters on a
+screen eight times heavier than an ordinary one.
 
 ## Working Practices
 
