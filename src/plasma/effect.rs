@@ -1,19 +1,28 @@
 use crate::buffer::{Buffer, Cell};
 use crate::canvas::Canvas;
-use crate::common::{DEFAULT_SEED, TerminalEffect};
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crate::render::glyph_ramp::{self, GlyphRamp};
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, SQRT_2};
 use std::sync::LazyLock;
 
-/// `std::f64::consts::SQRT_3` is still unstable, so it is spelled out here.
+/// `std::f64::consts` carries `SQRT_2` and nothing else, so the other two roots
+/// this field needs are spelled out here.
 ///
-/// The literal is the correctly-rounded `f64` nearest `sqrt(3)`, which is all a
+/// Each literal is the correctly-rounded `f64` nearest the root, which is all a
 /// frequency ratio needs: what matters is that it is irrational and that it is
-/// not a rational multiple of [`TIME_FREQ_WAVE`]'s base, and both properties
-/// survive to the last bit.
+/// not a rational multiple of any of the others, and both properties survive to
+/// the last bit. `sqrt(3)`, `sqrt(5)` and `sqrt(7)` are pairwise irrational in
+/// *every* ratio -- `sqrt(5/3)`, `sqrt(7/5)` and the rest are all irrational,
+/// because the quotient of two square roots of distinct squarefree integers is
+/// irrational. That is the property [`TIME_FREQ_DIAGONAL`] and
+/// [`TIME_FREQ_BREATH`] rely on, and it is why the set is those three and not
+/// `sqrt(6)` or `sqrt(8)`: `sqrt(8) = 2*sqrt(2)`, and a rational factor in
+/// there is a rational ratio between two frequencies and a period with them.
 const SQRT_3: f64 = 1.732_050_807_568_877_2;
+const SQRT_5: f64 = 2.236_067_977_499_79;
+const SQRT_7: f64 = 2.645_751_311_064_590_7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -140,7 +149,7 @@ const PALETTE_LEN: usize = 256;
 /// - The heavy end is no longer a tail in *area*, which the ten-step version of
 ///   this note relied on, and the reason is the re-spacing: `@` now covers about
 ///   a sixteenth of the field rather than none of it. It is still a tail in
-///   *value* -- reaching it takes a value above 0.768, which is where the field's
+///   *value* -- reaching it takes a value above 0.737, which is where the field's
 ///   bright cores are -- but not in area, and the note that used to lean on area
 ///   is what [`glyph_value`] had to be written to undo.
 ///
@@ -176,16 +185,54 @@ const DEFAULT_GLYPHS: &str = " '.-:=;*+X#O%&M@";
 /// `;` and `+` together on 49% of the screen and `@` on **0.00%**: the brightest
 /// glyph in the set was never drawn, not once. At 200x50, where the field is
 /// better sampled, `+` still took 23.5% and `@` 0.20%. The cause is that a sum
-/// of four sines is a *bell*: its value is concentrated near the middle of its
+/// of a few sines is a *bell*: its value is concentrated near the middle of its
 /// range, so a ramp divided evenly in value spends most of its steps on
 /// distinctions the eye cannot find and leaves its extremes unreachable.
 ///
 /// The field's measured quantiles at 1/16 intervals, at 200x50:
 ///
 /// ```text
-/// 0.232 0.296 0.343 0.382 0.417 0.449 0.478 0.506 0.534 0.563
-/// 0.593 0.626 0.663 0.707 0.768
+/// 0.237 0.295 0.337 0.372 0.402 0.431 0.459 0.487 0.515 0.544 0.573 0.604
+/// 0.639 0.683 0.737
 /// ```
+///
+/// **Fitted over ten seeds rather than one**, and that is the whole difference
+/// from the fit this replaced. [`FieldTuning`] draws the five spatial divisors
+/// and the five starting phases from the seed, and
+/// [`Config::randomise_seeds`](crate::config::Config::randomise_seeds) hands
+/// every launch whose seed is unset a fresh one -- so *every launch has a
+/// slightly different field* and a table fitted to one of them is fitted to a
+/// launch nobody chose. These are the quantiles of six million samples pooled
+/// over seeds 0, 1, 7, 13, 42, 99, 1234, 5150, 65535 and 987654321.
+///
+/// **The last boundary is not a pooled quantile**, and the reason is that a
+/// table's job is the *worst* launch while a pooled quantile is fitted to the
+/// median one. Measured over those ten seeds the pooled quantiles leave the
+/// sparsest step of the unluckiest launch at 2.37% and let one seed's busiest
+/// step reach 13.2%. Lowering the top boundary to 0.737 moves 1.1 points of area
+/// off the top step and onto its neighbour, which takes the worst launch's floor
+/// to **2.63%** and its ceiling to 13.9%. It is the one number here that is not
+/// a measured quantile, and it is a calibration decision rather than a
+/// measurement wearing one.
+///
+/// The previous table was fitted to a field of four sines, and the field's
+/// distribution is measurably different now that there are five: a sum of five
+/// is less peaked than a sum of four, so the field reaches further at both
+/// ends. Carried onto the new field unchanged it leaves the worst of those ten
+/// launches with a sparsest step of **1.50%**, against 2.63% for this one, and
+/// at the default seed alone it put 9.05% of the screen on `:` and 1.47% on
+/// `@` -- a monotone drift down the whole ramp which stayed inside the
+/// histogram test's 3% floor without being a good calibration.
+/// `the_calibration_holds_across_seeds_not_just_the_default_one` is the
+/// assertion, and this table's shares at that same seed are 7.86% and 2.57%.
+///
+/// The five-term distribution is also much less sensitive to the terminal's
+/// size, which was not true of the four-term one. Pooled over nine seeds the
+/// 80x24 quantiles run 0.233 to 0.724 against 0.237 to 0.743 at 200x50 -- a
+/// gap of 0.004 at the bottom where the old field's was 0.20 -- so the
+/// small-terminal case is a smaller correction than it used to be. See
+/// `a_short_terminal_thins_the_ends_of_the_ramp` for what is still asserted
+/// there.
 ///
 /// # Why a table and not an exponent
 ///
@@ -201,8 +248,8 @@ const DEFAULT_GLYPHS: &str = " '.-:=;*+X#O%&M@";
 ///
 /// # What it costs
 ///
-/// - **The field's tails are compressed.** A value of 0.0 and a value of 0.23
-///   now draw the same glyph, and 0.77 and 1.0 draw the same other one. That is
+/// - **The field's tails are compressed.** A value of 0.0 and a value of 0.24
+///   now draw the same glyph, and 0.74 and 1.0 draw the same other one. That is
 ///   a real loss of contrast at the extremes, paid for in the middle: two
 ///   characters that used to cover half the screen between them now cover an
 ///   eighth of it, and the busiest character covers 6.4% against 29.1%. A region
@@ -213,7 +260,7 @@ const DEFAULT_GLYPHS: &str = " '.-:=;*+X#O%&M@";
 /// - **The heavy end is no longer a tail in *area*,** which the ten-step note on
 ///   [`DEFAULT_GLYPHS`] relied on. `@` now covers a sixteenth of the field rather
 ///   than none of it. It is still a tail in *value*: reaching it takes a value
-///   above 0.768, which is where the field's bright cores are.
+///   above 0.743, which is where the field's bright cores are.
 ///
 /// - **The colour channel is deliberately left alone.** A cell's colour is
 ///   `palette[plasma + offset]` on the raw value, and remapping that too would
@@ -228,19 +275,22 @@ const DEFAULT_GLYPHS: &str = " '.-:=;*+X#O%&M@";
 /// They are fitted at 200x50, and 400x200 agrees with them to within 0.006 at
 /// every one of the fifteen -- which the measurement in
 /// `every_glyph_of_the_default_ramp_carries_its_share_of_the_screen` confirms
-/// from the other end, by finding every step at 6.0% to 6.6% there too.
+/// from the other end, by finding every step within a few tenths of a percent
+/// of a sixteenth there too.
 ///
 /// **80x24 does not agree, and cannot.** Reaching the field's extreme values is
-/// a coincidence in three variables at once, so a small screen does not sample
-/// them often enough: over 460,800 samples at 80x24 the field spans 0.032 to
-/// 0.941, against 0.0002 to 0.9998 at 400x200. The bottom of the ramp therefore
-/// comes out *thin* rather than empty at that size -- the space draws 1.54% and
-/// `'` 2.44% where each step draws 6.3% at 200x50 -- and no static table can do
+/// a coincidence in five variables at once, so a small screen does not sample
+/// them often enough: over 460,800 samples at 80x24 the field spans 0.017 to
+/// 0.994, against 0.003 to 0.996 at 200x50. The bottom of the ramp therefore
+/// comes out *thin* rather than empty at that size, and no static table can do
 /// better, because the missing mass is in the field and not in the mapping. See
 /// `a_short_terminal_thins_the_ends_of_the_ramp` for what *is* asserted there.
+/// It used to be a much worse gap than it is: with five terms the field's
+/// quantiles at 80x24 sit within 0.02 of the 200x50 ones at both ends, against
+/// a 0.20 gap at the bottom when there were four.
 const VALUE_BOUNDARIES: [f64; 15] = [
-    0.232, 0.296, 0.343, 0.382, 0.417, 0.449, 0.478, 0.506, 0.534, 0.563, 0.593,
-    0.626, 0.663, 0.707, 0.768,
+    0.237, 0.295, 0.337, 0.372, 0.402, 0.431, 0.459, 0.487, 0.515, 0.544, 0.573,
+    0.604, 0.639, 0.683, 0.737,
 ];
 
 /// The remap itself: the glyph ramp's own value for a field value.
@@ -417,15 +467,210 @@ fn glyph_ramp(configured: &str) -> GlyphRamp {
 /// vertically` for the measurement.
 const CELL_ASPECT: f64 = 1.2;
 
-/// Divisor on the fourth term's radius, deliberately not the third term's 4.0.
+/// One spatial divisor and the band the seed is allowed to draw it from.
 ///
-/// Two sines of the same argument differ only by a phase, so sharing a divisor
-/// collapses the pair into a single wave and drops a degree of freedom from the
-/// field. One factor of two again -- the same relationship the octave sum
-/// uses -- keeps the two ripples at different frequencies so they interfere
-/// rather than merge, and measured within noise of the alternatives on both
-/// metrics the tests use.
-const FOURTH_RADIUS_DIVISOR: f64 = 8.0;
+/// # Why the band has hard edges
+///
+/// A divisor is a *spatial frequency*, and both of its degenerate ends are
+/// degenerate in opposite directions. Near zero the term is a flat wash -- one
+/// broad, almost constant bulge across the whole screen. Near the screen's own
+/// width it is a single stripe, because there is not room for a second. Both
+/// are the field drawing nothing, and neither is a "randomiser" failure that
+/// shows up in a test: the picture still renders, it is just not plasma.
+///
+/// So the band is stored as a centre and a half-width rather than as two ends,
+/// the drawing is a *multiplication* of the centre by a factor in
+/// `1 - jitter ..= 1 + jitter` rather than a draw over an open range, and
+/// `the_seeded_divisors_stay_inside_their_bands` measures 200 seeds and holds
+/// every one of the twenty draws to its own edges. A factor is what makes the
+/// floor: `rng.random_range(0.0..base)` would have a floor of zero and a draw
+/// of `0.04` would be a legal, invisible, unarguable outcome.
+///
+/// The test recomputes the edges from `center` and `jitter` rather than reading
+/// them off the type. There are no accessors to read: a `low()` here would be
+/// used by nothing but the test, and the test asking the code under test where
+/// its own boundaries are is a test that cannot fail.
+#[derive(Debug, Clone, Copy)]
+struct DivisorBand {
+    /// What a fresh effect centres on.
+    center: f64,
+    /// Half-width of the band, as a fraction of `center`.
+    jitter: f64,
+}
+
+impl DivisorBand {
+    const fn new(center: f64, jitter: f64) -> Self {
+        Self { center, jitter }
+    }
+
+    /// Draws one divisor.
+    ///
+    /// Multiplicative and not additive because a divisor is a *period*: a
+    /// wobble of a fixed size in cells means something completely different at
+    /// 4 cells and at 16, and a proportional band keeps the number of bands on
+    /// screen the same fraction of the screen at both ends. Additive jitter on
+    /// a small divisor produces a different number of features than the same
+    /// jitter on a large one, which is the opposite of what a band is for.
+    fn draw(&self, rng: &mut EffectRng) -> f64 {
+        use rand::RngExt;
+        self.center * rng.random_range(1.0 - self.jitter..=1.0 + self.jitter)
+    }
+}
+
+/// Divisor on the wave term: the spacing of the vertical bands, in cells.
+///
+/// The widest of the five, because it is the term that has to survive being
+/// scaled by `spatial_scale` and still read as bands rather than as texture.
+/// At 200 columns the band is 15.7 to 30.0, so 7 to 13 full cycles across the
+/// screen; a narrower one and the field's coarsest structure stops being
+/// visible as structure at all.
+const WAVE_DIVISOR: DivisorBand = DivisorBand::new(8.0, 0.30);
+
+/// Divisor on the sweep term: the spacing of the horizontal bands.
+///
+/// Wider than [`WAVE_DIVISOR`] and deliberately so, twice over. It was 16.0
+/// against the wave's 8.0 before, and the ratio is what keeps the field's
+/// vertical spatial rate down: measured over a 400x200 screen, the field
+/// changes 0.79x as fast going down a column as across a row, and this divisor
+/// is the reason it is not 1.2x. A field that changes as fast vertically as
+/// horizontally is *isotropic*, and `the_field_is_not_stretched_vertically` is
+/// about the opposite failure -- but the honest reading of that test's band is
+/// that 1.2 is the isotropic value and this divisor is what keeps the measured
+/// figure below it.
+///
+/// The seed's band is 11.2 to 20.8, which at 200x50 is 2.9 to 5.1 cycles of
+/// horizontal band over the screen's 60 corrected units of height.
+const SWEEP_DIVISOR: DivisorBand = DivisorBand::new(16.0, 0.30);
+
+/// Divisor on the first ring term: the spacing of the concentric bands.
+///
+/// The narrowest of the five, and the reason the field has a *scale* to it. The
+/// radial extent of a 200x50 screen is about 104 corrected units, so 3.0 to 5.0
+/// puts 21 to 35 rings along the diagonal -- enough that the rings read as
+/// rings and not as one gradient.
+const RING_DIVISOR: DivisorBand = DivisorBand::new(4.0, 0.25);
+
+/// Divisor on the second ring term, deliberately **not** [`RING_DIVISOR`]'s
+/// multiple.
+///
+/// This is the third of the three structural faults in the field, and it is the
+/// one that no test in this file was watching for. The two ring terms used to
+/// be `sin(r/4)` and `sin(r/8)` -- the same pattern at exactly 2 : 1, a
+/// harmonic. Two sines of one argument in a harmonic ratio are not two waves:
+/// they are one wave and its second harmonic, they add *coherently* at every
+/// radius, and their sum is a single clean beat with a smooth envelope. Which
+/// is exactly what the field looked like: hard concentric bands, evenly spaced,
+/// marching outwards, no interference anywhere in them.
+///
+/// 5.5 against 4.0 is a ratio of 11 : 8. Not harmonic, so the two beat against
+/// each other at a visibly different rate and the rings interfere rather than
+/// reinforce. It is still a rational ratio, so the pair is jointly periodic in
+/// the radius -- at 88*pi, about 276 corrected units, which is more than the
+/// screen's own diagonal, so the repeat is off the visible field entirely. The
+/// 2 : 1 pair's joint period was 16*pi = 50.3 units, a shade under *half* the
+/// 200x50 diagonal and 12 units under the 400x200 one, so its repeat was on
+/// screen. That is the whole difference: not that the pattern cannot repeat,
+/// but that the repeat is now further away than the screen.
+///
+/// The band is 3.85 to 7.15, which keeps the ratio to [`RING_DIVISOR`]'s
+/// between 11 : 8 and 2.39 : 1, and the low end of that range is deliberately
+/// still not 2 : 1.
+const BREATH_DIVISOR: DivisorBand = DivisorBand::new(5.5, 0.30);
+
+/// Divisor on the diagonal term: the spacing of the 45-degree bands.
+///
+/// The fault this fixes is the one with no constant in front of it, because the
+/// fix is a term rather than a number. Every term the field had was a function
+/// of `x` alone, `y` alone, or `r` alone, so the field was built from
+/// axis-aligned stripes and concentric rings and nothing else, and it read as
+/// bands sliding past rather than as something with a grain. There is a
+/// diagonal term in the canonical demoscene plasma for exactly that reason.
+///
+/// 12.0 puts 17 to 31 cycles across the 260 corrected units of `x + y` that a
+/// 200x50 screen spans. Wider than that and the diagonal stops competing with
+/// the wave term, which is at 8.0 and therefore coarser; narrower and it
+/// becomes the finest structure on the screen and the field's grain turns to
+/// noise. The band's low end, 8.4, is *coarser* than the wave's centre on
+/// purpose, so that across the band there are seeds where the diagonal is the
+/// coarsest term in the field and seeds where it is not.
+const DIAGONAL_DIVISOR: DivisorBand = DivisorBand::new(12.0, 0.30);
+
+/// How far the sweep term's phase travels, in bands of `y / SWEEP_DIVISOR`.
+///
+/// **This is the number the user's second complaint is about**, and it was 2.0.
+///
+/// The sweep term is a field of *horizontal* bands whose phase is dragged up
+/// and down the screen over time, so its depth is a vertical advection speed and
+/// nothing else measures it. At 2.0 the phase swings the full two cycles of
+/// `y / 16`, which is 32 corrected units -- more than half the 60 units of
+/// height a 200x50 screen has. Half the field's amplitude was travelling
+/// vertically, upwards and downwards, once every `2*pi / 0.866` = 7.3 units of
+/// `plasma.time` (14.5 seconds of wall clock), and no other term in the field
+/// can compete with a motion that size: it is the direct cause of "it just
+/// goes up and down", and it is why the *first* fix -- making the time
+/// frequencies irrational -- did not touch the complaint. That fix was about
+/// repetition and this is about character, and the two are different problems.
+///
+/// At 0.25 the same term carries the bands 4 corrected units, or three rows,
+/// each way -- about one and a half rows a second of wall clock. Measured as
+/// the least-squares advection velocity the picture has downwards against the
+/// one it has sideways, the field went from 5.81 to 0.98 at 200x50 and from
+/// 3.46 to 1.13 at 80x24. See `the_field_does_not_go_up_and_down`.
+///
+/// **What was given up, because something had to be.** The old term was the
+/// fastest-moving thing in the field and a good part of the picture's perceived
+/// activity came from it. The field's *net drift* went from 3.14 cells a second
+/// to 0.75, which is three quarters of the picture's motion; the mean |change|
+/// at a cell over a second of wall clock, which is what churn actually feels
+/// like, is about 60% of what it was. So the picture still boils locally and
+/// simply no longer marches. The churn it lost is partly recoverable from the
+/// seed, which is the other half of this round -- a launch that draws a small
+/// [`DIAGONAL_DIVISOR`] is livelier than one that draws a large one.
+const SWEEP_DEPTH: f64 = 0.25;
+
+/// How far the first ring term's phase travels, in rings of `r / RING_DIVISOR`.
+///
+/// Zero before, and a term that does not move is a term whose half the radial
+/// structure on the screen is standing still while the other half drifts. That
+/// reads as a picture with a frozen component in it, and it is also the term
+/// that makes the *pattern* of rings legible in the first place -- an
+/// interference pattern needs both of its waves to breathe or it is just a
+/// gradient that happens to be curved.
+const RING_DEPTH: f64 = 0.9;
+
+/// How far the second ring term's phase travels.
+///
+/// Was 1.0 against a divisor of 8.0, so a radial speed of 4.0 units per unit of
+/// `plasma.time`. [`BREATH_DIVISOR`] is now 5.5 and the divisor's band runs
+/// down to 3.85, so 1.0 would have put the speed at 7.3 and the term would have
+/// been the fastest-moving thing in the field. Scaled to hold the speed where
+/// it was rather than to keep the number, which is the whole point of writing
+/// the product down.
+const BREATH_DEPTH: f64 = 0.55;
+
+/// How far the diagonal term's phase travels, in cycles of `x + y`.
+///
+/// 0.6 over a divisor of 12.0 is 8.0 corrected units of `x + y` per unit of
+/// `plasma.time`, which is 4.0 cells across and 3.3 rows down. That is the
+/// fastest motion left in the field, and it is *diagonal* motion, which is the
+/// point: a drift along `x + y` has a vertical component and a horizontal one
+/// of nearly the same size, so it contributes to both directions instead of
+/// only to the one the user complained about. On screen the two are not the
+/// same size, because `y` is already in corrected units: one cell across is 1.0
+/// of `x` and one row down is 1.2 of `y`, so a 45-degree drift in field space
+/// is 40 degrees on the screen and the diagonal term is the only term in the
+/// field that leans *away* from vertical.
+///
+/// **1.0 was tried and measured, and it is the wrong value.** The diagonal is
+/// the only term that moves in both directions at once, so raising its depth is
+/// the obvious way to buy liveliness back -- and it does, raising the field's
+/// net drift by about a fifth. It also raises the vertical-to-horizontal drift
+/// ratio, from 0.98 to 1.8 at 200x50, because the vertical component of a
+/// diagonal drift is what a vertical-to-horizontal measure is most sensitive
+/// to. At 0.6 the ratio is under 1 -- the field's drift is, on net, sideways --
+/// and the picture is still the liveliest it has been since the sweep depth
+/// came down. The liveliness is worth having and 1.8 is not.
+const DIAGONAL_DEPTH: f64 = 0.6;
 
 /// # The time frequencies, and why the field never repeats
 ///
@@ -437,39 +682,229 @@ const FOURTH_RADIUS_DIVISOR: f64 = 8.0;
 /// 25.1 units of `plasma.time`**, which at the default `time_scale` of 0.5 is
 /// 50 seconds of wall clock. After that the screen was not merely similar to
 /// what it had been, it was *identical*, cell for cell and colour for colour,
-/// forever. `the_field_does_not_repeat_over_the_period_it_used_to_have` is that
-/// sentence as a test.
+/// forever.
 ///
 /// The fix is the frequencies rather than anything about how they are combined.
 /// A sum repeats only if a single `T` advances *every* term by a whole number
 /// of periods, so what matters is the **ratios** between the frequencies and not
 /// their size: rational ratios have a common period, and mutually irrational
-/// ratios do not. The three below are `{1, sqrt(2), sqrt(3)}` over a common
-/// two, and every pair has an irrational ratio -- `sqrt(2)`, `sqrt(3)` and
-/// `sqrt(3/2)`. So there is no `T > 0` for which all three come back to where
-/// they started, and the field has no period at all.
+/// ratios do not. The five below are `{1, sqrt(2), sqrt(3), sqrt(5),
+/// sqrt(7)}` over a common two, and every pair has an irrational ratio, because
+/// the quotient of the square roots of two distinct squarefree integers is
+/// always irrational. So there is no `T > 0` for which all five come back to
+/// where they started, and the field has no period at all.
 ///
 /// Two consequences worth being straight about, because neither is free:
 ///
 /// - **The composition does not rescue a rational set.** Each term is
 ///   `sin(spatial - c * sin(f*t))` rather than a bare sine, so a term's
 ///   harmonics sit at *integer multiples* of its own `f`. That makes the field's
-///   frequency content the additive group generated by the three `f`, which
-///   still contains each `f` itself, so a common period would still have to
-///   satisfy `f*T = 2*pi*n` for all three. Wrapping the phase in a sine delays
-///   the repeat; it does not remove it.
+///   frequency content the additive group generated by the `f`, which still
+///   contains each `f` itself, so a common period would still have to satisfy
+///   `f*T = 2*pi*n` for all of them. Wrapping the phase in a sine delays the
+///   repeat; it does not remove it.
 ///
 /// - **The speeds barely moved, and that was the design constraint.** Dividing
-///   the whole set by two keeps the ordering the field already had -- the fourth
-///   term's ripple drifts slowest, the first term's wave second, the second
-///   term's sweep fastest -- and keeps the total churn within 10% of what it was.
-///   Measured as the root-sum-square of `c*f` over the three terms, which is what
-///   drives mean |change| per second, the set below scores 0.93x the old
-///   `0.5, 1.0, 0.25`. The obvious alternative, `1, sqrt(2), sqrt(3)` unscaled,
-///   scores 1.67x and puts the slowest ripple where the fastest sweep was.
+///   the whole set by two keeps the ordering the field already had -- the first
+///   ring term's drift slowest, the wave term's second, the sweep term third --
+///   and keeps the total churn within 10% of what it was. Measured as the
+///   root-sum-square of `c*f` over the terms, which is what drives mean
+///   |change| per second, the five below score 1.06x the three they were
+///   extended from. The obvious alternative, `{1, sqrt(2), sqrt(3)}` unscaled,
+///   scores 1.67x.
+///
+/// The two added are the *fastest* pair, which is deliberate. A new term on a
+/// slow frequency is nearly invisible, and a field whose only visible motion is
+/// the slow one is a field that drifts rather than a screensaver. The diagonal
+/// and the second ring term are the two whose motion reads most clearly --
+/// one because it crosses the whole screen on a diagonal, one because a radial
+/// expansion is the change the eye is best at reading -- so those are the two
+/// that carry new frequencies.
 const TIME_FREQ_RIPPLE: f64 = 0.5;
 const TIME_FREQ_WAVE: f64 = SQRT_2 / 2.0;
 const TIME_FREQ_SWEEP: f64 = SQRT_3 / 2.0;
+const TIME_FREQ_DIAGONAL: f64 = SQRT_5 / 2.0;
+const TIME_FREQ_BREATH: f64 = SQRT_7 / 2.0;
+
+/// The five terms' spatial divisors and starting phases, drawn from the seed.
+///
+/// # What is randomised and what is not
+///
+/// The five divisors and the five starting phases. **Not** the time
+/// frequencies, the sweep depth, or the term structure itself, and each of
+/// those exclusions is deliberate:
+///
+/// - The time frequencies are what make the field aperiodic, and the period
+///   search in `the_field_does_not_come_back_to_where_it_was` reads them as
+///   named constants. Jittering them per seed would make that test assert
+///   something about a set it can no longer name, and -- worse -- a *random*
+///   set of five frequencies has a small but real chance of drawing two within
+///   a rational ratio, which would quietly reintroduce a period. The set is
+///   the property; it is not per-launch decoration.
+///
+/// - The depths are the *character* of the field, and the character is what
+///   this round was about. [`SWEEP_DEPTH`] is 0.25 because at 2.0 the field
+///   went up and down; drawing it from a band would mean every launch had a
+///   different amount of the exact fault the user reported.
+///
+/// # Why phases as well as divisors
+///
+/// Divisors alone give two launches the same *texture* and a different
+/// alignment, and a plasma that is recognisably the same field with the bands
+/// in a different place is not a different launch. A per-term phase offset is
+/// a constant added inside the sine, so it moves that term's bands without
+/// touching its spacing, its speed, or the field's periodicity -- which is
+/// exactly the property wanted from a randomisation that is not allowed to
+/// reintroduce a loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FieldTuning {
+    wave_divisor: f64,
+    sweep_divisor: f64,
+    ring_divisor: f64,
+    breath_divisor: f64,
+    diagonal_divisor: f64,
+    /// One starting phase per term, in `0..2*pi`, in the order the terms are
+    /// summed in [`FieldTuning::value`].
+    phase: [f64; 5],
+}
+
+impl FieldTuning {
+    /// Draws a field's tuning from its seed.
+    ///
+    /// The five divisors are drawn first, in the order they are summed, and the
+    /// phases after, so a seed maps to one tuning and one tuning only. Two
+    /// effects built from the same options therefore draw the same picture,
+    /// which is what `tests/effect_contracts.rs` compares them on.
+    fn from_seed(seed: u64) -> Self {
+        use rand::RngExt;
+
+        let mut rng = seeded_rng(seed, "plasma");
+        Self {
+            wave_divisor: WAVE_DIVISOR.draw(&mut rng),
+            sweep_divisor: SWEEP_DIVISOR.draw(&mut rng),
+            ring_divisor: RING_DIVISOR.draw(&mut rng),
+            breath_divisor: BREATH_DIVISOR.draw(&mut rng),
+            diagonal_divisor: DIAGONAL_DIVISOR.draw(&mut rng),
+            phase: std::array::from_fn(|_| rng.random_range(0.0..2.0 * PI)),
+        }
+    }
+
+    /// Vertical bands, their phase travelling sideways.
+    ///
+    /// A function of `x` alone, so it is a set of vertical stripes and nothing
+    /// else. Its phase is a cosine rather than a sine so that it is at its
+    /// fastest at `now = 0`, which is what puts the field's horizontal motion
+    /// at full speed on the first frame rather than starting from a dead stop.
+    fn wave(&self, x: f64, now: f64) -> f64 {
+        ((x / self.wave_divisor - (now * TIME_FREQ_WAVE).cos()) + self.phase[0])
+            .sin()
+    }
+
+    /// Horizontal bands, their phase travelling downwards.
+    ///
+    /// The term the user's complaint was about. See [`SWEEP_DEPTH`] -- this was
+    /// moving the field's half-amplitude vertically by 32 corrected units and
+    /// now moves it by four.
+    fn sweep(&self, y: f64, now: f64) -> f64 {
+        ((y / self.sweep_divisor - (now * TIME_FREQ_SWEEP).sin() * SWEEP_DEPTH)
+            + self.phase[1])
+            .sin()
+    }
+
+    /// Rings, breathing in and out about the screen centre.
+    fn ring(&self, radius: f64, now: f64) -> f64 {
+        ((radius / self.ring_divisor - (now * TIME_FREQ_RIPPLE).sin() * RING_DEPTH)
+            + self.phase[2])
+            .sin()
+    }
+
+    /// A second set of rings, at a different rate and a different phase.
+    ///
+    /// Deliberately out of harmonic relationship with [`ring`]. See
+    /// [`BREATH_DIVISOR`]. A sine of the same cosine would be one wave twice
+    /// and a phase offset apart; a sine of a *different* frequency is a second
+    /// wave, and the pair interfere instead of adding.
+    fn breath(&self, radius: f64, now: f64) -> f64 {
+        ((radius / self.breath_divisor
+            + (now * TIME_FREQ_BREATH).cos() * BREATH_DEPTH)
+            + self.phase[3])
+            .sin()
+    }
+
+    /// Bands on the 45-degree diagonal, phase travelling along it.
+    ///
+    /// The term with no predecessor. `x + y` rather than `x - y` so the bands
+    /// run from the top-left to the bottom-right, which is the diagonal the eye
+    /// reads as "down and across" and therefore the one that does not read as
+    /// vertical motion in either half of the screen.
+    fn diagonal(&self, x: f64, y: f64, now: f64) -> f64 {
+        (((x + y) / self.diagonal_divisor
+            - (now * TIME_FREQ_DIAGONAL).cos() * DIAGONAL_DEPTH)
+            + self.phase[4])
+            .sin()
+    }
+
+    /// The field at one point, normalised to `0.0..=1.0`.
+    ///
+    /// Five terms, each `128 + 128 * sin(..)` and so each running 0 to 256 with
+    /// a mean of 128. The sum of five has a mean of 640, and dividing by the
+    /// number of terms and then by 256 puts the level where the sines cancel
+    /// back at 0.5 -- which is why the divisor is the term count and not a
+    /// constant: a fifth term added without dividing by five would have put that
+    /// level at 0.64 and slid the calibration [`VALUE_BOUNDARIES`] is fitted to.
+    ///
+    /// The divisor moves with the count so the property cannot silently stop
+    /// holding, and `the_field_is_the_five_terms_normalised` holds it against
+    /// the terms themselves rather than against the field's own statistics --
+    /// which is the only way it can be held, and that test carries the
+    /// measurement of why.
+    ///
+    /// See the [AWK script formula](https://rosettacode.org/wiki/Plasma_effect#AWK),
+    /// which this is, and the note on why the result is a float rather than a
+    /// byte.
+    fn value(&self, x: f64, y: f64, now: f64, w: f64, h: f64, scale: f64) -> f64 {
+        // Both radial terms are anchored at the screen centre, and `x`, `y` and
+        // `radius` all arrive in the same corrected space. The fourth term used
+        // to be anchored at the origin, which is what made the *bottom* of the
+        // screen the busy part: its vertical phase gradient is `y / r`, zero
+        // along the top edge and maximal along the bottom, so it added to the
+        // third term's gradient at the bottom and subtracted at the top.
+        // Anchoring both at the centre makes each gradient proportional to
+        // `(y - h/2) / r`, so the pair reinforces in the middle of the screen
+        // and vanishes at the top and bottom edges equally. There is no bottom
+        // edge to be special any more; that is a property of the geometry, not
+        // a clamp.
+        let radius = ((x - w / 2.0).powi(2) + (y - h / 2.0).powi(2)).sqrt();
+
+        // `scale` multiplies each term's *spatial* argument and nothing else.
+        // Folded in here rather than passed to five methods, because it is one
+        // multiplication of the two coordinates and the radius -- three of them
+        // rather than five, and the radius has to be scaled too or the radial
+        // terms would be the only ones `spatial_scale` did not reach.
+        let value = (128.0
+            + (128.0 * self.wave(x * scale, now))
+            + 128.0
+            + (128.0 * self.sweep(y * scale, now))
+            + 128.0
+            + (128.0 * self.ring(radius * scale, now))
+            + 128.0
+            + (128.0 * self.breath(radius * scale, now))
+            + 128.0
+            + (128.0 * self.diagonal(x * scale, y * scale, now)))
+            / 5.0;
+
+        // A rail is a moving hard iso-line: on one side of it a cell is a
+        // clipped flat value and on the other it is riding the field, so
+        // everything on the clipped side animates only as the line sweeps past
+        // it. Clamping to a float makes the rail unreachable, and it hands the
+        // glyph ramp a real 0..1 value instead of a quantised byte. The
+        // function used to end in `value as u8`, and while that cast happens to
+        // saturate rather than wrap, nothing about the formula stops a future
+        // edit to a coefficient from pushing the sum outside `0..=256` and
+        // pinning a whole region of the screen against one end of the range.
+        (value / 256.0).clamp(0.0, 1.0)
+    }
+}
 
 pub struct Plasma {
     pub screen_size: (u16, u16),
@@ -478,6 +913,13 @@ pub struct Plasma {
     time: f64,
     palette: Vec<style::Color>,
     ramp: GlyphRamp,
+    /// The field's divisors and phases, drawn once from `options.seed`.
+    ///
+    /// Built in [`Plasma::new`] and never rebuilt: the seed cannot change
+    /// without a new effect, and a field that re-drew its own structure on a
+    /// resize would be a different picture on the same terminal. A resize
+    /// rebuilds the *canvas* and zeroes the clock and leaves this alone.
+    tuning: FieldTuning,
 }
 
 impl TerminalEffect for Plasma {
@@ -492,6 +934,7 @@ impl TerminalEffect for Plasma {
             self.options.spatial_scale,
             &self.palette,
             &self.ramp,
+            &self.tuning,
             self.canvas.surface_mut(),
         );
         self.canvas.commit()
@@ -532,6 +975,7 @@ impl Plasma {
         // Generate color palette
         let palette = Self::generate_palette();
         let ramp = glyph_ramp(&options.glyphs);
+        let tuning = FieldTuning::from_seed(options.seed);
 
         Self {
             screen_size,
@@ -540,6 +984,7 @@ impl Plasma {
             time,
             palette,
             ramp,
+            tuning,
         }
     }
 
@@ -597,68 +1042,6 @@ impl Plasma {
         (to_byte(r), to_byte(g), to_byte(b))
     }
 
-    /// The plasma value at one point, normalised to `0.0..=1.0`.
-    ///
-    /// The [AWK script formula](https://rosettacode.org/wiki/Plasma_effect#AWK),
-    /// from four sines that are each `128 + 128 * sin(..)` and so each run from
-    /// 0 to 256. Their mean therefore runs from 0 to 256 as well, which is why
-    /// this normalises by 256 rather than by a measured extreme. That is not
-    /// decoration: the function used to end in `value as u8`, and while that
-    /// cast happens to saturate rather than wrap, nothing about the formula
-    /// stops a future edit to a coefficient from pushing the sum outside
-    /// `0..=256` and silently pinning a whole region of the screen against one
-    /// end of the range. Normalising to a float here makes that rail
-    /// unreachable, and it hands the glyph ramp a real 0..1 value to index
-    /// instead of a quantised byte.
-    ///
-    /// `x`, `y`, `w` and `h` are all in the same corrected space, and the caller
-    /// is the only thing that knows about cells. That is the fix for the
-    /// bottom-of-the-screen flicker: `x` used to arrive in cell units while `y`
-    /// arrived in field units at two per cell row, so both radial terms were
-    /// ellipses 2 : 1 tall in units -- 1.67 : 1 on a 1 : 1.2 font, which
-    /// measured as a vertical rate 1.46x the horizontal one at 80x24 and 1.87x
-    /// at 400x200.
-    ///
-    /// The three time terms run at [`TIME_FREQ_WAVE`], [`TIME_FREQ_SWEEP`] and
-    /// [`TIME_FREQ_RIPPLE`], whose ratios are mutually irrational, so the field
-    /// has no period. The colour channel is *not* remapped: only the glyph
-    /// channel goes through [`glyph_value`], and the reason the two are allowed
-    /// to disagree is written there.
-    fn plasma_value(x: f64, y: f64, now: f64, w: f64, h: f64, scale: f64) -> f64 {
-        // Both radial terms are anchored at the screen centre.
-        //
-        // The fourth one used to be anchored at the origin, which is what
-        // actually made the *bottom* of the screen the busy part. Its vertical
-        // phase gradient is `y / sqrt(x*x + y*y)`, which is zero along the top
-        // edge and maximal along the bottom, so it added to the third term's
-        // gradient at the bottom and subtracted from it at the top: measured,
-        // the bottom four rows carried 1.22x to 1.64x the vertical spatial
-        // frequency of the top four depending on the frame, and at 400x200 the
-        // single busiest row on the screen was row 199. Anchoring both at the
-        // centre makes the gradient of each proportional to `(y - h/2) / r`, so
-        // the pair reinforces in the middle of the screen and vanishes at the top
-        // and bottom edges equally. There is no bottom edge to be special
-        // any more; that is a property of the geometry, not a clamp.
-        let radius = ((x - w / 2.0).powi(2) + (y - h / 2.0).powi(2)).sqrt();
-
-        let value = (128.0
-            + (128.0 * ((x / 8.0) * scale - (now * TIME_FREQ_WAVE).cos()).sin())
-            + 128.0
-            + (128.0
-                * ((y / 16.0) * scale - (now * TIME_FREQ_SWEEP).sin() * 2.0)
-                    .sin())
-            + 128.0
-            + (128.0 * ((radius / 4.0 * scale).sin()))
-            + 128.0
-            + (128.0
-                * ((radius / FOURTH_RADIUS_DIVISOR * scale
-                    - (now * TIME_FREQ_RIPPLE).sin())
-                .sin())))
-            / 4.0;
-
-        (value / 256.0).clamp(0.0, 1.0)
-    }
-
     /// Repaints the field, one cell per plasma sample.
     ///
     /// The cell's colour *and* its glyph are read from the same value, which is
@@ -676,6 +1059,7 @@ impl Plasma {
         spatial_scale: f64,
         palette: &[style::Color],
         ramp: &GlyphRamp,
+        tuning: &FieldTuning,
         buffer: &mut Buffer,
     ) {
         let width = size.0 as usize;
@@ -689,7 +1073,7 @@ impl Plasma {
 
             for x in 0..width {
                 let value =
-                    Self::plasma_value(x as f64, y_units, now, w, h, spatial_scale);
+                    tuning.value(x as f64, y_units, now, w, h, spatial_scale);
 
                 // Get color indices with time component. Wrapped rather than
                 // cast-and-clamped: the offset grows without bound, and an
@@ -943,6 +1327,17 @@ mod tests {
     /// naming a period would reintroduce the assumption this effect no longer
     /// has.
     ///
+    /// **What the field reaches inside the window is now recorded too, because
+    /// the top of it is what the completeness clause depends on.** Measured at
+    /// 200x50 the five-term field spans **0.003 to 0.921** over the window,
+    /// against 0.0006 to 0.9974 for the four-term one over a full cycle. The top
+    /// is lower and that is the cost of a field that moves less: the extreme
+    /// values are a coincidence of five terms' phases rather than four, and a
+    /// quieter field hits that coincidence less often. It does not threaten the
+    /// clause -- the last boundary is 0.737, comfortably under 0.921 -- but it
+    /// is the number to re-measure first if the top step ever goes missing, and
+    /// it is not the number the assertion reports when it does.
+    ///
     /// The bound on the two ends changed with the calibration, and the reason is
     /// not that it got looser. It used to be 10% and it still is, but the number
     /// it is compared against moved: the ends used to hold a few tenths of a
@@ -1050,17 +1445,26 @@ mod tests {
     /// a histogram assertion whose message is only "assertion failed" is a test
     /// that gets deleted rather than fixed.
     ///
-    /// The two bounds are 20% and 1%, against a measured busiest of 6.4% and a
-    /// measured sparsest of 6.1%. Before the fix the same run at this size
-    /// measured 23.5% for the busiest glyph and **0.20%** for the densest, so
-    /// both bounds were violated. Sixteen steps on a field is a sixteenth of the
+    /// The two bounds are 20% and 1%, against a measured busiest of 7.9% and a
+    /// measured sparsest of 2.6%. Sixteen steps on a field is a sixteenth of the
     /// screen each if the calibration is right and a long tail of nothing if it
     /// is not, and this is the test that says which.
     ///
+    /// **A word on the floor, because 1% is doing less work than it looks.** The
+    /// bound is 1% and the measurement is 2.6%, so the test as written would
+    /// have passed a table that starved `@` to 1.5% -- which is exactly what the
+    /// table this one replaced did when carried onto the five-term field. It is
+    /// not loosened here, because the histogram at the default seed is not the
+    /// question any more: there is a different field on every launch, and the
+    /// seed the table is fitted to is one of them.
+    /// `the_calibration_holds_across_seeds_not_just_the_default_one` is the
+    /// test that holds the floor over ten seeds, and it is the one that goes
+    /// red.
+    ///
     /// 200x50 and not 80x24, and the difference is not cosmetic. At 80x24 the
-    /// sparsest glyph measures 1.6% and cannot be made to measure more, because
+    /// sparsest glyph measures 0.6% and cannot be made to measure more, because
     /// the field does not reach its own extremes often enough at that size -- so
-    /// asserting a 1% floor there would be asserting something about the field
+    /// asserting a floor there would be asserting something about the field
     /// that is not true. `a_short_terminal_thins_the_ends_of_the_ramp` covers
     /// the small case on the terms it can actually meet.
     #[test]
@@ -1088,22 +1492,32 @@ mod tests {
     /// What a small terminal gets, stated rather than assumed.
     ///
     /// The calibration is fitted at 200x50 and this is the 80x24 measurement of
-    /// the same run, and it is a different answer. The shares run 1.54% at the
-    /// space up to 9.36% at `M`, and they run *monotonically up* to `M` and then
-    /// back down at `@` -- which is the shape of a field that does not reach its
-    /// own extremes often enough at this size, and so leaves the bottom of the
-    /// ramp thin. The field over 460,800 samples spans 0.032 to 0.941 here
-    /// against 0.0002 to 0.9998 at 400x200.
+    /// the same run, and it is still a different answer -- but a good deal less
+    /// different than it was. The shares run 3.23% at the space up to 10.10% at
+    /// `=`, and they run *monotonically up* to `=` and then back down to 0.62% at
+    /// `@`, which is the shape of a field that does not reach its own extremes
+    /// often enough at this size, and so leaves the bottom of the ramp thin. The
+    /// field over 460,800 samples spans 0.017 to 0.994 here against 0.003 to
+    /// 0.996 at 200x50.
     ///
-    /// The 3% floor from `every_glyph_of_the_default_ramp_carries_its_share_of_
+    /// **The gap narrowed a lot, and the five terms are why.** The space was
+    /// 1.54% here before this round and 3.23% now, and the field's quantiles at
+    /// 80x24 sit within 0.02 of the 200x50 ones at both ends where they used to
+    /// be 0.20 apart at the bottom. A sum of five sines has a flatter
+    /// distribution than a sum of four, so it samples its own tails on a small
+    /// screen more often. The end of the ramp is still the thinnest part and
+    /// `@` is still six hundredths of the screen -- a small screen still does
+    /// not get the full ramp -- but it is a much smaller shortfall.
+    ///
+    /// The 1% floor from `every_glyph_of_the_default_ramp_carries_its_share_of_
     /// the_screen` is deliberately *not* asserted here, and saying so in a test
     /// is better than silently applying a bound the size cannot meet.
     ///
     /// What is asserted is that the degradation is graceful: the screen is still
-    /// spread across nearly the whole ramp, and no single glyph has taken the
-    /// screen over. Both halves were false before the calibration -- the busiest
-    /// glyph measured 29.1% of an 80x24 screen and 23.5% of a 200x50 one -- and
-    /// neither is true now, at 9.4% and 6.4%.
+    /// spread across the whole ramp, and no single glyph has taken the screen
+    /// over. Both halves were false before the calibration -- the busiest glyph
+    /// measured 29.1% of an 80x24 screen and 23.5% of a 200x50 one -- and
+    /// neither is true now, at 10.1% and 7.9%.
     #[test]
     fn a_short_terminal_thins_the_ends_of_the_ramp() {
         let size = (80u16, 24u16);
@@ -1179,14 +1593,26 @@ mod tests {
     /// 100 units -- four times the period this field used to have, so the old
     /// code would have measured the same frame four times over.
     fn glyph_shares(size: (u16, u16), frames: u64) -> Vec<f64> {
+        glyph_shares_for(size, frames, PlasmaOptions::default().seed)
+    }
+
+    /// [`glyph_shares`] against an explicitly named seed.
+    ///
+    /// There is more than one field now, and a histogram of "the field" that
+    /// silently means "seed 42's field" is a histogram of a launch nobody
+    /// chose. The default-seed version is a thin wrapper over this rather than
+    /// the other way round, so the tests that want the default and the test that
+    /// wants a spread go through one implementation.
+    fn glyph_shares_for(size: (u16, u16), frames: u64, seed: u64) -> Vec<f64> {
         let ramp = glyph_ramp(&PlasmaOptions::default().glyphs);
+        let tuning = FieldTuning::from_seed(seed);
         let mut counts = vec![0usize; ramp.len()];
         let mut total = 0usize;
         for frame in 0..frames {
             let now = frame as f64 * 0.5;
             for y in 0..size.1 as usize {
                 for x in 0..size.0 as usize {
-                    let v = value_at(size, x, y, now);
+                    let v = value_at_with(&tuning, size, x, y, now);
                     let g = glyph_value(v);
                     let i = ramp.index_for(g as f32);
                     counts[i] += 1;
@@ -1410,9 +1836,14 @@ mod tests {
 
         // Before the fix this measured 1.22x to 1.64x depending on the frame,
         // and at 400x200 the single busiest row on the screen was row 199, the
-        // last one. The tolerance is 1.15: the corrected field measures 0.92x
-        // to 1.05x here, so there is room for the frame's phase without room
-        // for the old bias to come back.
+        // last one. The tolerance is 1.15 and is unchanged: the five-term field
+        // measures 0.93x to 1.01x here, so there is room for the frame's phase
+        // without room for the old bias to come back. The fifth term did not
+        // move this, and it is worth knowing why rather than assuming it: the
+        // diagonal's contribution to the vertical gradient is
+        // `cos((x+y)/D)/D`, and the screen-average of a cosine over a rectangle
+        // is near zero, so it adds to the *variance* of the vertical rate
+        // without adding to its mean.
         for now in [0.0, 0.37, 1.1, 2.6, 4.3, 7.1] {
             let (top, bottom) = row_change_ratio(size, now);
             assert!(
@@ -1435,13 +1866,19 @@ mod tests {
     ///
     /// A cell is taller than it is wide, so a *round* field on a 1 : 1.2 font
     /// has a vertical rate 1 / 1.2 = 0.83x its horizontal one. The corrected
-    /// field measures 0.48x to 0.58x here, comfortably inside the band below,
-    /// and the upper bound of 1.2 is the side that catches the old bug.
+    /// field measures 0.88 here at 400x200 and 0.57 at 200x50, and the two
+    /// differ for a reason worth having: the measurement steps a *row*, which is
+    /// 1.2 corrected units, and a screen eight times taller has four times as
+    /// many rows for the same number of vertical periods, so it averages the
+    /// cosine over more of them and lands closer to the isotropic value. The
+    /// band below is unchanged -- 1.2 is the side that catches the old bug, and
+    /// 0.88 is now only 27% under it, which is the thinnest it has been.
     #[test]
     fn the_field_is_not_stretched_vertically() {
         let size = (400u16, 200u16);
         let scale = PlasmaOptions::default().spatial_scale;
-        let at = |x: f64, y: f64| sample(size, x, y, 0.0, scale);
+        let tuning = default_tuning();
+        let at = |x: f64, y: f64| sample(&tuning, size, x, y, 0.0, scale);
 
         let mut horizontal = 0.0f64;
         let mut horizontal_samples = 0.0f64;
@@ -1808,6 +2245,604 @@ mod tests {
         );
     }
 
+    /// The value at a point is the five terms, normalised -- and nothing else.
+    ///
+    /// `FieldTuning::value` is `(128 + 128*s0 + 128 + 128*s1 + ... ) / 5.0 / 256.0`
+    /// over five terms of `128 + 128*sin(..)`, which is `0.5 + (s0 + .. + s4) / 10`
+    /// for five sines each running -1 to 1. **The `/5` is the number of terms and
+    /// nothing else**, and the mistake a fifth term invites is leaving it at four:
+    /// which puts the level where the sines cancel at 0.625 rather than 0.5 and
+    /// slides the calibration [`VALUE_BOUNDARIES`] is fitted to up by an eighth of
+    /// the range.
+    ///
+    /// **This is asserted against the terms rather than against the field's own
+    /// statistics, and the reason is worth recording.** The obvious test is "the
+    /// field's mean is 0.5", and the field's mean is not 0.5: measured over 200
+    /// frames at 200x50 it reads 0.451, 0.516 and 0.433 on three seeds, and the
+    /// *median* reads 0.449. So a bound on either would have to be 0.05 wide, it
+    /// would be 0.06 wide to be safe across seeds, and a 0.06 band around 0.5 does
+    /// not exclude the 0.625 it is meant to exclude. The offset is real and it is
+    /// not the divisor's fault: the two radial terms average `sin(r/D + phi)` over
+    /// a *rectangle* rather than over a disc, and the mean of an exponential over
+    /// a rectangle is not zero however many periods cross it, so the phase offsets
+    /// the seed draws decide which way the residual points. A time average does not
+    /// rescue it either -- the modulation inside each sine is `-depth*sin(f*t)`,
+    /// and the mean of `sin(A - c*sin(theta))` over `theta` is `J0(c)*sin(A)`, not
+    /// `sin(A)`, so the phase sweep shrinks each term towards zero rather than
+    /// averaging it out.
+    ///
+    /// That is also why [`VALUE_BOUNDARIES`] is fitted to measured *quantiles*
+    /// rather than to a mean, and it is worth knowing before anyone "simplifies"
+    /// the fit to normalise by the mean: the empirical centre of this field is
+    /// 0.45, not 0.5, and a table built on the mean would be 0.05 out on every
+    /// boundary.
+    ///
+    /// The other half of the same failure is a term added to the sum and not to
+    /// the count, or dropped from the sum and not from it. Both are caught here
+    /// and neither is caught by any statistical bound: with six terms summed and
+    /// a divisor of five, the field's mean moves by a twentieth and every
+    /// threshold in this file still passes.
+    #[test]
+    fn the_field_is_the_five_terms_normalised() {
+        let size = (200u16, 50u16);
+        let w = f64::from(size.0);
+        let h = f64::from(size.1) * CELL_ASPECT;
+        let scale = PlasmaOptions::default().spatial_scale;
+
+        for seed in [DEFAULT_SEED, 0, 1, 987_654_321] {
+            let tuning = FieldTuning::from_seed(seed);
+            for now in [0.0, 0.5, 3.7] {
+                for y in [0usize, 13, 39] {
+                    for x in [0usize, 41, 119] {
+                        let xu = x as f64;
+                        let yu = y as f64 * CELL_ASPECT;
+                        let radius = ((xu - w / 2.0).powi(2)
+                            + (yu - h / 2.0).powi(2))
+                        .sqrt();
+                        let sines = tuning.wave(xu * scale, now)
+                            + tuning.sweep(yu * scale, now)
+                            + tuning.ring(radius * scale, now)
+                            + tuning.breath(radius * scale, now)
+                            + tuning.diagonal(xu * scale, yu * scale, now);
+                        let expected = (0.5 + sines / 10.0).clamp(0.0, 1.0);
+                        let drawn = tuning.value(xu, yu, now, w, h, scale);
+                        assert!(
+                            (drawn - expected).abs() < 1e-12,
+                            "seed {seed} at ({x}, {y}) and t={now}: the value is \
+                             {drawn:.6} where the five terms normalised give \
+                             {expected:.6}, so the sum's divisor is not its term \
+                             count"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // --- character: does it go up and down? -------------------------------
+    /// The field must not march up and down the screen. The user's complaint,
+    /// as a number.
+    ///
+    /// "Right now it just goes up and down; it's not something new" -- said
+    /// twice, and the first fix did not touch it, which is the finding. The
+    /// first fix made the field's time frequencies mutually irrational, so the
+    /// field stopped *repeating*. Repetition and character are different
+    /// problems: a field can be aperiodic and still go up and down forever, and
+    /// this one did, because one term was carrying half the amplitude
+    /// vertically at 32 corrected units a second.
+    ///
+    /// **What is measured.** Not "how fast does the value change" -- that
+    /// answers a question about churn, and a field can churn fast and not
+    /// travel anywhere. What is measured is the field's net *drift*: the
+    /// velocity, in rows and columns per second, at which the whole picture
+    /// slides. [`advection_velocity`] recovers it by regressing the time
+    /// derivative onto the two spatial derivatives over every cell, which is the
+    /// statement "the picture moved by this much, this way".
+    ///
+    /// **The ratio and not the speeds, because the speeds are the wrong
+    /// question.** A field that is still has no drift and passes every upper
+    /// bound there is; so has one that has stopped entirely. The claim is about
+    /// direction -- a field that goes up and down has a large vertical rate and
+    /// a small horizontal one -- and 1.0 is the value a field whose drift is
+    /// purely sideways would read.
+    ///
+    /// Measured, over [`SAMPLE_SEEDS`] and [`DRIFT_SAMPLES`]:
+    ///
+    /// ```text
+    ///             old    new
+    ///   200x50    5.81   0.98
+    ///   400x200   2.24   0.50
+    ///   80x24     3.46   1.13
+    /// ```
+    ///
+    /// The bound is 1.6, which clears the largest new figure by 42% and the
+    /// smallest old one by 30%. That the old field's *smallest* is 2.24 and not
+    /// 5.8 is worth knowing: 400x200 is eight times the size of 200x50, the
+    /// sweep term's phase travels the same number of units either way, and the
+    /// horizontal terms' contribution to the fit grows with the screen. The
+    /// complaint was reported at ordinary terminal sizes and the fix is measured
+    /// at all three.
+    ///
+    /// `dt` is half a unit of `plasma.time`, which is one second of wall clock
+    /// at the default `time_scale` of 0.5 -- the gap between the two frames the
+    /// user is actually comparing when they say the field is going up and down.
+    ///
+    /// **The margin is thinner than the table suggests, and that is deliberate.**
+    /// The per-configuration figure ranges from 0.0 to 2.3 at 200x50 depending
+    /// on which term happens to dominate the fit at that instant, so a bound
+    /// tight enough to catch the old field exactly would trip on unlucky seeds
+    /// of the new one. The mean over seeds is the quantity that separates them by
+    /// a factor of six, and it is the one asserted. See
+    /// [`vertical_to_horizontal_drift`].
+    ///
+    /// **What this cannot see, named because it is a real blind spot.** A field
+    /// with the diagonal term *removed* measures better on this, 0.49 at
+    /// 200x50, because the diagonal is the only term that moves in both
+    /// directions at once and dropping it leaves the field's remaining motion
+    /// almost entirely sideways. So this test says the field does not go up and
+    /// down; it cannot say the field has something else to go on instead. That
+    /// is `the_field_has_a_diagonal`, and the two are deliberately separate.
+    #[test]
+    fn the_field_does_not_go_up_and_down() {
+        /// Half a unit of `plasma.time`: one second of wall clock at the default
+        /// `time_scale`. See the note on the test.
+        const ONE_SECOND: f64 = 0.5;
+        const MAX_VERTICAL_DRIFT: f64 = 1.6;
+
+        for size in [(200u16, 50u16), (400, 200), (80, 24)] {
+            let ratio = vertical_to_horizontal_drift(size, ONE_SECOND);
+            assert!(
+                ratio < MAX_VERTICAL_DRIFT,
+                "at {size:?} the field drifts {ratio:.2}x as far downwards every \
+                 second as it does sideways, so it is going up and down. The old \
+                 field measured 5.81 here, and putting the sweep term's depth \
+                 back to 2.0 while leaving everything else alone measures 1.88."
+            );
+        }
+
+        // ...and the lower guard, because a field with no drift at all reads 0
+        // and would sail through the bound above. A quarter of a cell a second
+        // is well under a tenth of what the field measures.
+        let speed = drift_speed((200, 50), ONE_SECOND);
+        assert!(
+            speed > 0.25,
+            "the field's pattern is drifting at {speed:.3} cells a second, so it \
+             has stopped travelling altogether -- which satisfies every bound \
+             above while drawing a still picture"
+        );
+    }
+
+    /// The field's net drift in cells a second, which is the quantity
+    /// [`vertical_to_horizontal_drift`] normalises away.
+    ///
+    /// **It used to be 3.14 at 200x50 and is now 0.75**, so the fix cost
+    /// three quarters of the picture's net motion. That is the price and it is
+    /// worth being blunt about, because it is not a small one: the old field's
+    /// motion was 3.1 cells a second and the complaint was that all of it was
+    /// in one direction. The field still churns -- the mean |change| at a cell
+    /// over a second of wall clock is about 60% of what it was -- so the picture
+    /// still boils; it just no longer marches.
+    ///
+    /// So the number is asserted rather than left implicit, because a field that
+    /// has been slowed too far is a screensaver that has stopped, and the only
+    /// way to notice is to say how fast it is *supposed* to be. The bound is
+    /// 0.25, a third of what it measures and a quarter of what the old field
+    /// did, so it catches a field that has been flattened without objecting to
+    /// one that has merely been calmed.
+    fn drift_speed(size: (u16, u16), dt: f64) -> f64 {
+        let mut total = 0.0f64;
+        let mut count = 0.0f64;
+        for seed in SAMPLE_SEEDS {
+            let tuning = FieldTuning::from_seed(seed);
+            for now in DRIFT_SAMPLES {
+                let (ux, uy) = advection_velocity(size, now, dt, &tuning);
+                total += (ux * ux + uy * uy).sqrt();
+                count += 1.0;
+            }
+        }
+        total / count
+    }
+
+    /// There has to be something in the field that is not stripes and not rings.
+    ///
+    /// Every term the field had was a function of `x` alone, `y` alone, or `r`
+    /// alone, so the picture was assembled from axis-aligned bands and
+    /// concentric ones and read as bands sliding past rather than as something
+    /// with a grain. The canonical demoscene plasma has an `(x + y) / 2` term for
+    /// exactly that reason and this one did not have one.
+    ///
+    /// **How a missing diagonal is detected without looking for one.** A field
+    /// made of `x`, `y` and `r` has no preferred diagonal: walk a cell down and
+    /// right, or up and right, and on average you cross the same amount of the
+    /// field's structure either way, because reversing the sign of the `y` step
+    /// changes which part of a band you land on and not how much of it you
+    /// cross. A term in `x + y` breaks that, because `x + y` increases on one of
+    /// those two walks and decreases on the other. So the asymmetry between the
+    /// two diagonals is the term's fingerprint, and it is zero for a field
+    /// without one.
+    ///
+    /// Measured over [`SAMPLE_SEEDS`] and [`DRIFT_SAMPLES`]:
+    ///
+    /// ```text
+    ///             old    new
+    ///   200x50    0.005  0.111
+    ///   400x200   0.002  0.112
+    ///   80x24     0.006  0.112
+    /// ```
+    ///
+    /// **The new figures are the same at all three sizes to three decimals**,
+    /// which is not a coincidence and is the reason to believe them. The
+    /// asymmetry is a property of the *term*, and the term's contribution to it
+    /// is the same fraction of the field's total rate wherever it is measured;
+    /// the sizes differ in how much of the screen the other four terms cover, and
+    /// the diagonal is a small share of the total at all of them.
+    ///
+    /// The old figures are not exactly zero and the reason is worth having,
+    /// because it is a trap: the measurement is a *finite* screen, and a
+    /// rectangle's mean |change| along two mirrored diagonals is not
+    /// identically equal even for a field with no preferred diagonal. So 0.005
+    /// is the noise floor of the measurement, and it is a quarter of the bound.
+    ///
+    /// What does **not** produce a false positive is worth stating as well,
+    /// because it looked like it might: a *static* term in `x + y` breaks the
+    /// symmetry in principle, since `x + y` increases on one walk and decreases
+    /// on the other. It does not in practice, and the reason is that the mean
+    /// |change| of a periodic function over many periods is the same wherever
+    /// the window starts, so a term that is not moving contributes equally to
+    /// both walks and cancels. The asymmetry is evidence of a *moving*
+    /// diagonal, which is the one that shows up on screen.
+    ///
+    /// The bound is 0.05: a factor of five below what the field measures and a
+    /// factor of eight above the old field's largest. Per-configuration the
+    /// figure ranges from 0.006 to 0.195 at 80x24, so it is the mean over seeds
+    /// that is asserted rather than every draw; see
+    /// [`mean_diagonal_asymmetry`].
+    #[test]
+    fn the_field_has_a_diagonal() {
+        const MIN_ASYMMETRY: f64 = 0.05;
+
+        for size in [(200u16, 50u16), (400, 200), (80, 24)] {
+            let asymmetry = mean_diagonal_asymmetry(size);
+            assert!(
+                asymmetry > MIN_ASYMMETRY,
+                "at {size:?} the field changes by the same amount along the two \
+                 diagonals to within {:.1}%, so its structure is still only \
+                 stripes and rings: every term is a function of x, of y or of \
+                 the radius, and the field has no grain",
+                asymmetry * 100.0
+            );
+        }
+    }
+
+    /// The two ring terms must not be one wave and its second harmonic.
+    ///
+    /// They were `sin(r/4)` and `sin(r/8)`: the same pattern at exactly 2 : 1.
+    /// Two sines of one argument in a harmonic ratio are not two waves. They
+    /// add coherently at every radius, and their sum is a single clean beat with
+    /// a smooth envelope -- which is what the screen showed, hard concentric
+    /// bands marching outwards with no interference anywhere in them.
+    ///
+    /// **Measured as the repeat, not as the ratio.** "Not 2 : 1" is a claim about
+    /// two numbers and it is the wrong one to assert: the seed now draws both
+    /// divisors, so *any* pair can come up, and a test that forbade 2 : 1 would
+    /// be forbidding a legal draw rather than a defect. What is not a matter of
+    /// luck is the distance at which the pair comes back to itself, because a
+    /// pair that repeats inside the screen draws the same rings twice and a pair
+    /// that repeats outside it does not. That distance is what is asserted.
+    ///
+    /// The old pair repeated every `16*pi` = 50.3 corrected units. A 200x50
+    /// screen is 209 units corner to corner, so the old field drew its radial
+    /// structure twice across its own diagonal -- once near the centre and again
+    /// in the corners, identical. The centres now give 4.0 and 5.5, a ratio of
+    /// 11 : 8, whose joint repeat is `88*pi` = 276 units: past the corner of the
+    /// size the calibration is fitted at.
+    ///
+    /// It is worth being straight about the limit of that. 88 is still a number
+    /// a terminal can reach: at 400x200, which is 466 units corner to corner,
+    /// the repeat is 59% of the way across. What the change bought is 5.5x the
+    /// distance, not an infinite one, and the arithmetic is against an infinite
+    /// one -- every `f64` is a dyadic rational, so *any* two of them have a
+    /// rational ratio and a joint period, and the seeded draws put theirs
+    /// thousands of times further out than 276. The search below is what turns
+    /// that from an argument into a measurement.
+    #[test]
+    fn the_two_ring_terms_do_not_repeat_inside_the_screen() {
+        // Searched to a bit over the screen's own diagonal at the size the
+        // calibration is fitted at. A thousandth of a unit is 0.0008 of a row,
+        // so a repeat is either found or it is not there.
+        const CAP: f64 = 240.0;
+        const STEP: f64 = 0.001;
+
+        // The centres, first: this is the number the constant note quotes and it
+        // is the clearest statement of the change.
+        assert_eq!(
+            radial_joint_period(
+                RING_DIVISOR.center,
+                BREATH_DIVISOR.center,
+                CAP,
+                STEP
+            ),
+            None,
+            "the two ring divisors' centres still come back to themselves within \
+             {CAP} corrected units, so they are still in a harmonic relationship"
+        );
+
+        // The search finds the old pair's repeat, and at the right distance.
+        // Without this the assertion above is worth nothing: a search that finds
+        // nothing is indistinguishable from a search that cannot see.
+        let old = radial_joint_period(4.0, 8.0, CAP, STEP).expect(
+            "the search did not find the old pair's repeat at 16*pi, so it cannot \
+             be trusted to report that the new pair has none",
+        );
+        assert!(
+            (old - 16.0 * PI).abs() <= STEP,
+            "the old pair's repeat was found at {old:.4} rather than at 16*pi = {}, \
+             so the search is measuring something other than the joint period",
+            16.0 * PI
+        );
+
+        // And then every draw. The centres are not what a launch gets.
+        for seed in 0..200u64 {
+            let tuning =
+                FieldTuning::from_seed(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            assert_eq!(
+                radial_joint_period(
+                    tuning.ring_divisor,
+                    tuning.breath_divisor,
+                    CAP,
+                    STEP
+                ),
+                None,
+                "seed {seed} drew ring divisors {:.4} and {:.4}, whose rings \
+                 repeat within {CAP} corrected units -- inside the screen",
+                tuning.ring_divisor,
+                tuning.breath_divisor
+            );
+        }
+    }
+
+    // --- the seed --------------------------------------------------------
+
+    /// The whole point of a seed: a different launch looks different.
+    ///
+    /// `PlasmaOptions::seed` was added in `b8d85db` and read by nothing. The
+    /// field is a pure function of time and so was identical on every launch,
+    /// which is the one thing a screensaver cannot be.
+    ///
+    /// Asserted on the **first frame**, which is the strict version. A test
+    /// that let the field run for a few seconds would be satisfied by a seed
+    /// that only shifts a phase, and a phase shift is not what "a plasma looks
+    /// different on every launch" means -- the launch that matters is the one
+    /// where the terminal is still filling up.
+    #[test]
+    fn two_seeds_draw_different_fields_on_the_first_frame() {
+        let size = (120u16, 40u16);
+        let first_frame = |seed: u64| {
+            let tuning = FieldTuning::from_seed(seed);
+            (0..size.1 as usize)
+                .flat_map(|y| {
+                    (0..size.0 as usize)
+                        .map(move |x| value_at_with(&tuning, size, x, y, 0.0))
+                })
+                .collect::<Vec<f64>>()
+        };
+
+        let baseline = first_frame(DEFAULT_SEED);
+        for other in [0u64, 1, 43, 987_654_321] {
+            let candidate = first_frame(other);
+            assert_ne!(
+                candidate, baseline,
+                "seed {other} draws the same first frame as the default, so the \
+                 seed is not reaching the field"
+            );
+
+            // Not merely "not equal": measurably different. An `assert_ne` on a
+            // Vec of floats passes on a last-bit change, and a field that
+            // differed by 1e-16 would be the same picture. A tenth of the range
+            // is the bar, which the divisors' 30% bands clear by a wide margin.
+            let mean: f64 = candidate
+                .iter()
+                .zip(&baseline)
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f64>()
+                / baseline.len() as f64;
+            assert!(
+                mean > 0.1,
+                "seed {other} differs from the default by a mean of {mean:.4} on \
+                 the first frame, which is the same picture"
+            );
+        }
+    }
+
+    /// The other half of the contract, and the half that is easy to break by
+    /// accident.
+    ///
+    /// A seed that is read *differently* twice -- because the tuning is drawn
+    /// from a generator that is rebuilt rather than stored, or because the
+    /// divisors are drawn in an order that depends on a hash iteration -- gives
+    /// a field that cannot be reproduced, and `--seed` becomes a lie. The
+    /// contract suite in `tests/effect_contracts.rs` checks this across two
+    /// separately built instances; this checks it against the field function
+    /// directly, so a failure points at [`FieldTuning`] rather than at the
+    /// runtime.
+    #[test]
+    fn one_seed_always_draws_the_same_field() {
+        let size = (120u16, 40u16);
+        for seed in [DEFAULT_SEED, 0, 1, 43, u64::MAX] {
+            let first = FieldTuning::from_seed(seed);
+            let second = FieldTuning::from_seed(seed);
+            assert_eq!(first, second, "seed {seed} drew two different tunings");
+
+            for now in [0.0, 0.5, 3.7] {
+                for y in [0usize, 13, 39] {
+                    for x in [0usize, 41, 119] {
+                        assert_eq!(
+                            value_at_with(&first, size, x, y, now),
+                            value_at_with(&second, size, x, y, now),
+                            "seed {seed} drew different values at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The randomisation cannot produce a degenerate field, on any draw.
+    ///
+    /// This is the test that a random number with no floor fails, and it fails
+    /// it *quietly*: a divisor drawn near zero is a term that is a flat wash
+    /// across the whole screen, and a divisor drawn near the screen's width is
+    /// a single band. Neither is a wrong answer, a NaN, or an assertion failure
+    /// anywhere else in this file -- the picture renders, it is just not plasma,
+    /// and a test that only looked for crashes would call it a pass. So the
+    /// bounds are the assertion.
+    ///
+    /// Two hundred seeds, and every one of the five divisors from every one of
+    /// them. The bands are multiplicative for the reason on [`DivisorBand`]: a
+    /// divisor is a period, so a wobble of a fixed size in cells means something
+    /// different at 4 and at 16, and a proportional band keeps the number of
+    /// bands on the screen the same fraction of the screen at both ends.
+    #[test]
+    fn the_seeded_divisors_stay_inside_their_bands() {
+        const SEEDS: u64 = 200;
+
+        let bands = [
+            ("wave", WAVE_DIVISOR),
+            ("sweep", SWEEP_DIVISOR),
+            ("ring", RING_DIVISOR),
+            ("breath", BREATH_DIVISOR),
+            ("diagonal", DIAGONAL_DIVISOR),
+        ];
+
+        // The range each band covers across the draws, for the failure message.
+        let mut measured: Vec<[f64; 5]> = Vec::new();
+        for seed in 0..SEEDS {
+            measured.push(draw_divisors(seed));
+        }
+
+        for (index, (name, band)) in bands.iter().enumerate() {
+            let column: Vec<f64> = measured.iter().map(|row| row[index]).collect();
+            let low = column.iter().copied().fold(f64::INFINITY, f64::min);
+            let high = column.iter().copied().fold(0.0f64, f64::max);
+
+            // The band's own edges, recomputed here rather than read off the
+            // type. If `draw` ever stopped multiplying by `1 - jitter ..=
+            // 1 + jitter` -- which is the mistake this test exists for -- the
+            // range it draws is still described by the *band*, and these are the
+            // numbers it has to stay inside.
+            let band_low = band.center * (1.0 - band.jitter);
+            let band_high = band.center * (1.0 + band.jitter);
+            assert!(
+                low >= band_low && high <= band_high,
+                "the {name} divisor ranged over {low:.3} to {high:.3} over {SEEDS} \
+                 seeds, outside its band of {band_low:.3} to {band_high:.3}: a \
+                 divisor near zero is a flat wash and one near the screen's width \
+                 is a single band, and neither is a plasma"
+            );
+            assert!(
+                low > 0.0,
+                "the {name} divisor was drawn as {low}, so the term has no \
+                 structure at all -- the band has lost its floor"
+            );
+        }
+
+        // The five are not all the same number, which is a different failure:
+        // five terms at one frequency are one term five times.
+        for (index, (name, _)) in bands.iter().enumerate() {
+            let others: Vec<f64> = bands
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, (_, band))| band.center)
+                .collect();
+            let mine = bands[index].1.center;
+            assert!(
+                others.iter().all(|other| (other - mine).abs() > 0.5),
+                "the {name} divisor's centre is {mine}, which is the same as \
+                 another term's to within half a cell, so the two terms are one \
+                 term drawn twice"
+            );
+        }
+    }
+
+    /// The five divisors a seed produced, in the order they are summed.
+    fn draw_divisors(seed: u64) -> [f64; 5] {
+        let tuning =
+            FieldTuning::from_seed(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        [
+            tuning.wave_divisor,
+            tuning.sweep_divisor,
+            tuning.ring_divisor,
+            tuning.breath_divisor,
+            tuning.diagonal_divisor,
+        ]
+    }
+
+    /// The calibration has to hold for a launch the user did not choose.
+    ///
+    /// [`VALUE_BOUNDARIES`] is fitted at 200x50, and it used to be fitted to one
+    /// field -- which was the whole field, because there was only one. There are
+    /// now as many fields as there are seeds, and `randomise_seeds` hands every
+    /// unconfigured launch a fresh one, so a table that only suits seed 42 suits
+    /// exactly one launch in the world.
+    ///
+    /// **The floor is the assertion; the ceiling is a guard.** A step that
+    /// covers too little of the screen is a character the field effectively does
+    /// not draw, and that is the failure a table fitted to the wrong field
+    /// produces first: the old boundaries leave the worst of ten launches with
+    /// 1.50% on its sparsest step against 2.63% for these. The ceiling cannot
+    /// do the same job -- the old table's worst launch peaks at 11.3% and these
+    /// at 13.9%, so a bound between them would be asserting that the *new* fit
+    /// is worse, which is the opposite of true. The refit buys its floor with
+    /// ceiling, and the note on the table says so; the 20% ceiling here is the
+    /// same bar `every_glyph_of_the_default_ramp_carries_its_share_of_the_
+    /// screen` uses, kept as a backstop rather than as the discriminator.
+    ///
+    /// Ten seeds, sixty frames each. Not a random sample -- the first ten seeds
+    /// anyone would write down, plus the default and the largest `u64` a config
+    /// can carry, which is a deliberate attempt to include a bad one. The
+    /// default is in the list because it is the one an unconfigured run gets
+    /// before `randomise_seeds` fires, and because it is the seed the table was
+    /// originally fitted to: leaving it out of the list that checks whether the
+    /// table reaches beyond it is precisely the mistake worth naming.
+    #[test]
+    fn the_calibration_holds_across_seeds_not_just_the_default_one() {
+        /// A step covering less than a fiftieth of the screen is not a band.
+        ///
+        /// A fiftieth, not a sixteenth, because this is a *worst launch* bound
+        /// and the fit is over ten different distributions: measured, they run
+        /// from 2.6% to 13.9% on the sparsest and busiest steps, and a bound at
+        /// a sixteenth would be asserting a uniformity that nine of them do not
+        /// have. It sits 24% below what the table achieves and 33% above what
+        /// the table it replaced achieved on the same ten seeds.
+        const MIN_SHARE: f64 = 0.02;
+        const MAX_SHARE: f64 = 0.20;
+
+        let size = (200u16, 50u16);
+        for seed in [
+            DEFAULT_SEED,
+            0u64,
+            1,
+            7,
+            13,
+            99,
+            1234,
+            5150,
+            65535,
+            987_654_321,
+        ] {
+            let shares = glyph_shares_for(size, 60, seed);
+            let busiest = shares.iter().copied().fold(0.0f64, f64::max);
+            let sparsest = shares.iter().copied().fold(1.0f64, f64::min);
+            assert!(
+                busiest <= MAX_SHARE && sparsest >= MIN_SHARE,
+                "seed {seed} puts {busiest:.1}% of the screen on one glyph and \
+                 {sparsest:.1}% on another, so the calibration fitted at 200x50 \
+                 does not reach every launch: [{shares:?}]"
+            );
+        }
+    }
+
     // --- repetition -------------------------------------------------------
 
     /// The field has to stop coming back. The user's complaint, as a number.
@@ -1823,7 +2858,7 @@ mod tests {
     ///
     /// Asserted twice over, because the two halves fail differently. The
     /// frequency search is the one that catches the bug directly: it looks for a
-    /// `T` that advances all three time terms by whole cycles, and against the
+    /// `T` that advances all five time terms by whole cycles, and against the
     /// old frequencies it finds one on the first grid point worth trying, `8*pi`
     /// itself. The frame comparison is the one that says what the user sees, and
     /// it is deliberately a *weak* threshold -- a hundredth of the range, against
@@ -1833,6 +2868,17 @@ mod tests {
     /// The weak threshold needs the guard below it, or the test would also pass
     /// against a field that never changed at all. A constant field has no period
     /// either, so "does not repeat" is vacuously true of it.
+    ///
+    /// **The search is over five frequencies now, and that is not free.** The
+    /// five are `1, sqrt(2), sqrt(3), sqrt(5), sqrt(7)` over a common two, and
+    /// the two added are for the diagonal term and the second ring term. Every
+    /// pair's ratio is irrational, so there is no period; but "no period" is a
+    /// statement about the *exact* reals, and the grid is a finite search
+    /// through `f64`s. The closest approach it finds over 0.05 to 200 units is
+    /// 0.0105 of a cycle off -- four orders of magnitude outside the tolerance,
+    /// and the margin is better than it was with three frequencies, because
+    /// every extra frequency is another near-independent constraint. That is the
+    /// argument for adding them rather than an accident of the search.
     #[test]
     fn the_field_does_not_come_back_to_where_it_was() {
         // A period `T` has to satisfy `f * T = 2*pi * n` for every time
@@ -1851,7 +2897,13 @@ mod tests {
         /// nothing at all.
         const CYCLE_TOLERANCE: f64 = 1.0e-6;
 
-        let frequencies = [TIME_FREQ_RIPPLE, TIME_FREQ_WAVE, TIME_FREQ_SWEEP];
+        let frequencies = [
+            TIME_FREQ_RIPPLE,
+            TIME_FREQ_WAVE,
+            TIME_FREQ_SWEEP,
+            TIME_FREQ_DIAGONAL,
+            TIME_FREQ_BREATH,
+        ];
         let mut steps = (SEARCH_TO - SEARCH_FROM) / SEARCH_STEP;
         let mut best: Option<(f64, f64)> = None;
         while steps >= 0.0 {
@@ -1868,9 +2920,10 @@ mod tests {
             }
             if worst <= CYCLE_TOLERANCE {
                 panic!(
-                    "a period of {period:.3} units advances all three time \
+                    "a period of {period:.3} units advances all {} time \
                      frequencies ({frequencies:?}) by a whole number of cycles, \
-                     to within {CYCLE_TOLERANCE:e}, so the field repeats on it"
+                     to within {CYCLE_TOLERANCE:e}, so the field repeats on it",
+                    frequencies.len()
                 );
             }
             steps -= 1.0;
@@ -1938,10 +2991,257 @@ mod tests {
 
     // --- helpers ---------------------------------------------------------
 
+    /// The instants every "does the field go up and down" measurement is taken
+    /// at.
+    ///
+    /// Not consecutive and not on a round step: a round step of `plasma.time`
+    /// can land every sample on the same phase of one term's cycle, and the
+    /// measurement would then be a statement about that phase rather than about
+    /// the field. These are spread over more than the 25.1 units of the period
+    /// the field used to have, so the set sees a full turn of every one.
+    const DRIFT_SAMPLES: [f64; 6] = [0.0, 0.37, 2.6, 7.1, 19.9, 33.7];
+
+    /// The seeds a field property is measured over.
+    ///
+    /// [`FieldTuning`] makes every launch a different field, so a property of
+    /// "the field" is a property of a *distribution* of fields, and measuring
+    /// one seed measures one draw from it. Four is a small sample and the tests
+    /// that use it average over them for exactly that reason. 42 is in the set
+    /// because it is the default, and 0 and 1 are in it because they are the
+    /// seeds a hand-written config is most likely to carry.
+    const SAMPLE_SEEDS: [u64; 4] = [DEFAULT_SEED, 0, 1, 987_654_321];
+
+    /// The field's net drift, in cells across and rows down per unit of
+    /// `plasma.time`.
+    ///
+    /// A pattern translating rigidly at `(u_x, u_y)` satisfies
+    /// `dv/dt = -(u_x dv/dx + u_y dv/dy)`, so the two-by-two normal equations on
+    /// the two spatial derivatives recover the velocity from the whole screen at
+    /// once. Three things about that are worth being explicit about:
+    ///
+    /// - **It is an aggregate.** No single term decides the answer, which is
+    ///   what makes it a statement about the picture rather than about the
+    ///   formula. A measurement of one term's phase would be a measurement of
+    ///   that term.
+    ///
+    /// - **It is in units, and the units differ.** `u_x` comes back in cells,
+    ///   `u_y` in corrected units, and a row is 1.2 of the latter, so `u_y` is
+    ///   divided by [`CELL_ASPECT`] before the two are compared. Leaving that
+    ///   out is not a rounding error: it inflates every vertical figure in this
+    ///   file by 20%, and it does so on both sides of the comparison, so the
+    ///   ordering survives and the *numbers quoted in the constant notes* do
+    ///   not.
+    ///
+    /// - **It is a first-order reading.** The field is a sum of five waves at
+    ///   different frequencies and they do not translate together, so there is
+    ///   no exact velocity; this is the one that best explains the change the
+    ///   viewer sees, least squares over every cell. That it is a fit and not an
+    ///   identity is why the drift it reports for a *still* field is zero and
+    ///   why the test below needs the lower guard as well as the upper one.
+    fn advection_velocity(
+        size: (u16, u16),
+        now: f64,
+        dt: f64,
+        tuning: &FieldTuning,
+    ) -> (f64, f64) {
+        /// Half the finite-difference step for the spatial derivatives, in
+        /// corrected units. A thousandth of a cell: the value is smooth, so this
+        /// is a derivative to six figures and not a difference between two
+        /// samples a cell apart.
+        const H: f64 = 1.0e-3;
+
+        let (mut sxx, mut sxy, mut syy) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut sx, mut sy) = (0.0f64, 0.0f64);
+        let scale = PlasmaOptions::default().spatial_scale;
+        for y in 0..size.1 as usize {
+            for x in 0..size.0 as usize {
+                let xu = x as f64;
+                let yu = y as f64 * CELL_ASPECT;
+                let rate = (sample(tuning, size, xu, yu, now + dt, scale)
+                    - sample(tuning, size, xu, yu, now, scale))
+                    / dt;
+                let dvdx = (sample(tuning, size, xu + H, yu, now, scale)
+                    - sample(tuning, size, xu - H, yu, now, scale))
+                    / (2.0 * H);
+                let dvdy = (sample(tuning, size, xu, yu + H, now, scale)
+                    - sample(tuning, size, xu, yu - H, now, scale))
+                    / (2.0 * H);
+                sxx += dvdx * dvdx;
+                sxy += dvdx * dvdy;
+                syy += dvdy * dvdy;
+                sx += dvdx * rate;
+                sy += dvdy * rate;
+            }
+        }
+
+        let det = sxx * syy - sxy * sxy;
+        if det <= f64::EPSILON {
+            // No gradient variance at all: a constant field, or a screen too
+            // small to have any structure in it. Zero is the honest answer and
+            // the test's lower guard is what notices.
+            return (0.0, 0.0);
+        }
+        (
+            -(syy * sx - sxy * sy) / det,
+            -(-sxy * sx + sxx * sy) / det / CELL_ASPECT,
+        )
+    }
+
+    /// The field's drift downwards for every row it drifts across, averaged
+    /// over [`SAMPLE_SEEDS`] and [`DRIFT_SAMPLES`].
+    ///
+    /// Averaged, and that is a design decision rather than a convenience. The
+    /// per-configuration figure is high-variance -- it depends on which term
+    /// happens to dominate the least-squares fit at that instant, which depends
+    /// on the phase, which the seed draws -- and measured over the divisor
+    /// bands it ranges from 0.0 to 2.3 at 200x50. A bound on a quantity with
+    /// that spread would have to be set at its maximum, and a maximum over
+    /// configurations is a statement about the unluckiest launch rather than
+    /// about the effect. The mean over seeds says what the field does, which is
+    /// the question.
+    fn vertical_to_horizontal_drift(size: (u16, u16), dt: f64) -> f64 {
+        let mut across = 0.0f64;
+        let mut down = 0.0f64;
+        for seed in SAMPLE_SEEDS {
+            let tuning = FieldTuning::from_seed(seed);
+            for now in DRIFT_SAMPLES {
+                let (ux, uy) = advection_velocity(size, now, dt, &tuning);
+                across += ux.abs();
+                down += uy.abs();
+            }
+        }
+        let samples = (SAMPLE_SEEDS.len() * DRIFT_SAMPLES.len()) as f64;
+        (down / samples) / (across / samples).max(1e-9)
+    }
+
+    /// How differently the field changes along the two diagonals.
+    ///
+    /// The mean |change| from a cell one row down and one column right, against
+    /// the same for one row *up* and one column right. A field built only from
+    /// `x`, `y` and `r` reads the same both ways -- there is no preferred
+    /// diagonal in it, and reversing the sign of the `y` step changes which
+    /// part of a band you land on but not how much of it you cross -- so this is
+    /// zero for the old field to within the finite screen's own asymmetry. A
+    /// term that is a function of `x + y` breaks exactly that, and by exactly
+    /// this much.
+    fn diagonal_asymmetry(size: (u16, u16), now: f64, tuning: &FieldTuning) -> f64 {
+        let scale = PlasmaOptions::default().spatial_scale;
+        let (mut down_right, mut up_right) = (0.0f64, 0.0f64);
+        for y in 0..size.1 as usize {
+            for x in 0..size.0 as usize {
+                let xu = x as f64;
+                let yu = y as f64 * CELL_ASPECT;
+                let here = sample(tuning, size, xu, yu, now, scale);
+                down_right +=
+                    (sample(tuning, size, xu + 1.0, yu + CELL_ASPECT, now, scale)
+                        - here)
+                        .abs();
+                up_right +=
+                    (sample(tuning, size, xu + 1.0, yu - CELL_ASPECT, now, scale)
+                        - here)
+                        .abs();
+            }
+        }
+        let mean = (down_right + up_right) / 2.0;
+        if mean <= 0.0 {
+            return 0.0;
+        }
+        (down_right - up_right).abs() / mean
+    }
+
+    /// [`diagonal_asymmetry`] averaged over [`SAMPLE_SEEDS`] and
+    /// [`DRIFT_SAMPLES`].
+    ///
+    /// Averaged for the same reason the drift is, and for one more: measured
+    /// per configuration this ranges from 0.006 to 0.195 at 80x24, and the low
+    /// end is a real configuration rather than a fluke. A launch can draw a set
+    /// of divisors on which the diagonal term's cross-terms happen to cancel,
+    /// and the field on that screen is genuinely no more diagonal than the old
+    /// one. The claim worth making is that the field is diagonal *in general*,
+    /// not that every draw of it is.
+    fn mean_diagonal_asymmetry(size: (u16, u16)) -> f64 {
+        let mut total = 0.0f64;
+        for seed in SAMPLE_SEEDS {
+            let tuning = FieldTuning::from_seed(seed);
+            for now in DRIFT_SAMPLES {
+                total += diagonal_asymmetry(size, now, &tuning);
+            }
+        }
+        total / (SAMPLE_SEEDS.len() * DRIFT_SAMPLES.len()) as f64
+    }
+
+    /// The smallest shift in `r` at which both ring terms come back to where
+    /// they were, or `None` if there is none within the search.
+    ///
+    /// `ring(r)` and `breath(r)` are sines of `r / divisor`, so each repeats
+    /// every `2*pi*divisor` and the pair repeats every common multiple of the
+    /// two. Found by search rather than by least common multiple, because the
+    /// divisors are drawn from the seed and are arbitrary `f64`s: their ratio
+    /// is a ratio of dyadic rationals, so the arithmetic answer is enormous and
+    /// the interesting question is whether a repeat is anywhere near the screen.
+    ///
+    /// **The tolerance is the grid's, not a number.** A search at step `s` can
+    /// only find a repeat at a distance `p` if some grid point lands within
+    /// `s / 2` of it, and `s / 2` of shift is `s / (4*pi*divisor)` of cycle for
+    /// the coarser of the two. A fixed cycle tolerance smaller than that
+    /// searches for a repeat it cannot represent and finds nothing -- which is
+    /// how the first version of this passed against the *old* pair, whose
+    /// repeat at `16*pi` = 50.2655 is not a multiple of the 0.001 grid. The
+    /// tolerance is derived from the step so the search and the grid cannot
+    /// disagree about what the grid can see.
+    fn radial_joint_period(
+        first: f64,
+        second: f64,
+        cap: f64,
+        step: f64,
+    ) -> Option<f64> {
+        let coarsest = first.min(second);
+        let tolerance = 0.75 * step / (2.0 * PI * coarsest);
+        let mut shift = step;
+        while shift <= cap {
+            let cycles = |divisor: f64| {
+                let c = shift / (2.0 * PI * divisor);
+                (c - c.round()).abs()
+            };
+            if cycles(first) <= tolerance && cycles(second) <= tolerance {
+                return Some(shift);
+            }
+            shift += step;
+        }
+        None
+    }
+
+    /// The tuning the default options produce, rebuilt on each call.
+    ///
+    /// Not a `static` or a cached `OnceLock`: a shared one would be a mutable
+    /// global, and the point of `FieldTuning` is that a field is a value two
+    /// effects can hold at once without either of them seeing the other's seed.
+    fn default_tuning() -> FieldTuning {
+        FieldTuning::from_seed(PlasmaOptions::default().seed)
+    }
+
     /// The value one cell was drawn from, recovered from the same inputs
     /// `update_plasma` uses so a test can pair a drawn cell with its value.
+    ///
+    /// Reads the *drawn* effect's tuning rather than a default, so a test that
+    /// builds a seeded effect and one that uses the default agree on what the
+    /// screen was drawn from. Callers that only ever use the default are
+    /// unaffected; callers that do not have an effect in hand want
+    /// [`value_at_with`].
     fn value_at(size: (u16, u16), x: usize, y: usize, now: f64) -> f64 {
+        value_at_with(&default_tuning(), size, x, y, now)
+    }
+
+    /// [`value_at`] against an explicitly named tuning.
+    fn value_at_with(
+        tuning: &FieldTuning,
+        size: (u16, u16),
+        x: usize,
+        y: usize,
+        now: f64,
+    ) -> f64 {
         sample(
+            tuning,
             size,
             x as f64,
             y as f64 * CELL_ASPECT,
@@ -1951,8 +3251,15 @@ mod tests {
     }
 
     /// The value at one point, at a given time, in corrected units.
-    fn sample(size: (u16, u16), x: f64, y: f64, now: f64, scale: f64) -> f64 {
-        Plasma::plasma_value(
+    fn sample(
+        tuning: &FieldTuning,
+        size: (u16, u16),
+        x: f64,
+        y: f64,
+        now: f64,
+        scale: f64,
+    ) -> f64 {
+        tuning.value(
             x,
             y,
             now,
@@ -1978,14 +3285,27 @@ mod tests {
     /// bottom four, at one instant.
     fn row_change_ratio(size: (u16, u16), now: f64) -> (f64, f64) {
         let scale = PlasmaOptions::default().spatial_scale;
+        let tuning = default_tuning();
         let mut per_row = vec![0.0f64; size.1 as usize];
         for (y, row) in per_row.iter_mut().enumerate() {
             for x in 0..size.0 as usize {
                 let xu = x as f64;
-                *row +=
-                    (sample(size, xu, (y + 1) as f64 * CELL_ASPECT, now, scale)
-                        - sample(size, xu, y as f64 * CELL_ASPECT, now, scale))
-                    .abs();
+                *row += (sample(
+                    &tuning,
+                    size,
+                    xu,
+                    (y + 1) as f64 * CELL_ASPECT,
+                    now,
+                    scale,
+                ) - sample(
+                    &tuning,
+                    size,
+                    xu,
+                    y as f64 * CELL_ASPECT,
+                    now,
+                    scale,
+                ))
+                .abs();
             }
         }
 
