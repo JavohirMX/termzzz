@@ -1096,17 +1096,20 @@ fn dvd_options_default_to_a_block_letter_logo() {
         rendered.contains("[dvd]"),
         "the dvd section is missing from the rendered config"
     );
-    // Recolours on every *third* wall hit. The option used to be
-    // `corner_color_change`, and a corner needs both axes to reverse on the same
-    // frame: at 80x24 that first happens after 97 seconds, so the logo was
-    // effectively one colour for the whole run. It was then moved to every
-    // bounce, which is the reference implementation's behaviour and was fine for
-    // a 23-cell slab -- but with a 30-cell wordmark and a reflection under it, a
-    // full-slab hue change every second and a half reads as a strobe. Every third
-    // keeps the colour change tied to a bounce and drops the rate by two thirds.
+    // Recolours on every wall hit, which is the reference implementation's
+    // behaviour and what was asked for.
+    //
+    // It was briefly every *third*. The reason given was that a full-slab hue
+    // change on a 30-cell wordmark reads as a strobe -- and it does, at the speed
+    // the logo was then running at, where wall hits were 1.4 seconds apart. The
+    // cause was diagnosed as the colour and was actually the speed: a braille
+    // glyph is its own bit pattern, so a one-dot step rewrites the whole
+    // letterform, and the logo was stepping 36 dots a second against 60 frames.
+    // At 5 cells a second wall hits are about eight seconds apart and a colour
+    // change is an event again. See `ColorChange::Bounce` in the effect.
     assert_eq!(
         options.color_change,
-        termzzz::dvd::effect::ColorChange::Steady
+        termzzz::dvd::effect::ColorChange::Bounce
     );
     // The palette has to be big enough that consecutive bounces look different,
     // which is the whole point of changing at all.
@@ -1116,19 +1119,24 @@ fn dvd_options_default_to_a_block_letter_logo() {
          is a line at 50 to 63 degrees rather than a diagonal",
         options.slope
     );
-    // And the speed has to be high enough that the drawn position actually
-    // changes between frames, which is the whole "not a staircase" requirement.
+    // And the speed has to be high enough that a traverse is not tediously slow.
     //
-    // The cap was 24 against the old 23-cell logo and is now 18 against the
-    // 30-cell wordmark, scaled by the old width over the new. So this bound comes
-    // down with it: what has to be preserved is dots per second against 60
-    // frames, and 18 cells a second is 36 horizontal dots, comfortably above the
-    // 30 that "changes on more than every other frame" needs. A bound of 20 would
-    // have been a statement about the old logo, not about this one.
+    // This bound used to be 15, on the reasoning that the drawn position must
+    // change "on more than every other frame" or the logo is a staircase. That
+    // was a proxy, and a proxy that can be satisfied by jumping a whole cell at a
+    // time on rare frames -- the defect it was meant to catch. The direct
+    // statement is that no frame moves the logo more than a fraction of a cell,
+    // and `dvd::effect` asserts that in `the_picture_changes_on_almost_every_frame`
+    // where the machinery to measure it lives.
+    //
+    // So this is now the other bound: fast enough to cross a screen in a
+    // reasonable time. At 5 cells a second an 80 column screen takes sixteen
+    // seconds, which is the reference implementation's pace, and anything under
+    // about 3 is a crawl rather than a bounce.
     assert!(
-        options.speed >= 15.0,
-        "the default speed is {}, which is slow enough for the logo to sit still \
-         for several frames between steps",
+        options.speed >= 3.0,
+        "the default speed is {}, which crosses an 80 column screen in over \
+         twenty seconds",
         options.speed
     );
     assert!(
