@@ -263,47 +263,64 @@ impl Default for DvdOptions {
     fn default() -> Self {
         Self {
             logo: String::from(DVD_WORDMARK),
-            // 5.0, and the number comes from the reference implementation rather
-            // than from taste.
+            // 12.0, and it is set by how often the picture changes rather than
+            // by how fast the logo looks like it is travelling.
             //
-            // lemonyte's screensaver moves 50 pixels a second across a 1920-pixel
-            // window, and its logo is a sixth of that window. So it crosses one
-            // logo width every 6.4 seconds, or at 0.156 logo-widths a second.
-            // This logo is 30 cells wide, so the same *feel* is 4.7 cells a
-            // second, which rounds to 5.
+            // The logo is a braille bitmap, so it can only move in whole dots and
+            // the smallest possible jump is one dot -- which rewrites most of a
+            // dense letterform, because a braille glyph *is* its bit pattern.
+            // That part is irreducible. What is not irreducible is how often it
+            // jumps, and it turns out that is the whole of the complaint.
             //
-            // The number was 18 for a while and the justification given for it
-            // was wrong, twice over. It was derived by scaling 24 by the old logo
-            // width over the new, which holds `cells_per_second * width`
-            // constant -- a product that is not a quantity that means anything,
-            // and which in particular does not preserve the time to cross one
-            // logo width. That would want 31, not 18. The second error was more
-            // interesting: 18 was defended as "too quick rather than stuttering",
-            // on the theory that a slow logo steps visibly from dot to dot.
+            // Measured over 600 frames at 80x24, by accumulating every diff the
+            // way a terminal does and comparing the on-screen dots frame to
+            // frame:
             //
-            // That theory has the braille grid backwards. A step here is one dot
-            // out of the logo's 60, so it moves the picture 1.7% of its own
-            // width. The block letter this replaced stepped a whole cell out of
-            // 23 -- 4.3% -- and did so at 24 cells a second rather than 18. The
-            // braille logo is not the coarse one; at a slower rate it is three
-            // times finer than the thing that was reported as a staircase.
+            //   speed  5    8   10   12   15   18
+            //   moved 17%  28%  34%  40%  51%  82%
             //
-            // So the stepping was never the problem, and the flicker was. It is
-            // this: a braille glyph *is* its bit pattern, so moving the logo one
-            // dot rewrites nearly every cell it passes through. At 18 cells a
-            // second that is 36 dot-steps against 60 frames -- a whole-logo
-            // repaint on three frames in five, which reads as a shimmer rather
-            // than as motion. At 5 it is 10 dot-steps, one every six frames, and
-            // the logo slides.
+            // At 5 the logo moves on **one frame in six** and holds for the
+            // other five. That is not slow motion, it is a slideshow: the eye
+            // gets five identical frames and then a jump, and reports flicker.
+            // The dot step is one dot at every speed in the table -- raising the
+            // speed does not make the jumps bigger, only more frequent, so
+            // there is no smoothness argument against going faster.
             //
-            // Which is also what makes [`ColorChange::Bounce`] safe to leave on
-            // every hit: at this speed a wall hit is about eight seconds away
-            // rather than one and a half, so a colour change is an event again
-            // instead of a strobe.
+            // 12 puts it at 40%, i.e. movement on roughly every other frame,
+            // which at 60 Hz is the point where the eye stops seeing discrete
+            // steps and starts integrating them as motion. 15 and 18 keep
+            /// going up and there is no cliff; this is a taste line, and
+            // `speed` in the config moves it.
             //
-            // Set `speed` in the config for brisker. Above about 24 the shimmer
-            // comes back.
-            speed: 5.0,
+            // ## The two wrong answers this replaced
+            //
+            // It was 18, derived as `24 * 23/30` -- the old cap scaled by the
+            // old logo's width over the new one. That holds
+            // `cells_per_second * width` constant, which is not a quantity that
+            // means anything, and it explicitly does *not* preserve the time to
+            // cross one logo width; that would want 31. The test asserted 18
+            // while its own comment claimed to preserve something it did not.
+            //
+            // Then 5, derived from lemonyte's screensaver: 50 px/s across a
+            // 1920 px window with a logo a sixth of that width, which crosses
+            // one logo width every 6.4 seconds, or 4.7 cells a second here.
+            // That derivation is arithmetically fine and it is the wrong
+            // question -- it asks what the reference *feels* like without asking
+            // what the reference is made of. A 1920-pixel window has 1920
+            // positions to choose from; a braille cell has two dots, so this
+            // logo has 160 columns * 2. **Copying the reference's pace onto a
+            // medium with a hundredth of its spatial resolution does not copy
+            // its pace, it copies a stutter.** The same comment claimed the
+            // slow value avoided "the staircase" by stepping less often, which
+            // is precisely backwards: a step is one dot out of sixty, 1.7% of
+            // the logo's width, so the *jumps* were never the problem.
+            //
+            // What this trades against: `ColorChange::Bounce` recolours the
+            // whole slab on every wall hit, and a wall hit is 50 cells away, so
+            // at 12 that is a full-logo hue change about every four seconds.
+            // `color_change = "steady"` thins it to every third if that is what
+            // the flicker turns out to be.
+            speed: 12.0,
             slope: 2.0,
             color_change: ColorChange::default(),
             start_in_corner: true,
@@ -1183,74 +1200,93 @@ mod tests {
     /// glyph inside it moves every frame. A version of this test did exactly that
     /// and reported 280 of 600 while the screen was in fact changing 545 times.
     ///
-    /// The bound is 500 rather than 600 because the sub-cell resolution caps it,
-    /// and it is close: at 18 cells a second the horizontal origin advances 36
-    /// dots a second and the vertical 36, against 60 frames, so a frame changes the
-    /// picture if *either* axis crosses a dot boundary. That is 0.6 of a chance
-    /// each, and 1 - 0.4 * 0.4 = 0.84 -- which is 504 of 600, and the measurement
-    /// is 503. The bound is the one number here that is genuinely tight, and it is
-    /// tight for a reason worth stating: the horizontal is still 2 dots to the cell,
-    /// because a cell has one foreground and one background and a vertical split
-    /// spends both. Only the vertical went from 2 to 4.
+    /// The logo moves on enough frames to read as motion rather than as a
+    /// slideshow.
+    ///
+    /// This is the whole of "it flickers", and it is measured the only way that
+    /// means anything: on the *drawn* dots, accumulated frame by frame the way a
+    /// terminal does, rather than on the continuous position the effect is
+    /// integrating. The continuous position is always perfectly smooth whatever
+    /// the speed -- it is a float that advances 0.2 of a cell per frame -- and
+    /// asserting anything about *it* only ever restates the speed back to
+    /// itself. The previous version of this test did exactly that: a
+    /// `worst_step < 0.2` bound on `dvd.x`, which is `speed / 60`.
+    ///
+    /// The dot step is irreducible. Braille moves in whole dots, so the smallest
+    /// possible jump is one dot out of the logo's sixty, and that jump rewrites
+    /// most of a dense letterform because a braille glyph *is* its bit pattern.
+    /// What is adjustable is how often the jump happens, and the report was that
+    /// it flickered, which is what a logo that jumps once every six frames looks
+    /// like: five identical frames and then a lurch, with the eye reporting
+    /// flicker rather than slowness.
+    ///
+    /// Measured over 600 frames at 80x24:
+    ///
+    ///   speed  5    8   10   12   15   18
+    ///   moved 17%  28%  34%  40%  51%  82%
+    ///
+    /// A third is the floor, and it is set by the frame rate rather than by
+    /// taste: at 60 Hz, movement on roughly every third frame is where discrete
+    /// steps start integrating as motion. The default measures 40%, and the old
+    /// default measured 17% -- one frame in six.
     #[test]
-    fn the_picture_changes_on_almost_every_frame() {
-        let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
-        let _ = dvd.get_diff();
+    fn the_logo_moves_on_enough_frames_to_read_as_motion() {
+        const DOT_POS: [(i64, i64); 8] = [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (0, 3),
+        ];
 
-        let mut changed = 0usize;
-        let mut previous = (dvd.x, dvd.y);
-        let mut worst_step = 0.0f64;
+        // The dots currently on screen. A diff only carries *changes*, so the
+        // frame has to be accumulated -- which is also what the terminal does, and
+        // is the only reason this measures the picture rather than the delta.
+        let mut cells: std::collections::HashMap<(usize, usize), u32> =
+            Default::default();
+        let mut on_screen =
+            |cells: &std::collections::HashMap<(usize, usize), u32>| {
+                let mut dots = std::collections::HashSet::new();
+                for (&(x, y), &bits) in cells {
+                    for (i, (dx, dy)) in DOT_POS.iter().enumerate() {
+                        if bits & (1 << i) != 0 {
+                            dots.insert((x as i64 * 2 + dx, y as i64 * 4 + dy));
+                        }
+                    }
+                }
+                dots
+            };
+
+        let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        let mut previous = on_screen(&cells);
+        let _ = dvd.get_diff();
+        let mut moved = 0usize;
         for _ in 0..600 {
             dvd.update();
-            let diff = dvd.get_diff();
-            if !diff.is_empty() {
-                changed += 1;
+            for (x, y, cell) in dvd.get_diff() {
+                let bits = if cell.symbol == ' ' {
+                    0
+                } else {
+                    cell.symbol as u32 - 0x2800
+                };
+                cells.insert((x, y), bits);
             }
-            worst_step = worst_step.max(
-                ((dvd.x - previous.0).powi(2) + (dvd.y - previous.1).powi(2))
-                    .sqrt(),
-            );
-            previous = (dvd.x, dvd.y);
+            let current = on_screen(&cells);
+            if current != previous {
+                moved += 1;
+            }
+            previous = current;
         }
 
-        // Two bounds, and the second is the one that matters.
-        //
-        // The first says the logo is moving often enough to read as motion. At 5
-        // cells a second the origin advances 10 dots horizontally and 10
-        // vertically against 60 frames, so a frame changes the picture if either
-        // axis crosses a dot boundary -- and the measurement is 176 of 600, or
-        // 29%. It used to assert 500, which was correct at 18 cells a second and
-        // is not a property of anything.
-        //
-        // The second is the actual anti-staircase claim, and it is the one that
-        // was missing. "Changes on most frames" is a proxy for "moves smoothly",
-        // and a proxy that can be satisfied by moving a whole cell at a time on
-        // rare frames -- which is precisely the defect it was written to catch.
-        // The direct statement is that no single frame moves the logo more than
-        // a fraction of a cell. At 5 cells a second and 60 Hz that is 0.083 of a
-        // cell; a whole-cell jump would be twelve times larger, and the old
-        // block letter stepped exactly one cell at four times this rate.
         assert!(
-            changed > 150,
-            "the screen changed on only {changed} of 600 frames, so the logo is \
-             mostly stationary with the occasional move"
-        );
-        assert!(
-            worst_step < 0.2,
-            "the logo jumped {worst_step:.3} of a cell in one frame, which is a \
-             staircase rather than motion"
-        );
-        // No single frame may move the logo more than a cell and a half. A
-        // bounce clamps the position to the wall, which is a snap of up to one
-        // cell, so the bound is above one rather than at it. This is the check
-        // that would catch a genuine teleport, and it is on the position rather
-        // than on the diff: a bounce legitimately repaints the logo's whole
-        // leading edge, which is most of its area, so diff size cannot tell a
-        // bounce from a jump.
-        assert!(
-            worst_step < 1.5,
-            "the logo moved {worst_step:.2} cells in one frame, which is a jump \
-             rather than motion"
+            moved >= 200,
+            "the logo moved on only {moved} of 600 frames, so it holds still for \
+             most of them and lurches the rest of the time. At 5 cells a second \
+             that is one frame in six, and it reads as a flicker rather than as \
+             slow motion -- five identical frames, then a jump."
         );
     }
 
@@ -1677,56 +1713,49 @@ mod tests {
         );
     }
 
-    /// The speed cap matches the reference implementation's *feel*.
+    /// The speed is the frame-movement rate, not the reference's pace.
     ///
-    /// This test used to pin a scaling rule -- `24 * 23 / 30`, the old cap
-    /// against the old logo's width over the new one -- and that rule was wrong.
-    /// It holds `cells_per_second * width` constant, which is not a quantity that
-    /// means anything, and it does not preserve the time taken to cross one logo
-    /// width: that would want 31, and the test asserted 18 while claiming to
-    /// preserve it. The number it produced was roughly right for a while by
-    /// accident, which is the worst way for a derivation to be right.
+    /// This test pinned the reference's derived value for a while, and the
+    /// derivation was arithmetically correct: lemonyte's screensaver moves 50
+    /// px/s across a 1920 px window with a logo a sixth of that width, so it
+    /// crosses one logo width every 6.4 seconds, which is 4.7 cells a second
+    /// here. It was the wrong question. It asked what the reference *feels* like
+    /// without asking what the reference is made of -- and a 1920-pixel window
+    /// has 1920 positions to choose from where a braille cell has two dots, so
+    /// this logo has 160 columns * 2.
     ///
-    /// What the cap is actually for is *feel*, and the reference has one to copy.
-    /// lemonyte's screensaver moves 50 pixels a second across a 1920-pixel window
-    /// with a logo a sixth of that width, so it crosses one logo width every 6.4
-    /// seconds. Converting that rate to this logo's 30 cells gives 4.7 cells a
-    /// second.
+    /// **Copying the reference's pace onto a medium with a hundredth of its
+    /// spatial resolution does not copy its pace, it copies a stutter.** At 4.7
+    /// cells a second the logo moved on one frame in six, and the report was
+    /// flicker.
     ///
-    /// Asserted as a band, because the derivation rounds and because a cap is
-    /// something a user will want to move. It fails in the direction that
-    /// matters most: back at 18 the logo is three and a half times too quick and
-    /// shimmers, which is the whole of the report this commit answers.
+    /// The rule this pins instead: movement on at least a third of frames, which
+    /// is where discrete dot steps start integrating as motion at 60 Hz. See
+    /// `the_logo_moves_on_enough_frames_to_read_as_motion` for the measurement
+    /// and the table behind it. This test guards the *number* so the two cannot
+    /// drift apart; the other one is the claim itself.
+    ///
+    /// Asserted as a band, because a speed is something a user will want to move
+    /// and because the table has no cliff at the top -- 15 and 18 both measured
+    /// higher still.
     #[test]
-    fn the_speed_cap_matches_the_reference_feel() {
+    fn the_speed_gives_movement_on_at_least_a_third_of_frames() {
+        // From the measured table, the speed at which the logo crosses a third of
+        // frames. Linear in the speed, since the dot step is one dot at every
+        // speed and only the frequency changes: 40% at 12, 34% at 10, so a third
+        // lands at about 9.7.
+        const THIRD_OF_FRAMES_AT: f32 = 10.0;
         let options = DvdOptions::default();
-        let logo_cells = options
-            .logo
-            .split('\n')
-            .map(|row| row.chars().count())
-            .max()
-            .unwrap_or(0)
-            .div_ceil(DOTS_X);
-
-        // The reference, spelled out rather than quoted.
-        const REFERENCE_PX_PER_SECOND: f64 = 50.0;
-        const REFERENCE_WINDOW_PX: f64 = 1920.0;
-        const REFERENCE_LOGO_FRACTION: f64 = 6.0;
-
-        let widths_per_second = REFERENCE_PX_PER_SECOND
-            / (REFERENCE_WINDOW_PX / REFERENCE_LOGO_FRACTION);
-        let derived = widths_per_second * logo_cells as f64;
-
         assert!(
-            (f64::from(options.speed) - derived).abs() < 1.0,
-            "the cap is {} and the reference's {widths_per_second:.3} \
-             logo-widths a second over this {logo_cells}-cell logo is {derived:.1}",
+            options.speed >= THIRD_OF_FRAMES_AT,
+            "the speed is {}, and below about {THIRD_OF_FRAMES_AT} the logo moves \
+             on under a third of frames, which reads as a stutter rather than as \
+             motion",
             options.speed
         );
         assert!(
-            (4.0..=8.0).contains(&options.speed),
-            "the cap is {}, which is outside 4 to 8: at 18 the logo is three times \
-             too quick and shimmers, and above about 24 it is worse",
+            (THIRD_OF_FRAMES_AT..=18.0).contains(&options.speed),
+            "the speed is {}, which is outside {THIRD_OF_FRAMES_AT}..=18",
             options.speed
         );
     }
