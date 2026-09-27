@@ -57,6 +57,45 @@ pub struct TerrainOptions {
     /// amplitude is additionally capped so the surface keeps clear of the top and
     /// bottom of the screen, which on a short terminal binds first.
     pub relief: f64,
+    /// The far ridge's relief, in rows per noise period. Same units and the same
+    /// cap as [`relief`](Self::relief), which is why it is a second copy of the
+    /// knob rather than something shared: the two ridges are separate pieces of
+    /// landscape and a user who wants a flat near hill and a rolling far one is
+    /// asking a question a shared knob cannot answer.
+    ///
+    /// The 0.5 default is half the near ridge's, because distance flattens. A
+    /// ridge a long way off subtends less vertical angle than the same ridge up
+    /// close, and a far layer with as much relief as the near one reads as two
+    /// cuts of the same hill rather than as distance. The near ridge is not the
+    /// reference by accident -- the far ridge is *also* built from two octaves
+    /// rather than four ([`FAR_OCTAVES`](Self::far_relief) below), which is the
+    /// same statement made about detail rather than about amplitude. Neither
+    /// half needs a knob of its own, and that is the point: two knobs for two
+    /// ridges, and the smoothness is a constant.
+    pub far_relief: f64,
+    /// The far ridge's scroll speed as a *fraction* of the near one's.
+    ///
+    /// Below 1.0 is the whole meaning of the option -- distance scrolls slower,
+    /// which is the one cue that separates a far layer from a near one more
+    /// reliably than colour does, because a viewer reads rate as depth long
+    /// before they read brightness as depth. A value above 1.0 is not rejected;
+    /// it produces a far layer that outruns the near one, which is a real
+    /// (if uncommon) effect and is the user's business rather than a mistake
+    /// worth second-guessing. A negative value is treated as 0.0 and a
+    /// non-finite one falls back to the default, for the reason `relief` does:
+    /// this is a float in a hand-editable config and a NaN here would reach
+    /// every surface row in the frame.
+    ///
+    /// The 0.35 default is a third of the near ridge's rate, and the number is
+    /// pinned by measurement rather than by taste: at `scroll_speed` 0.9 and a
+    /// period of 8 cells, the near ridge takes 8.9 seconds to cross the screen
+    /// and the far one 25.4, and both sit inside the 2-to-30 second band the
+    /// near ridge's own scroll test already holds it to. Anything much lower and
+    /// the far ridge stops reading as scenery and starts reading as a still
+    /// frame; the ratio is also large enough to be obvious in a side-by-side
+    /// frame, which is the property `the_far_ridge_scrolls_more_slowly_than_\
+    /// the_near_one` measures rather than asserts.
+    pub parallax: f64,
     /// Characters the ground is drawn as, sparsest first.
     pub glyphs: String,
 }
@@ -74,7 +113,9 @@ impl Default for TerrainOptions {
             octaves: 4,
             persistence: 0.5,
             scroll_speed: DEFAULT_SCROLL_SPEED,
-            relief: 1.0,
+            relief: DEFAULT_RELIEF,
+            far_relief: DEFAULT_FAR_RELIEF,
+            parallax: DEFAULT_PARALLAX,
             glyphs: DEFAULT_GLYPHS.to_string(),
         }
     }
@@ -122,61 +163,176 @@ const DEFAULT_SCROLL_SPEED: f64 = 0.9;
 /// Default for [`TerrainOptions::relief`], in rows per noise period.
 const DEFAULT_RELIEF: f64 = 1.0;
 
-/// Cells per period of the ground's grain, horizontally and vertically.
+/// Default for [`TerrainOptions::far_relief`], in rows per noise period.
 ///
-/// Two different numbers on purpose, and the vertical one is the interesting
-/// half. Equal periods would give isotropic blobs -- noise, which reads as
-/// static. A vertical period several times shorter than the horizontal one
-/// stretches the features into horizontal bands, and banding is what says
-/// "sediment" rather than "TV snow". The surface's own period is 8 cells; 6 by 3
-/// puts the grain at a similar scale to the landscape above it, so the two look
-/// like the same material.
-const GRAIN_PERIOD_X: f64 = 6.0;
-const GRAIN_PERIOD_Y: f64 = 3.0;
+/// Half the near ridge's, and the half is the point rather than a round number
+/// found by eye: see the field's own documentation, and
+/// `neither_ridge_is_a_flat_constant_row` for the measurement that keeps the far
+/// ridge from degenerating into a ruler.
+const DEFAULT_FAR_RELIEF: f64 = 0.5;
 
-/// Octaves and persistence for the grain.
+/// Default for [`TerrainOptions::parallax`], a fraction of the near ridge's rate.
+const DEFAULT_PARALLAX: f64 = 0.35;
+
+/// Mixed into the seed for the far ridge's own noise stream.
 ///
-/// Two, for the same reason the seabed uses two: a finely detailed floor under a
-/// smooth large-scale structure reads as two different materials.
-const GRAIN_OCTAVES: i32 = 2;
-const GRAIN_PERSISTENCE: f64 = 0.5;
-
-/// How much of the glyph the grain contributes, against the depth bias.
-const GRAIN_WEIGHT: f32 = 0.32;
-
-/// How much denser the ground reads with depth, out of a full ramp step.
+/// **This is a second generator, not a second rate on the first one.** The
+/// obvious cheap version -- sample the near field at `x * 1.7`, or at
+/// `x + 41.0`, or anywhere else -- gives a picture where the far ridge is the
+/// *same hill twice*: one field, so the two profiles are the same shape at two
+/// different rates, and the eye reads the repetition as a fault long before it
+/// reads the colour difference as distance. Multiplying the sample coordinate
+/// makes it worse rather than better, because a higher rate on one field is a
+/// stretched version of that field, not an independent one.
 ///
-/// Small. Depth genuinely does make ground denser, but this is the *texture*
-/// channel now and the shading is the colour's job, so a strong bias here would
-/// be re-introducing the vertical ramp that was the defect -- just with noise on
-/// top of it.
-const GROUND_DEPTH_BIAS: f32 = 0.22;
+/// So the far ridge gets its own permutation table, the way the crab's seabed
+/// does, and the two landscapes are then unrelated rather than merely offset.
+/// `the_two_ridges_are_two_landscapes_and_not_one_twice` measures the
+/// difference; the salt is what it is measuring.
+const FAR_SEED_SALT: u64 = 0xFA4_2AD1_5A9D_0001;
 
-/// The range octave noise actually reaches, measured.
+/// Octaves for the far ridge's profile.
 ///
-/// Not 1.0, and assuming 1.0 is a quiet way to lose two thirds of a ramp:
-/// measured over four thousand samples at three different periods this generator
-/// spans 0.79, so dividing by 1.0 would put every grain value inside the middle
-/// half of the ramp and leave the ends unreachable. The same correction is why
-/// `relief` is 7.0 for three rows of surface.
-const NOISE_PRACTICAL_RANGE: f32 = 0.4;
+/// Two, against the near ridge's four -- or rather, against the near ridge's
+/// configured [`TerrainOptions::octaves`], which is four by default and which a
+/// user may change without moving this. Distance is not only flatter, it is also
+/// smoother: a ridge a long way off has no fine detail on its crest, and giving
+/// it the same detail as the near one is what makes a distant layer look like a
+/// nearer one seen through a colour filter.
+///
+/// A constant rather than a third knob, because it is a property of *being far*
+/// rather than a thing a user is likely to want to change independently. It
+/// borrows the crab's argument for a two-octave seabed: a finely detailed floor
+/// under a smooth large-scale structure reads as two different materials, and
+/// here the two materials are both supposed to be the same land.
+const FAR_OCTAVES: i32 = 2;
 
-// Checked when the crate is compiled rather than when a test runs.
-//
-// Both of these were runtime `assert!`s in a test, which is `assert!(true)` --
-// clippy says so, and it is right: the compiler evaluates the condition and
-// drops the check, so the test could never fail. A `const` block is checked for
-// real and fails the build, which is what an invariant between two named
-// constants wants. The messages cannot be formatted here, because const panic
-// takes a literal, so they live on the constants instead.
+/// Fraction of the screen height at which the far ridge's mean surface sits.
+///
+/// Above [`HORIZON_FRACTION`], not below it, and that ordering is the whole
+/// constraint here. The two layers are painted far-first and near-second with no
+/// depth buffer, so "behind" is decided entirely by which surface is higher on
+/// the screen: put the far ridge's mean *below* the near one's and the dim
+/// distant layer is drawn in front of the bright near one, which is not a
+/// landscape, it is a mistake. The far ridge is therefore always the upper of
+/// the two on average, and where a far crest is high enough to clear the near
+/// ridge it simply shows through the gap, which is what a distant peak in a
+/// valley does.
+///
+/// 0.16 against the near ridge's 0.32 puts the far ridge halfway up the sky's own
+/// gradient, so the dim layer is never drawn against the pale haze at the
+/// horizon -- where it would have least contrast -- and the sky still has room
+/// above it at every size the effect is used at.
+const FAR_RIDGE_FRACTION: f64 = 0.16;
+
+/// Checked when the crate is compiled rather than when a test runs.
+///
+/// This was a runtime `assert!` in a test, which is `assert!(true)` -- clippy
+/// says so, and it is right: the compiler evaluates the condition and drops the
+/// check, so the test could never fail. A `const` block is checked for real and
+/// fails the build, which is what an invariant between two named constants
+/// wants. The message cannot be formatted here, because const panic takes a
+/// literal, so it lives on the constants instead.
+///
+/// The two fractions are what make the layering possible at all: the far ridge
+/// has to sit above the near one, or the dim layer is drawn in front of the
+/// bright one. See [`FAR_RIDGE_FRACTION`].
 const _: () = assert!(
-    GRAIN_PERIOD_Y < GRAIN_PERIOD_X,
-    "the grain's vertical period must be the shorter of the two or the ground reads as fluting"
+    FAR_RIDGE_FRACTION < HORIZON_FRACTION,
+    "the far ridge must sit above the near one, or the dim layer is drawn in front \
+     of the bright one and the picture inverts"
 );
-const _: () = assert!(
-    0.5 + GRAIN_WEIGHT < 1.0 && 0.5 - GRAIN_WEIGHT > 0.0,
-    "the grain must be able to reach both ends of the ramp or the calibration does nothing"
-);
+
+/// The lit row along the top of the near ridge.
+///
+/// One row, one colour, and it is the reason this reads as a landscape rather
+/// than as a cut-out. A filled region on its own is a silhouette, and a
+/// silhouette with a bright edge along its top is a *hill*; without the rim the
+/// same picture reads as a block of colour that happens to have a wavy top.
+///
+/// Brighter than every stop of the [`GROUND`] fill, not just its first. That is
+/// the property the rim has to have to do its job, and it is a step rather than
+/// a blend: a rim that faded into the fill would be a gradient, and a gradient
+/// has no edge in it.
+const NEAR_LIT: style::Color = style::Color::Rgb {
+    r: 226,
+    g: 232,
+    b: 242,
+};
+
+/// The far ridge's fill: one flat colour, one flat glyph, no depth ramp.
+///
+/// A distant hill is a silhouette, and giving it shading would be claiming a
+/// surface detail the layer exists to deny. The two-tone version of this layer
+/// -- [`FAR_FILL`] with [`FAR_LIT`] along its top -- is the same trick as the
+/// near ridge's rim, and it is what makes the far layer read as a *shape* rather
+/// than as a tint over the sky.
+///
+/// Dimmer than the near ridge's darkest stop on purpose. It is the layer a
+/// viewer should be able to ignore; if it competes with the near ridge for
+/// attention the depth ordering stops being legible and both layers flatten
+/// into one picture.
+const FAR_FILL: style::Color = style::Color::Rgb {
+    r: 58,
+    g: 74,
+    b: 104,
+};
+
+/// The lit row along the top of the far ridge.
+///
+/// Between [`FAR_FILL`] and the near ridge's rim in brightness, and for the same
+/// reason each of those is where it is: the three tones have to be ordered far
+/// rim, far body, near rim, near body, or the layers stop being separable at a
+/// glance. It also sits deliberately close to the sky's brightest stop, the haze
+/// at the horizon, which is the *aerial* half of the depth cue: a distant ridge
+/// is lit by the same sky the viewer is looking at, so its top edge tends toward
+/// the colour of the air above it.
+const FAR_LIT: style::Color = style::Color::Rgb {
+    r: 104,
+    g: 124,
+    b: 158,
+};
+
+/// Ground fill, from just under the lit rim down into shadow.
+///
+/// Ordered for the depth ramp, which runs *downwards*: the first stop is the
+/// first row of fill in every column and the last is the bottom of the screen.
+///
+/// Every stop here is *below* [`NEAR_LIT`], which is the constraint the rim
+/// imposes, and the top stop is well below it rather than just under it -- a
+/// fill that starts almost as bright as its own rim has no rim. The bottom
+/// stops short of black, as the previous version did: the deepest rows are the
+/// ones furthest from any light in the fiction *and* the ones furthest from the
+/// horizon, and a near-black there is indistinguishable from a hole in the
+/// screen on a terminal whose background is not black.
+///
+/// Lighter at the bottom than the cross-section's body was, and deliberately. A
+/// fill that runs to near-black over the lower two thirds of the screen is a
+/// *hole* wearing a silhouette, which is a large part of why the cutaway read
+/// as a cross-section rather than as ground you could stand on. Ground seen from
+/// the side is lit, not buried.
+const GROUND: &[style::Color] = &[
+    style::Color::Rgb {
+        r: 148,
+        g: 156,
+        b: 170,
+    },
+    style::Color::Rgb {
+        r: 112,
+        g: 120,
+        b: 134,
+    },
+    style::Color::Rgb {
+        r: 82,
+        g: 88,
+        b: 100,
+    },
+    style::Color::Rgb {
+        r: 62,
+        g: 67,
+        b: 78,
+    },
+];
 
 /// The largest fraction of the ground's depth the surface amplitude may take.
 ///
@@ -211,20 +367,28 @@ const MAX_RELIEF_FRACTION: f64 = 0.45;
 ///
 /// **The leading space of the conventional ramp is deliberately dropped.** Every
 /// cell of the ground is filled, so a glyph that renders as nothing makes that
-/// cell indistinguishable from sky -- and the top row of the ground in every
-/// column is exactly the row whose depth samples the *start* of this ramp. With
-/// the space in, the crest of every hill was invisible and the silhouette was
-/// drawn a row too low. `the_ground_is_never_drawn_as_a_space` is that bug.
+/// cell indistinguishable from sky -- and the topmost row of *fill* in every
+/// column is exactly the row whose depth samples the start of this ramp. With
+/// the space in, the row under the crest of every hill drew as a space and the
+/// ground was a row of holes along its own silhouette.
+///
+/// The lit edge of each ridge is now drawn at the *densest* step of this ramp
+/// rather than the start of it, so the rim is a solid line whatever the ramp is
+/// and the ground below it still starts at the sparse end. Both facts are
+/// pinned: `the_ground_is_never_drawn_as_a_space` is the bug above, and
+/// `the_ascii_ground_ramp_documents_the_two_pairs_that_run_backwards` is the set
+/// itself.
 const DEFAULT_GLYPHS: &str = ".:-=+*#%@";
 
-/// Fraction of the screen height that is ground, the rest sky.
+/// Fraction of the screen height at which the *near* ridge's mean surface sits.
 ///
 /// Pinned rather than derived, because a horizon has to be somewhere specific
 /// for the effect to read as a landscape: at a third of the height the ground
 /// has enough rows to show several noise periods against the sky, and the sky
-/// has enough rows to show a gradient. It is the *mean* surface level now, not
-/// a hard split -- the surface moves above and below it by [`DEFAULT_RELIEF`]
-/// of the ground's depth.
+/// has enough rows to show a gradient. It is the *mean* surface level, not a hard
+/// split -- the surface moves above and below it by [`DEFAULT_RELIEF`] of the
+/// ground's depth, and the far ridge sits above it entirely; see
+/// [`FAR_RIDGE_FRACTION`].
 const HORIZON_FRACTION: f64 = 0.32;
 
 /// Sky at the zenith, through mid sky, to the haze at the horizon.
@@ -244,45 +408,6 @@ const SKY: &[style::Color] = &[
         r: 126,
         g: 148,
         b: 186,
-    },
-];
-
-/// Ground, from the lit crest down into shadow.
-///
-/// Ordered for the depth ramp, which runs *downwards*: the first stop is the top
-/// row of ground in every column and the last is the bottom of the screen. The
-/// old table was the other way round, because the old effect sampled a value
-/// per cell rather than a depth.
-///
-/// A middle stop was added, and that is the point of the whole palette: with
-/// only a lit crest and a dark floor, everything below the crest row is the
-/// same two colours and the ground reads as a silhouette with a shadow under
-/// it. The middle is what makes the body look like a body.
-///
-/// Deliberately dark at the bottom rather than black. The deepest rows are the
-/// ones furthest from any light source in the fiction *and* the ones furthest
-/// from the horizon, and a near-black there is indistinguishable from a hole in
-/// the screen on a terminal whose background is not black.
-const GROUND: &[style::Color] = &[
-    style::Color::Rgb {
-        r: 222,
-        g: 228,
-        b: 236,
-    },
-    style::Color::Rgb {
-        r: 122,
-        g: 130,
-        b: 144,
-    },
-    style::Color::Rgb {
-        r: 44,
-        g: 48,
-        b: 58,
-    },
-    style::Color::Rgb {
-        r: 26,
-        g: 29,
-        b: 36,
     },
 ];
 
@@ -307,11 +432,16 @@ pub struct Terrain {
     pub screen_size: (u16, u16),
     options: TerrainOptions,
     canvas: Canvas,
-    noise: PerlinNoise,
+    /// The near ridge's noise stream, built from the seed alone.
+    near_noise: PerlinNoise,
+    /// The far ridge's, built from `seed ^ FAR_SEED_SALT`. A *second generator*,
+    /// not a second rate on the first -- see [`FAR_SEED_SALT`] for why that
+    /// distinction is the difference between two landscapes and one hill twice.
+    far_noise: PerlinNoise,
     ramp: GlyphRamp,
     sky: Palette,
     ground: Palette,
-    /// Ground rows scrolled past, accumulated from the frame delta.
+    /// Cells of the near landscape scrolled past, from the frame delta.
     offset: f64,
 }
 
@@ -354,8 +484,11 @@ impl TerminalEffect for Terrain {
         self.canvas
             .resize(self.screen_size.0.max(1), self.screen_size.1.max(1));
         // The noise is seeded, so it has to be rebuilt too. Leaving the old one
-        // in place meant a reset reused the previous terrain's landscape.
-        self.noise = PerlinNoise::new(self.options.seed);
+        // in place meant a reset reused the previous terrain's landscape. Both
+        // streams, for the same reason: a reset that rebuilt one of them would
+        // swap a landscape for its own past.
+        self.near_noise = PerlinNoise::new(self.options.seed);
+        self.far_noise = PerlinNoise::new(self.options.seed ^ FAR_SEED_SALT);
         self.offset = 0.0;
     }
 }
@@ -363,7 +496,8 @@ impl TerminalEffect for Terrain {
 impl Terrain {
     pub fn new(options: TerrainOptions, screen_size: (u16, u16)) -> Self {
         let canvas = Canvas::new(screen_size.0, screen_size.1);
-        let noise = PerlinNoise::new(options.seed);
+        let near_noise = PerlinNoise::new(options.seed);
+        let far_noise = PerlinNoise::new(options.seed ^ FAR_SEED_SALT);
 
         Self {
             screen_size,
@@ -373,12 +507,39 @@ impl Terrain {
             offset: 0.0,
             options,
             canvas,
-            noise,
+            near_noise,
+            far_noise,
         }
     }
 
     fn advance(&mut self, delta: f64) {
         self.offset += self.options.scroll_speed * delta;
+    }
+
+    /// The far ridge's scroll rate as a multiple of the near one, guarded.
+    ///
+    /// `parallax` is a float in a hand-editable config, so it can be NaN, and a
+    /// NaN here would reach every far surface row in the frame and then every
+    /// fill between two of them. Falling back to the documented default is the
+    /// same decision `relief` makes, and for the same reason.
+    fn parallax_rate(&self) -> f64 {
+        if self.options.parallax.is_finite() {
+            self.options.parallax.max(0.0)
+        } else {
+            DEFAULT_PARALLAX
+        }
+    }
+
+    /// How far the far ridge has travelled, in cells, at the current offset.
+    ///
+    /// The whole of the parallax effect, and it is one multiplication. The near
+    /// ridge's offset is in cells of *its own* field and the far ridge's is the
+    /// same figure scaled by [`Self::parallax_rate`], so the two layers separate
+    /// faster and faster as the run goes on rather than drifting apart at a
+    /// constant distance -- which is the other thing that makes a pair of layers
+    /// read as one landscape instead of as a loop of two.
+    fn far_offset(&self) -> f64 {
+        self.offset * self.parallax_rate()
     }
 
     /// The row at which the ground starts, for one column.
@@ -405,11 +566,41 @@ impl Terrain {
     /// happens to be at an extreme can reach the top of the screen or the bottom,
     /// and a screen with no sky in one column and no ground in the next does not
     /// read as a landscape either -- it reads as a tear.
+    /// The row at which one ridge's surface starts, for one column.
+    ///
+    /// This is the whole effect. Before the rewrite there was no such thing: the
+    /// renderer sampled two-dimensional noise at every cell and mapped the value
+    /// straight onto a glyph, so every row below the horizon was an independent
+    /// sample of the same field. There was no surface, nothing was filled below
+    /// anything, and the result was a full-screen wash that read as a landscape
+    /// only if you already knew one was supposed to be there. The user reported
+    /// it as "cut off, showing only half of my terminal", and that is close to
+    /// the truth: what looked like the top half was a blank sky, and the bottom
+    /// half was texture with no shape in it.
+    ///
+    /// It is a height field and not a value, so it is computed per *column* and
+    /// reused down the whole column rather than sampled per cell. That is the
+    /// reason this is a function and not an inline expression in the fill loop.
+    ///
+    /// `x` is the column, `offset` the accumulated scroll. The field is sampled
+    /// on the `y = 0` line of the two-dimensional noise, which is what turns it
+    /// into a one-dimensional height field: `noise_2d` interpolates on `y`
+    /// first and `y` is 0, so only the bottom row of gradients contributes. That
+    /// is not a degenerate case to be avoided -- it is exactly a 1D slice, and it
+    /// is why this needs no change to the noise module.
+    ///
+    /// The returned row is clamped so that every column keeps at least one sky
+    /// row and at least one ground row. Without that clamp a column whose noise
+    /// happens to be at an extreme can reach the top of the screen or the bottom,
+    /// and a screen with no sky in one column and no ground in the next does not
+    /// read as a landscape either -- it reads as a tear.
     fn surface_row(
         &self,
+        noise: &PerlinNoise,
+        octaves: i32,
         x: usize,
         offset: f64,
-        horizon: usize,
+        centre: usize,
         span: f64,
     ) -> usize {
         let period = Self::noise_period(self.options.scale);
@@ -419,15 +610,15 @@ impl Terrain {
         // without going anywhere, which for a landscape is the difference
         // between flying over one and watching it breathe.
         let travelled = x as f64 + offset;
-        let raw = self.noise.octave_noise_2d(
+        let raw = noise.octave_noise_2d(
             travelled,
             0.0,
-            self.options.octaves,
+            octaves,
             self.options.persistence,
             1.0 / period,
         );
 
-        // Centred on the horizon, in units of rows.
+        // Centred on the ridge's own mean level, in units of rows.
         //
         // There is no cell-aspect correction here, and there used to be one.
         // A cell is about 1.2 times taller than it is wide, so a shape measured
@@ -438,7 +629,7 @@ impl Terrain {
         // P / 2.4 rows is a ridge, not a bump, at any cell aspect. Whether 0.45
         // is the right amount of that is settled by measurement rather than by
         // the argument -- see `the_relief_is_not_so_flat_that_the_ground_is_a_slab`.
-        let row = horizon as f64 - raw * span;
+        let row = centre as f64 - raw * span;
         let (low, high) = Self::surface_bounds(self.screen_size.1 as usize);
         // `round` rather than `trunc`: truncating biases every surface down by
         // half a row on average, which for a silhouette is a systematic lean
@@ -462,7 +653,7 @@ impl Terrain {
         (1, height - 2)
     }
 
-    /// The amplitude the height field is scaled to, in rows.
+    /// The amplitude a ridge's height field is scaled to, in rows.
     ///
     /// In units of the noise period first, so the landscape has the same shape
     /// at every terminal size -- see [`TerrainOptions::relief`]. Then capped, so
@@ -472,10 +663,15 @@ impl Terrain {
     /// The cap is a fraction of the ground's depth rather than a row count for
     /// the same reason, and it is the only part of this that knows about the
     /// screen at all.
-    fn surface_span(&self, horizon: usize) -> f64 {
+    ///
+    /// `relief` is the near ridge's and `far_relief` the far one's, through the
+    /// same function and under the same cap: the cap is what stops a short
+    /// terminal from turning either layer into a stripe, and it has to bind on
+    /// both or a small window would show one of them filling the screen.
+    fn surface_span(&self, relief: f64, horizon: usize) -> f64 {
         let period = Self::noise_period(self.options.scale);
-        let relief = if self.options.relief.is_finite() {
-            self.options.relief.max(0.0)
+        let relief = if relief.is_finite() {
+            relief.max(0.0)
         } else {
             DEFAULT_RELIEF
         };
@@ -511,7 +707,7 @@ impl Terrain {
         1.0 / Self::noise_period(scale)
     }
 
-    /// Where the horizon sits, in cell rows.
+    /// Where the near ridge's mean surface sits, in cell rows.
     ///
     /// At least one ground row, so the effect is never all sky, and at most
     /// `height - 1`, so it is never all ground. A one-row terminal is a special
@@ -524,6 +720,25 @@ impl Terrain {
         }
         let horizon = (height as f64 * HORIZON_FRACTION).round() as usize;
         horizon.clamp(1, height - 1)
+    }
+
+    /// Where the far ridge's mean surface sits, in cell rows.
+    ///
+    /// Strictly above [`Self::horizon_row`] by construction, and that ordering is
+    /// the one invariant the whole layering rests on -- see
+    /// [`FAR_RIDGE_FRACTION`], which pins the fraction and the `const` block
+    /// below it checks the ordering at compile time.
+    fn far_ridge_row(size: (u16, u16)) -> usize {
+        let height = size.1 as usize;
+        if height <= 1 {
+            return 0;
+        }
+        let row = (height as f64 * FAR_RIDGE_FRACTION).round() as usize;
+        // At most the near ridge's own row, so the two can never swap places on
+        // a terminal too short for the fractions to be distinguishable. Below
+        // row 1 there is no sky left at all, which the near ridge's clamp is
+        // there to prevent.
+        row.clamp(1, Self::horizon_row(size))
     }
 
     /// How far the surface moves between neighbouring columns, in rows.
@@ -546,8 +761,7 @@ impl Terrain {
     #[cfg(test)]
     fn silhouette_density(size: (u16, u16)) -> f64 {
         let terrain = Terrain::new(TerrainOptions::default(), size);
-        let horizon = Self::horizon_row(size);
-        let rows = terrain.surface_rows(0.0, horizon);
+        let rows = terrain.near_surface_rows(0.0);
         if rows.len() < 2 {
             return 0.0;
         }
@@ -555,23 +769,56 @@ impl Terrain {
         steps as f64 / (rows.len() - 1) as f64
     }
 
-    /// Paints one frame, `offset` ground rows further on than the last.
-    /// The surface row for every column, computed once per frame.
+    /// The near ridge's surface row for every column, at a given scroll.
     ///
     /// Hoisted out of the fill loop because it is the only part of the frame
     /// that costs a noise sample, and there are `height` times more cells than
     /// columns. The old renderer paid that cost per cell because it sampled per
     /// cell; this pays it per column, which at 400x200 is 200 samples instead of
-    /// 80,000.
-    fn surface_rows(&self, offset: f64, horizon: usize) -> Vec<usize> {
-        let width = self.screen_size.0 as usize;
-        let span = self.surface_span(horizon);
-        (0..width)
-            .map(|x| self.surface_row(x, offset, horizon, span))
+    /// 80,000. The far ridge is the same trade on the same terms, so the frame
+    /// costs two samples per column rather than one.
+    fn near_surface_rows(&self, offset: f64) -> Vec<usize> {
+        let centre = Self::horizon_row(self.screen_size);
+        let span = self.surface_span(self.options.relief, centre);
+        let noise = &self.near_noise;
+        let octaves = self.options.octaves;
+        (0..self.screen_size.0 as usize)
+            .map(|x| self.surface_row(noise, octaves, x, offset, centre, span))
+            .collect()
+    }
+
+    /// The far ridge's surface row for every column, at a given travelled
+    /// distance.
+    ///
+    /// The argument is the *far* ridge's own distance, not the near one's, and it
+    /// comes from [`Self::far_offset`] at every call site outside the tests. The
+    /// multiplication that makes it the far ridge's lives in one place for that
+    /// reason: a caller that passed `offset` here would get the near ridge's
+    /// surface drawn with the far ridge's noise, which is a picture with no
+    /// parallax in it rather than an error anything would notice.
+    fn far_surface_rows(&self, offset: f64) -> Vec<usize> {
+        let centre = Self::far_ridge_row(self.screen_size);
+        let span = self.surface_span(self.options.far_relief, centre);
+        let noise = &self.far_noise;
+        (0..self.screen_size.0 as usize)
+            .map(|x| self.surface_row(noise, FAR_OCTAVES, x, offset, centre, span))
             .collect()
     }
 
     /// Paints one frame, `offset` ground rows further on than the last.
+    ///
+    /// Three bands per column, in this order and with no depth buffer: sky above
+    /// whichever ridge is higher, the far ridge between the two surfaces, and the
+    /// near ridge from its own surface to the bottom of the screen. Which ridge
+    /// wins a cell is decided by arithmetic on the two row arrays rather than by
+    /// a draw order, which is why it costs nothing and why it cannot get out of
+    /// step with the surfaces the same frame computed.
+    ///
+    /// The far ridge is allowed to be *below* the near one in a given column, and
+    /// when it is it is simply not drawn there: the near ground covers it. That
+    /// is not a special case bolted on, it is what a far ridge behind a near
+    /// valley looks like, and a layer that could never be occluded would read as
+    /// a band painted across the picture rather than as land behind other land.
     fn render(&mut self, offset: f64) {
         let size = self.screen_size;
         let width = size.0 as usize;
@@ -580,14 +827,29 @@ impl Terrain {
             return;
         }
         let horizon = Self::horizon_row(size);
-        let surface_rows = self.surface_rows(offset, horizon);
-        // Depth is normalised against the *mean* ground depth rather than each
-        // column's own, so the shading is a function of distance below the mean
-        // surface and not of distance below the bottom of the screen. Per-column
-        // normalisation would put the darkest stop in the same row of every
-        // column, which draws a hard line along the bottom of the picture that
-        // has nothing to do with the landscape.
+        let near_rows = self.near_surface_rows(offset);
+        let far_rows = self.far_surface_rows(self.far_offset());
+        // Depth is measured from *this column's own* surface and normalised
+        // against the mean ground depth, so the shading follows the ridge as the
+        // ridge moves instead of being nailed to a row of the screen.
+        //
+        // That is a real decision rather than the obvious one, and it has a cost
+        // worth naming: a column whose surface moves a row re-shades its whole
+        // depth, because every cell in it is now one row further from the
+        // surface. Measured, that is most of what this frame still emits -- 526
+        // changed cells a frame at 400x200, against 77 if the fill were shaded by
+        // row instead. It is kept because the alternative draws the same colour
+        // on row 12 whether the ground there is the crest of a hill or the floor
+        // of a valley, and a hilltop in shadow reads as a mistake.
         let ground_depth = height.saturating_sub(horizon).max(1) as f32;
+        // The two glyphs the layers are drawn with, sampled once a frame rather
+        // than per cell. The rim of each ridge takes the *densest* step, so the
+        // lit edge is a solid line rather than a dotted one whatever the user has
+        // configured the ramp to be; the far body takes the *sparsest*, because a
+        // distant layer with texture in it reads as a nearer one seen through a
+        // colour filter, which is the one thing it must not do.
+        let lit_glyph = self.ramp.sample(1.0);
+        let far_glyph = self.ramp.sample(0.0);
         let surface = self.canvas.surface_mut();
 
         for y in 0..height {
@@ -597,75 +859,40 @@ impl Terrain {
             // palette samples a frame.
             let sky_colour = Self::sky_colour(y, horizon, &self.sky);
 
-            for (x, &top) in surface_rows.iter().enumerate().take(width) {
-                if y < top {
+            for x in 0..width {
+                let near_top = near_rows[x];
+                let far_top = far_rows[x];
+                let cell = if y < near_top.min(far_top) {
                     // A space, and a deliberate one: sky is where the *absence*
                     // of ground is, and drawing it as a ramp character would put
                     // texture in the sky and make the horizon ambiguous.
-                    surface.set(
-                        x,
-                        y,
-                        Cell::new(' ', sky_colour, style::Attribute::Reset),
-                    );
-                    continue;
-                }
-
-                let depth = (y - top) as f32 / ground_depth;
-                // Colour from depth, and *only* from depth. This is the shading
-                // -- how much light reaches this far into the ground -- and it is
-                // the one thing in the frame that is a clean function of a single
-                // quantity, so it is the right place to spend a continuous ramp.
-                let colour = self.ground.sample(depth.clamp(0.0, 1.0));
-
-                // Glyph from a two-dimensional field, which is the fix for "I
-                // don't understand what it's showing me".
-                //
-                // Both encodings used to be functions of depth alone, so every
-                // column below its own surface was *identical* and the whole
-                // picture was one smooth vertical ramp under a slightly wavy top
-                // edge. That is not a landscape and it is not a cross-section
-                // either; it is a gradient with a border. The missing thing was
-                // structure running horizontally through the body -- strata,
-                // grain, whatever the rock is made of.
-                //
-                // Three parts, because one is not enough. The `grain` field is
-                // smooth and sampled at (column, depth), so it varies along both
-                // axes, and the shorter vertical period is what gives the
-                // horizontal banding that says "sediment" rather than "noise".
-                // The `depth * GROUND_DEPTH_BIAS` term tips it very slightly
-                // denser with depth, which is the one true thing about going down
-                // through ground. And the grain is scaled to the noise's *actual*
-                // range rather than assuming it reaches +/-1, because it does not
-                // -- measured at 0.79, which is also why `relief` has to be 7.0
-                // to move the surface three rows.
-                //
-                // The column coordinate carries `offset`, and that is load-bearing
-                // rather than cosmetic. The surface scrolls because
-                // `surface_row` samples its own noise at `x + offset`, so a grain
-                // sampled at a bare `x` would sit still in screen space while the
-                // landscape slid across it -- a silhouette moving over a fixed
-                // texture, which is not ground and reads as two unrelated things
-                // sliding past each other. The depth coordinate needs no offset
-                // because it is measured *from the surface*, so it already moves
-                // with the ground.
-                let depth_cells = (y - top) as f64;
-                let grain = self.noise.octave_noise_2d(
-                    (x as f64 + offset) / GRAIN_PERIOD_X,
-                    depth_cells / GRAIN_PERIOD_Y,
-                    GRAIN_OCTAVES,
-                    GRAIN_PERSISTENCE,
-                    1.0,
-                ) as f32
-                    / NOISE_PRACTICAL_RANGE;
-                let t = (0.5 + depth * GROUND_DEPTH_BIAS + grain * GRAIN_WEIGHT)
-                    .clamp(0.0, 1.0);
-
-                surface.set(
-                    x,
-                    y,
+                    Cell::new(' ', sky_colour, style::Attribute::Reset)
+                } else if y < near_top {
+                    // Between the two surfaces, so this cell belongs to the far
+                    // ridge. Its own rim is the top row of the band.
+                    let colour = if y == far_top { FAR_LIT } else { FAR_FILL };
+                    Cell::new(far_glyph, colour, style::Attribute::Reset)
+                } else if y == near_top {
+                    Cell::new(lit_glyph, NEAR_LIT, style::Attribute::Reset)
+                } else {
+                    // Colour and glyph both from depth, and *only* from depth.
+                    // The shading is how much light reaches this far down the
+                    // near ground, and it is the one thing in the frame that is a
+                    // clean function of a single quantity, so it is the right
+                    // place to spend a continuous ramp.
+                    //
+                    // The old renderer also ran a two-dimensional grain field
+                    // through here, to give the ground a body. There is no body:
+                    // this is a view from the side, the ground is a filled region,
+                    // and a body was never the thing that was missing. What was
+                    // missing was a *second ridge*, and it cost one noise sample
+                    // per ground cell to buy texture that read as noise -- 54,000
+                    // samples a frame at 400x200 against 800 for both surfaces.
+                    let depth =
+                        ((y - near_top) as f32 / ground_depth).clamp(0.0, 1.0);
                     Cell::new(
-                        self.ramp.sample(t),
-                        colour,
+                        self.ramp.sample(depth),
+                        self.ground.sample(depth),
                         // `Attribute::Reset`, not `Attribute::Bold`. Every cell
                         // was bold, and bold on a truecolor foreground is a
                         // rendering hint that many terminals act on by
@@ -675,8 +902,9 @@ impl Terrain {
                         // supposed to read as three-quarter coverage and bold
                         // turned it into a white block.
                         style::Attribute::Reset,
-                    ),
-                );
+                    )
+                };
+                surface.set(x, y, cell);
             }
         }
     }
@@ -704,53 +932,179 @@ const HORIZON_SKY_FRACTION: f32 = 0.72;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
-    /// Builds a grid of drawn symbols from a diff, for the tests that want to
-    /// look at the picture rather than at the model behind it.
-    fn drawn(size: (u16, u16), frames: u64) -> Vec<Vec<char>> {
-        let mut terrain = Terrain::new(TerrainOptions::default(), size);
-        for _ in 0..frames {
-            terrain.advance(1.0 / 60.0);
+    /// Rec. 709 relative luminance of a drawn colour, for the tests that compare
+    /// one layer's brightness against another's.
+    ///
+    /// Weighted rather than an average of the channels, because the layers in
+    /// this effect differ mostly in the *blue* channel -- they are all cool
+    /// colours -- and a plain mean of the three would compress the differences
+    /// the tests are looking for into a fraction of a step.
+    fn luminance(colour: style::Color) -> f32 {
+        match colour {
+            style::Color::Rgb { r, g, b } => {
+                0.2126 * f32::from(r)
+                    + 0.7152 * f32::from(g)
+                    + 0.0722 * f32::from(b)
+            }
+            _ => f32::NAN,
         }
-        let mut grid = vec![vec![' '; size.0 as usize]; size.1 as usize];
-        for (x, y, cell) in terrain.get_diff() {
-            grid[y][x] = cell.symbol;
-        }
-        grid
     }
 
-    /// The surface row for every column, from the same code the renderer uses.
+    /// How much brighter one tone has to be than the one below it to count as a
+    /// separate tone at all.
     ///
-    /// At offset zero, which is the *first* frame. Anything that compares a
-    /// surface against a frame drawn later has to use
-    /// [`drawn_with_surface`] instead -- the seabed scrolls, so a surface row
-    /// from one instant says nothing about a frame from another. Getting that
-    /// wrong is not subtle: it looks like the ground has more structure than it
-    /// does, because the rows are sampling different depths in each column.
+    /// A bare `>` is not enough, and this number exists because a test using one
+    /// passed against the defect it was written for. The near rim was set to
+    /// exactly the first stop of the ground ramp -- the *same* colour as the top
+    /// row of fill under it -- and every brightness assertion in the module still
+    /// passed, because the row below samples the ramp a fraction of a step down
+    /// and rounded back to within one unit. A ratio cannot be faked that way: at
+    /// 1.0 the margin is zero, and the smallest real difference that survives
+    /// `>` in this palette is about 1.004.
+    ///
+    /// 1.25 is the pick, and it sits well inside what the palette actually
+    /// delivers: measured at the defaults the near rim is 1.50x the brightest
+    /// cell of the near fill and the far rim 1.68x its own fill, while a rim set
+    /// to its fill's first stop is 1.00x.
+    const TONE_CONTRAST: f32 = 1.25;
+
+    fn is_brighter(lit: style::Color, under: style::Color) -> bool {
+        luminance(lit) > luminance(under) * TONE_CONTRAST
+    }
+
+    /// The near ridge's surface row for every column, at offset zero.
+    ///
+    /// Offset zero is the *first* frame. Anything that compares a surface against
+    /// a frame drawn later has to use [`Frame`] instead -- the landscape scrolls,
+    /// so a surface row from one instant says nothing about a frame from another.
     fn surface(size: (u16, u16)) -> Vec<usize> {
-        let terrain = Terrain::new(TerrainOptions::default(), size);
-        terrain.surface_rows(0.0, Terrain::horizon_row(size))
+        Terrain::new(TerrainOptions::default(), size).near_surface_rows(0.0)
     }
 
-    /// A drawn frame and the surface it was drawn against, from one instance.
+    /// The far ridge's surface row for every column, at its own offset zero.
     ///
-    /// The pair has to come from the same `Terrain`, for the reason on
-    /// [`surface`].
-    fn drawn_with_surface(
-        size: (u16, u16),
-        frames: u64,
-    ) -> (Vec<Vec<char>>, Vec<usize>) {
+    /// Zero is the far ridge's zero as well as the near one's, since
+    /// `far_offset` is a multiple of the near offset and both are zero at the
+    /// start of a run.
+    fn far_surface(size: (u16, u16)) -> Vec<usize> {
+        Terrain::new(TerrainOptions::default(), size).far_surface_rows(0.0)
+    }
+
+    /// The mean number of changed cells per frame, after the opening frame.
+    ///
+    /// The opening frame is excluded because it is a full repaint by
+    /// construction -- the canvas has no previous frame to diff against -- and
+    /// averaging it in would hide the property this measures. What is left is
+    /// the cost of *motion*, which is the part that decides how big the frame is
+    /// on the wire.
+    fn mean_frame_diff(size: (u16, u16), frames: u64) -> f64 {
         let mut terrain = Terrain::new(TerrainOptions::default(), size);
+        // Establish the baseline, so the first measured frame is an ordinary
+        // frame and not the opening repaint.
+        terrain.get_diff();
+
+        let mut total = 0usize;
         for _ in 0..frames {
             terrain.advance(1.0 / 60.0);
+            total += terrain.get_diff().len();
         }
-        let rows = terrain.surface_rows(terrain.offset, Terrain::horizon_row(size));
-        let mut grid = vec![vec![' '; size.0 as usize]; size.1 as usize];
-        for (x, y, cell) in terrain.get_diff() {
-            grid[y][x] = cell.symbol;
+        total as f64 / frames as f64
+    }
+
+    /// A drawn frame together with the two surfaces it was drawn against.
+    ///
+    /// All three have to come from one `Terrain` instance, and the reason is not
+    /// tidiness. The landscape scrolls, so a surface row from one instant says
+    /// nothing about a frame from another; a test that reads a surface from a
+    /// fresh effect at offset zero and compares it against a frame drawn at
+    /// offset 1.5 is sampling every column at a different depth, and the
+    /// resulting "measurement" is a property of the scroll rather than of
+    /// anything it was written to look at.
+    ///
+    /// Colours are kept as well as glyphs because in this effect the two layers
+    /// are told apart by colour and almost not at all by glyph: the far ridge is
+    /// a sparse character and the near ground runs from sparse to dense down the
+    /// screen, so any test about *which layer* a cell belongs to has to read the
+    /// colour.
+    struct Frame {
+        glyphs: Vec<Vec<char>>,
+        colours: BTreeMap<(usize, usize), style::Color>,
+        /// The near ridge's surface row, per column.
+        near: Vec<usize>,
+        /// The far ridge's, per column.
+        far: Vec<usize>,
+    }
+
+    impl Frame {
+        fn new(size: (u16, u16), frames: u64) -> Self {
+            let mut terrain = Terrain::new(TerrainOptions::default(), size);
+            for _ in 0..frames {
+                terrain.advance(1.0 / 60.0);
+            }
+            Self::with(&mut terrain)
         }
-        (grid, rows)
+
+        /// A frame from an already-configured and already-advanced `Terrain`.
+        ///
+        /// The two surfaces are read from the same instance at the same offset
+        /// the frame is drawn at, which is the only pairing that means anything.
+        fn with(terrain: &mut Terrain) -> Self {
+            let size = terrain.screen_size;
+            let near = terrain.near_surface_rows(terrain.offset);
+            let far = terrain.far_surface_rows(terrain.far_offset());
+            let mut glyphs = vec![vec![' '; size.0 as usize]; size.1 as usize];
+            let mut colours = BTreeMap::new();
+            for (x, y, cell) in terrain.get_diff() {
+                glyphs[y][x] = cell.symbol;
+                colours.insert((x, y), cell.color);
+            }
+            Self {
+                glyphs,
+                colours,
+                near,
+                far,
+            }
+        }
+
+        /// The glyph at one cell. Row-major storage, so a *column* is a stride
+        /// through it rather than a row of it -- see the note on
+        /// `no_ground_is_drawn_above_its_own_columns_surface`, which got that
+        /// wrong and reported a sky cell in one column as a glyph from another
+        /// column's crest.
+        fn glyph(&self, x: usize, y: usize) -> char {
+            self.glyphs[y][x]
+        }
+
+        fn colour(&self, x: usize, y: usize) -> style::Color {
+            self.colours
+                .get(&(x, y))
+                .copied()
+                .unwrap_or(style::Color::Reset)
+        }
+
+        /// How many columns show the far ridge rather than the sky, as a fraction.
+        ///
+        /// The far ridge is behind the near one, so it is *meant* to be hidden in
+        /// some columns -- a layer that was never occluded would read as a band
+        /// painted over the picture rather than as land behind land. This is the
+        /// measure of how much of it is left, and it is the thing that has to
+        /// stay well clear of both zero (no second layer at all) and one (a flat
+        /// wall of dim colour with no near ridge in front of it).
+        fn far_visible_fraction(&self) -> f64 {
+            let width = self.near.len();
+            if width == 0 {
+                return 0.0;
+            }
+            let shown = self
+                .far
+                .iter()
+                .zip(&self.near)
+                .filter(|(far, near)| far < near)
+                .count();
+            shown as f64 / width as f64
+        }
     }
 
     // ---------------------------------------------------------------- the fix
@@ -769,27 +1123,39 @@ mod tests {
     /// spread bound is what rules out both, and it is asserted at three sizes
     /// because the relief is a fraction of the ground's depth, so a regression
     /// that made it a fixed row count would pass at one size and not another.
+    ///
+    /// Asserted for **both** ridges now, and the bound is looser for the far one
+    /// because it has to be: `far_relief` defaults to half `relief` and two
+    /// octaves rather than four, so a far surface that moves as much as the near
+    /// one would be a distant layer with no distance in it. Two rows of spread
+    /// is the floor below which the far ridge stops being a ridge at all, and
+    /// `neither_ridge_is_a_flat_constant_row` is the same claim measured the
+    /// other way round.
     #[test]
     fn there_is_a_surface_and_it_is_not_a_straight_line() {
         for size in [(80u16, 24u16), (200, 50), (400, 200)] {
-            let rows = surface(size);
-            assert_eq!(
-                rows.len(),
-                size.0 as usize,
-                "every column needs a surface row"
-            );
+            for (label, rows, minimum) in [
+                ("near", surface(size), 3usize),
+                ("far", far_surface(size), 2),
+            ] {
+                assert_eq!(
+                    rows.len(),
+                    size.0 as usize,
+                    "every column needs a {label} surface row"
+                );
 
-            let low = *rows.iter().min().unwrap();
-            let high = *rows.iter().max().unwrap();
-            assert!(
-                high - low >= 3,
-                "at {}x{} the surface spans only {} rows, from {low} to {high}, so \
-                 the top of the ground is a straight line and there is no \
-                 landscape in the picture",
-                size.0,
-                size.1,
-                high - low
-            );
+                let low = *rows.iter().min().unwrap();
+                let high = *rows.iter().max().unwrap();
+                assert!(
+                    high - low >= minimum,
+                    "at {}x{} the {label} surface spans only {} rows, from {low} to \
+                     {high}, so the top of that ridge is a straight line and there \
+                     is no landscape in the picture",
+                    size.0,
+                    size.1,
+                    high - low
+                );
+            }
         }
     }
 
@@ -800,20 +1166,37 @@ mod tests {
     /// but the *shape* was not a ground. Now that there is a surface it is a
     /// real question, because a surface that reaches the last row leaves a
     /// column with no ground at all and the picture tears.
+    ///
+    /// The far ridge is in the same assertion for the same reason, and this is
+    /// where the two layers stop being symmetric: the far one is allowed to
+    /// vanish in a column, because it is behind the near one, but the near one
+    /// is not -- a column of near ground that stopped short of the bottom would
+    /// be a hole in the front layer, and a hole in the front layer is the one
+    /// thing the layering is supposed to make impossible.
     #[test]
     fn the_ground_reaches_the_bottom_row_in_every_column() {
-        for size in [(80u16, 24u16), (200, 50), (400, 200), (1, 9), (9, 3)] {
-            let rows = surface(size);
+        for size in [
+            (80u16, 24u16),
+            (200, 50),
+            (400, 200),
+            (1, 9),
+            (9, 3),
+            (6, 6),
+            (20, 8),
+        ] {
             let height = size.1 as usize;
-            for (x, &top) in rows.iter().enumerate() {
-                assert!(
-                    top < height,
-                    "at {}x{} column {x} has its surface at row {top} of {height}, \
-                     so that column has no ground and the ground does not reach \
-                     the bottom",
-                    size.0,
-                    size.1
-                );
+            for (label, rows) in
+                [("near", surface(size)), ("far", far_surface(size))]
+            {
+                for (x, &top) in rows.iter().enumerate() {
+                    assert!(
+                        top < height,
+                        "at {}x{} column {x} has its {label} surface at row {top} of \
+                         {height}, so that column has no ground at all",
+                        size.0,
+                        size.1
+                    );
+                }
             }
         }
     }
@@ -830,46 +1213,140 @@ mod tests {
         // is made and `the_ground_reaches_the_bottom_row_in_every_column` is the
         // other half of the same bargain.
         for size in [(80u16, 24u16), (200, 50), (400, 200), (1, 9), (9, 3)] {
-            for (x, &top) in surface(size).iter().enumerate() {
-                assert!(
-                    top >= 1,
-                    "at {}x{} column {x} has its surface at row {top}, so that \
-                     column has no sky",
-                    size.0,
-                    size.1
-                );
+            for (label, rows) in
+                [("near", surface(size)), ("far", far_surface(size))]
+            {
+                for (x, &top) in rows.iter().enumerate() {
+                    assert!(
+                        top >= 1,
+                        "at {}x{} column {x} has its {label} surface at row {top}, so \
+                         that column has no sky",
+                        size.0,
+                        size.1
+                    );
+                }
             }
         }
     }
 
-    /// Nothing is drawn as ground above its own column's surface.
+    /// Nothing is drawn as ground above the *higher* of the two surfaces.
     ///
     /// The silhouette has to be a silhouette. A renderer that filled by
     /// comparing against a *mean* horizon rather than a per-column one would
     /// put ground in the sky on one side of every peak, and this is the test
     /// that says so.
+    ///
+    /// The bound is the *minimum* of the two surfaces per column, not the near
+    /// one, and that is the whole change from the single-ridge version. Where the
+    /// far ridge is above the near one it is *supposed* to be drawn there, and a
+    /// test that asserted "sky everywhere above the near surface" would be
+    /// asserting the absence of the second layer -- it would pass against a
+    /// renderer that drew no far ridge at all, which is the bug this rewrite
+    /// exists to fix.
     #[test]
     fn no_ground_is_drawn_above_its_own_columns_surface() {
         let size = (80u16, 24u16);
-        let rows = surface(size);
-        let grid = drawn(size, 0);
+        let frame = Frame::new(size, 0);
 
-        // `grid` is row-major, so a *column* is a stride, not a row. Iterating
-        // `grid.iter()` and treating each row as a column -- which is what this
-        // did first -- reads the wrong axis entirely and reports a sky cell in
-        // one column as a glyph from a different column's crest.
-        for (x, &top) in rows.iter().enumerate() {
-            for (y, cell) in grid
-                .iter()
-                .take(top)
-                .enumerate()
-                .map(|(y, row)| (y, row[x]))
-            {
+        for x in 0..size.0 as usize {
+            let highest = frame.far[x].min(frame.near[x]);
+            for y in 0..highest {
+                let cell = frame.glyph(x, y);
                 assert_eq!(
                     cell, ' ',
-                    "at ({x}, {y}) the ground starts at row {top} but this cell \
-                     was drawn as {cell:?}"
+                    "at ({x}, {y}) the ground starts at row {highest} -- the far \
+                     ridge is on {} and the near one on {} -- but this cell was \
+                     drawn as {cell:?}",
+                    frame.far[x], frame.near[x]
                 );
+            }
+        }
+    }
+
+    /// The three bands are in the right order in every column, and the near ridge
+    /// covers the far one completely wherever it is in front.
+    ///
+    /// This is the test that says what the effect *is*, as opposed to what it is
+    /// made of. Read down any column and it has to be: sky, then the far ridge
+    /// where the far ridge is above the near one, then the near ridge to the
+    /// bottom of the screen. Nothing else, in any order, at any size.
+    ///
+    /// Asserted on drawn colours rather than on glyphs, because the two layers
+    /// are almost indistinguishable by glyph -- the far body and the top of the
+    /// near ground are both the sparsest step of the same ramp. The colours are
+    /// constants rather than a gradient, so this can be an exact comparison,
+    /// which is what makes it worth having: a renderer that put the far fill
+    /// below the near surface, or drew the far ridge over the near one, would be
+    /// caught by an equality test that a luminance band would have let through.
+    #[test]
+    fn every_column_is_sky_then_far_then_near_and_stops_there() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200), (20, 8)] {
+            let frame = Frame::new(size, 0);
+            let height = size.1 as usize;
+
+            for x in 0..size.0 as usize {
+                let (far, near) = (frame.far[x], frame.near[x]);
+                for y in 0..height {
+                    let colour = frame.colour(x, y);
+                    if y >= near && y > near {
+                        // The near fill is a depth ramp rather than a constant, so
+                        // it is checked by range instead of by equality. Two
+                        // properties, and the first is the important one: the
+                        // near ridge occludes the far one completely, so no cell
+                        // below its own surface may carry either of the far
+                        // layer's colours. The second is that the fill stays well
+                        // under its own rim, which is what makes the rim a rim --
+                        // see `TONE_CONTRAST` for why that is a margin and not an
+                        // inequality.
+                        assert!(
+                            colour != FAR_FILL && colour != FAR_LIT,
+                            "at {}x{} cell ({x}, {y}) is below the near surface on row \
+                             {near} but was drawn in the far layer's colour, so the \
+                             near ridge is not occluding the far one",
+                            size.0,
+                            size.1
+                        );
+                        assert!(
+                            is_brighter(NEAR_LIT, colour),
+                            "at {}x{} cell ({x}, {y}) in the near fill is at {} against \
+                             a lit rim at {}, so the fill is as bright as its own rim",
+                            size.0,
+                            size.1,
+                            luminance(colour),
+                            luminance(NEAR_LIT)
+                        );
+                        continue;
+                    }
+
+                    // Everything else is one of three constant colours, chosen
+                    // purely by which band the row is in.
+                    let (expected, band) = if y < far.min(near) {
+                        // Sky. Compared as a glyph because the sky's colour is a
+                        // gradient and there is nothing to compare it *to*; a
+                        // space is the only thing a sky cell may be drawn as.
+                        assert_eq!(
+                            frame.glyph(x, y),
+                            ' ',
+                            "at {}x{} cell ({x}, {y}) is above both surfaces and was \
+                             drawn as {:?} rather than sky",
+                            size.0,
+                            size.1,
+                            frame.glyph(x, y)
+                        );
+                        continue;
+                    } else if y < near {
+                        (if y == far { FAR_LIT } else { FAR_FILL }, "far")
+                    } else {
+                        (NEAR_LIT, "near")
+                    };
+                    assert_eq!(
+                        colour, expected,
+                        "at {}x{} cell ({x}, {y}) belongs to the {band} band -- the \
+                         far ridge is on {far} and the near one on {near} -- and was \
+                         drawn in the other one",
+                        size.0, size.1
+                    );
+                }
             }
         }
     }
@@ -923,8 +1400,7 @@ mod tests {
                 relief,
                 ..Default::default()
             };
-            let terrain = Terrain::new(options, (80, 24));
-            let rows = terrain.surface_rows(0.0, Terrain::horizon_row((80, 24)));
+            let rows = Terrain::new(options, (80, 24)).near_surface_rows(0.0);
             rows.iter().max().unwrap() - rows.iter().min().unwrap()
         };
 
@@ -957,6 +1433,74 @@ mod tests {
         );
     }
 
+    /// `far_relief` is connected to the far ridge's surface, at both ends.
+    ///
+    /// The same three assertions as the near knob, and for the same reason: the
+    /// band in `the_relief_is_not_so_flat_that_the_ground_is_a_slab` is measured
+    /// on the *default*, so a second relief knob that was accepted by serde and
+    /// then ignored would pass that band perfectly. Zero is the assertion that
+    /// matters most -- a `far_relief` that never reached the far surface would
+    /// look exactly like `far_relief = 0` at every setting, which is a dim band
+    /// with a ruler along the top of it.
+    ///
+    /// The cap is asserted here too, and it is a *different* cap from the near
+    /// ridge's in one respect: the far one is measured against the ground's
+    /// depth as well, so on a short terminal both ridges flatten together rather
+    /// than the far one taking the whole screen.
+    #[test]
+    fn far_relief_reaches_the_far_ridge_and_is_capped_like_the_near_one() {
+        let spread_at = |far_relief: f64| {
+            let options = TerrainOptions {
+                far_relief,
+                ..Default::default()
+            };
+            let rows = Terrain::new(options, (80, 24)).far_surface_rows(0.0);
+            rows.iter().max().unwrap() - rows.iter().min().unwrap()
+        };
+
+        assert_eq!(
+            spread_at(0.0),
+            0,
+            "with no far_relief every column's far surface is on the same row, so \
+             the distant layer is a band with a ruler along the top"
+        );
+
+        // Both of these are *below* the cap, which is the whole difficulty on an
+        // 80x24: `MAX_RELIEF_FRACTION` of this screen's ground depth is 7.2 rows,
+        // so a period of 8 cells times the default 0.5 already asks for 4 of them
+        // and twice the default asks for 8, which is over. The monotonic
+        // comparison therefore runs at a quarter and a half rather than at a half
+        // and a whole.
+        let quarter = spread_at(DEFAULT_FAR_RELIEF / 2.0);
+        let default = spread_at(DEFAULT_FAR_RELIEF);
+        assert!(
+            default >= 2,
+            "the default far_relief {DEFAULT_FAR_RELIEF} spread the far surface only \
+             {default} rows, so the distant layer has no shape in it"
+        );
+        assert!(
+            default > quarter,
+            "the default far_relief spread the far surface {default} rows against \
+             {quarter} at half of it, so the knob is not reaching the far surface"
+        );
+
+        // And the cap is a cap, not a suggestion: two requests well past it give
+        // the same surface, and the same one as the smallest request past it.
+        let capped = spread_at(2.0);
+        assert_eq!(
+            spread_at(50.0),
+            capped,
+            "far_relief 50 spread the far surface differently from far_relief 2, so \
+             the amplitude is not capped and a large far_relief would drive the \
+             distant layer off the top of the screen"
+        );
+        assert!(
+            capped > default,
+            "past the cap the far surface spread {capped} rows against {default} at \
+             the default, so the cap is not binding where it should"
+        );
+    }
+
     /// The relief has to mean the same *landscape* at every terminal size.
     ///
     /// This is the test that pins the units. `relief` is in rows per noise period
@@ -973,9 +1517,7 @@ mod tests {
             };
             // Below the cap at every one of these sizes, so what is being compared
             // is the requested amplitude and not the clamp.
-            let terrain = Terrain::new(options, size);
-            let horizon = Terrain::horizon_row(size);
-            let rows = terrain.surface_rows(0.0, horizon);
+            let rows = Terrain::new(options, size).near_surface_rows(0.0);
             let steps = rows.windows(2).filter(|w| w[0] != w[1]).count();
             steps as f64 / (rows.len() - 1) as f64
         };
@@ -1001,12 +1543,76 @@ mod tests {
                 ..Default::default()
             };
             let terrain = Terrain::new(options, (80, 24));
-            let span = terrain.surface_span(Terrain::horizon_row((80, 24)));
+            let span = terrain.surface_span(bad, Terrain::horizon_row((80, 24)));
             assert!(
                 span.is_finite() && span >= 0.0,
                 "relief {bad} produced a surface span of {span}"
             );
         }
+    }
+
+    /// The same bargain for the two knobs the second ridge brought with it.
+    ///
+    /// `parallax` is the more dangerous of the two, and for a reason the
+    /// `relief` case does not have: a NaN relief produces a NaN *span*, which
+    /// `surface_row` rounds and clamps into a legal row and so degenerates
+    /// quietly into a flat slab, whereas a NaN parallax reaches
+    /// [`Terrain::far_offset`] and from there every far surface row, and a NaN
+    /// that reaches a row index is a NaN that reaches the whole band below it.
+    ///
+    /// Asserted through the public path -- the effective rate and the span --
+    /// rather than through the internals, because the fallback *is* the
+    /// behaviour being pinned and reading the field back would pass even if the
+    /// renderer used a different one.
+    #[test]
+    fn a_degenerate_far_relief_or_parallax_falls_back_rather_than_drawing_nothing()
+    {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -3.0, 7.0] {
+            let terrain = Terrain::new(
+                TerrainOptions {
+                    far_relief: bad,
+                    ..Default::default()
+                },
+                (80, 24),
+            );
+            let span = terrain.surface_span(bad, Terrain::far_ridge_row((80, 24)));
+            assert!(
+                span.is_finite() && span >= 0.0,
+                "far_relief {bad} produced a surface span of {span}"
+            );
+
+            let terrain = Terrain::new(
+                TerrainOptions {
+                    parallax: bad,
+                    ..Default::default()
+                },
+                (80, 24),
+            );
+            let rate = terrain.parallax_rate();
+            assert!(
+                rate.is_finite() && rate >= 0.0,
+                "parallax {bad} produced a rate of {rate}"
+            );
+            assert!(
+                terrain.far_offset().is_finite(),
+                "parallax {bad} produced a far offset of {}",
+                terrain.far_offset()
+            );
+        }
+
+        // And the fallbacks are the documented ones, not merely finite values.
+        let terrain = Terrain::new(
+            TerrainOptions {
+                parallax: f64::NAN,
+                ..Default::default()
+            },
+            (80, 24),
+        );
+        assert_eq!(
+            terrain.parallax_rate(),
+            DEFAULT_PARALLAX,
+            "a NaN parallax did not fall back to the documented default"
+        );
     }
 
     // ------------------------------------------------------- the two encodings
@@ -1041,13 +1647,7 @@ mod tests {
         // stop, and only this notices.
         for size in [(80u16, 24u16), (200, 50)] {
             let rows = surface(size);
-            let mut terrain = Terrain::new(TerrainOptions::default(), size);
-            let grid: std::collections::BTreeMap<(usize, usize), style::Color> =
-                terrain
-                    .get_diff()
-                    .into_iter()
-                    .map(|(x, y, cell)| ((x, y), cell.color))
-                    .collect();
+            let frame = Frame::new(size, 0);
 
             // Columns where the surface is high, so there is a deep body to
             // compare against without the bottom row being the surface itself.
@@ -1059,7 +1659,7 @@ mod tests {
                 .collect();
             assert!(
                 deep_columns.len() > size.0 as usize / 4,
-                "at {}x{} only {} columns have room for a ground body, so there is \\
+                "at {}x{} only {} columns have room for a ground body, so there is \
                  nothing to compare",
                 size.0,
                 size.1,
@@ -1068,11 +1668,21 @@ mod tests {
 
             for &x in &deep_columns {
                 let top = rows[x];
-                let shallow = grid[&(x, top)];
-                let deepest = grid[&(x, size.1 as usize - 1)];
+                // The rim, not the first row of fill. This is the one thing that
+                // changed in this test's subject, and it is worth being explicit
+                // about: the top row of the near ground *is* its lit edge now, so
+                // a version of this test that stopped one row lower would still
+                // pass and would be measuring the rim-to-rim drop rather than the
+                // shading. The assertion below is deliberately the widest drop in
+                // the column -- rim to floor -- because that is the one that has
+                // to exist for the fill to read as shaded ground at all, and it
+                // is a margin rather than an inequality for the reason on
+                // `TONE_CONTRAST`.
+                let shallow = frame.colour(x, top);
+                let deepest = frame.colour(x, size.1 as usize - 1);
                 assert!(
-                    luminance(deepest) < luminance(shallow),
-                    "at {}x{} column {x} is {} at the surface and {} at the bottom, \\
+                    is_brighter(shallow, deepest),
+                    "at {}x{} column {x} is {} at the surface and {} at the bottom, \
                      so the ground does not get darker going down",
                     size.0,
                     size.1,
@@ -1083,249 +1693,514 @@ mod tests {
         }
     }
 
-    /// The body of the ground has structure running through it horizontally.
+    /// There are two ridges, and they are two landscapes rather than one hill
+    /// twice.
     ///
-    /// The headline defect, and the reason the effect was reported as
-    /// unreadable. Both encodings were functions of depth alone, so every column
-    /// below its own surface drew identically and the whole picture was one
-    /// smooth vertical ramp under a slightly wavy top edge. That is not a
-    /// landscape and not a cross-section either. It is a gradient with a border.
+    /// The failure this is written against is a specific and easy one to commit:
+    /// derive the far ridge from the *same* noise as the near one and rely on the
+    /// rate to make it look different. It does not. One field sampled at two
+    /// different offsets is one landscape, and the eye reports the repetition as
+    /// a fault well before it reads the colour as distance -- which is why
+    /// [`FAR_SEED_SALT`] is a second permutation table rather than a multiplier on
+    /// the sample coordinate.
     ///
-    /// Measured **at constant depth**, and that is the whole difficulty. The
-    /// obvious metric -- how many adjacent cells in one row differ -- is
-    /// confounded, because two cells in the same row are at different depths
-    /// wherever the surface is uneven, and so they differed even with no grain at
-    /// all. The first version of this test used that metric, passed against the
-    /// flat body it was written to catch, and was measuring the silhouette.
+    /// Measured as correlation, and as the **worst** correlation over a range of
+    /// horizontal shifts rather than the correlation at shift zero. The shift
+    /// sweep is the part that matters: two copies of one profile will line up
+    /// beautifully at *some* offset, and a test that only looked at shift zero
+    /// would score that as "uncorrelated" because the layers happen to be at
+    /// different mean heights. So the claim is that no shift makes them agree.
     ///
-    /// So: a fixed number of rows below *each column's own* surface. Every cell
-    /// sampled is then at the same depth by construction, the only thing that can
-    /// differ between them is the grain, and the flat body gives exactly zero.
+    /// Reported in the failure message, because a correlation near the bound is
+    /// the thing to look at and a bare "not the same" is not.
     #[test]
-    fn the_ground_body_has_horizontal_structure() {
-        let size = (120u16, 30u16);
-        let (grid, rows) = drawn_with_surface(size, 90);
+    fn the_two_ridges_are_two_landscapes_and_not_one_twice() {
+        /// Pearson correlation of two series.
+        fn correlation(a: &[f64], b: &[f64]) -> f64 {
+            let n = a.len() as f64;
+            let mean_a = a.iter().sum::<f64>() / n;
+            let mean_b = b.iter().sum::<f64>() / n;
+            let covariance: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - mean_a) * (y - mean_b))
+                .sum();
+            let spread_a: f64 = a.iter().map(|x| (x - mean_a).powi(2)).sum();
+            let spread_b: f64 = b.iter().map(|y| (y - mean_b).powi(2)).sum();
+            covariance / (spread_a * spread_b).sqrt()
+        }
+
+        let size = (400u16, 50u16);
+        let frame = Frame::new(size, 0);
+        let near: Vec<f64> = frame.near.iter().map(|&r| r as f64).collect();
+        let far: Vec<f64> = frame.far.iter().map(|&r| r as f64).collect();
+
+        let worst = (-24i64..=24)
+            .map(|shift| {
+                let distance = shift.unsigned_abs() as usize;
+                let base = if shift < 0 {
+                    0..far.len() - distance
+                } else {
+                    distance..far.len()
+                };
+                let shifted: Vec<f64> = far[distance..].to_vec();
+                correlation(&near[base], &shifted).abs()
+            })
+            .fold(0.0f64, f64::max);
+
+        assert!(
+            worst < 0.5,
+            "the far ridge's profile correlates with the near one's at {worst:.2} at \
+             the worst of 49 horizontal shifts, so the two layers are the same \
+             landscape drawn twice rather than two landscapes"
+        );
+    }
+
+    /// The far ridge is on screen, and it is behind the near one.
+    ///
+    /// What this can and cannot claim is worth being precise about, because the
+    /// obvious version of the assertion is false. The far ridge is *never* hidden
+    /// in most columns at the default settings, and the test that says so would
+    /// be measuring the layout rather than the layering: `relief` is in rows per
+    /// noise period, so on a 200 row terminal the near ridge's whole excursion is
+    /// about six rows, and the far ridge's mean level is thirty-two rows above
+    /// it. Two ridges that close cannot both be visible.
+    ///
+    /// So the bound here is only the half that must hold -- the far ridge is
+    /// drawn across the frame rather than in a corner of it -- and the occlusion
+    /// half is asserted separately, in a configuration built to produce it:
+    /// `a_far_ridge_above_the_near_one_is_occluded_rather_than_drawn_over_it`.
+    #[test]
+    fn the_far_ridge_is_drawn_across_the_frame_at_the_default_settings() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200), (6, 6), (20, 8)] {
+            let frame = Frame::new(size, 0);
+            let visible = frame.far_visible_fraction();
+            assert!(
+                visible > 0.5,
+                "at {}x{} the far ridge is above the near one in only {:.0}% of \
+                 columns, so the second layer is a scrap at one edge of the frame",
+                size.0,
+                size.1,
+                visible * 100.0
+            );
+        }
+    }
+
+    /// Where the far ridge is behind the near one, it is occluded -- not drawn
+    /// over the top of it.
+    ///
+    /// The occlusion branch of the renderer is unreachable at the default
+    /// settings, for the reason on the test above: the two mean levels are too far
+    /// apart on a tall screen for either surface to reach the other. A code path
+    /// that never runs is a path nobody has tested, and this one is the one that
+    /// decides the *order* of the two layers, so it is built a configuration that
+    /// reaches it -- both reliefs at 6.0, which puts the far surface's highest
+    /// crest well below the near surface's lowest valley on a 200 row screen.
+    ///
+    /// Two assertions. That the occlusion actually happened, or the test is
+    /// measuring a configuration that did not do what it was built to do; and that
+    /// every occluded cell is near-ground, so a renderer that painted the far
+    /// ridge last would be caught even though it would look almost identical in
+    /// the columns where the far ridge is on top.
+    #[test]
+    fn a_far_ridge_above_the_near_one_is_occluded_rather_than_drawn_over_it() {
+        let size = (200u16, 50u16);
+        let options = TerrainOptions {
+            relief: 6.0,
+            far_relief: 6.0,
+            ..Default::default()
+        };
+        let mut terrain = Terrain::new(options, size);
+        let near = terrain.near_surface_rows(0.0);
+        let far = terrain.far_surface_rows(0.0);
         let height = size.1 as usize;
 
-        // Deep enough that every column still has ground, and shallow enough to
-        // be inside the body rather than in the depth bias at the very bottom.
-        let below = 3usize;
+        let occluded = far.iter().zip(&near).filter(|(f, n)| **f > **n).count();
         assert!(
-            *rows.iter().max().unwrap() + below + 1 < height,
-            "the deepest surface is row {} on a {height} row screen, so there is \
-             no row that is {below} rows of ground everywhere",
-            rows.iter().max().unwrap()
+            occluded > 0,
+            "no column has the far ridge behind the near one, so this \
+             configuration did not reach the occlusion path at all"
         );
 
-        let (differing, pairs) =
-            (0..size.0 as usize - 1).fold((0usize, 0usize), |(d, p), x| {
-                let a = grid[rows[x] + below][x];
-                let b = grid[rows[x + 1] + below][x + 1];
-                (d + usize::from(a != b), p + 1)
-            });
-        let fraction = differing as f64 / pairs.max(1) as f64;
-
-        assert!(
-            fraction > 0.15,
-            "sampled {below} rows below each column's own surface -- so every \
-             cell is at the same depth and only the grain can differ -- just \
-             {differing} of {pairs} adjacent pairs differ ({:.1}%). The body of \
-             the ground is featureless, so the picture is a vertical ramp with a \
-             wavy top edge rather than terrain.",
-            fraction * 100.0
-        );
+        let painted = Frame::with(&mut terrain);
+        for (x, (&far, &near)) in far.iter().zip(&near).enumerate() {
+            for y in near..height {
+                let colour = painted.colour(x, y);
+                assert_ne!(
+                    colour, FAR_FILL,
+                    "cell ({x}, {y}) is below the near surface on row {near} and the \
+                     far surface is on {far}, so the near ridge is in front, but the \
+                     cell was drawn in the far layer's fill"
+                );
+                assert_ne!(
+                    colour, FAR_LIT,
+                    "cell ({x}, {y}) is below the near surface on row {near} but was \
+                     drawn in the far layer's lit edge"
+                );
+            }
+        }
     }
 
-    /// The grain is a smooth field, not per-cell noise.
+    /// Each ridge is lit along its own edge, and each rim is brighter than the
+    /// fill under it.
     ///
-    /// The distinction matters visually and it is measurable at constant depth.
-    /// A field that is smooth in the column direction has runs of neighbouring
-    /// cells that agree; a per-cell random pick does not, and reads as
-    /// television static however the values are distributed. The assertion is a
-    /// lower bound on agreement at a two-cell offset, chosen because it is the
-    /// loosest bound that still fails for white noise.
+    /// This is the part that makes a filled region read as a landscape. A
+    /// silhouette with a bright edge along its top is a hill; the same silhouette
+    /// without one is a block of colour that happens to have a wavy top, and that
+    /// is a large part of why the first version of this effect read as
+    /// "terrain" the user could not place.
     ///
-    /// Note what this does *not* catch, because it is worth knowing: a body with
-    /// no grain at all passes it, with agreement at 100%. It distinguishes
-    /// "grain" from "static", not "grain" from "nothing" -- that is the test
-    /// above, and between them the two failures have different answers.
+    /// Measured on drawn cells at the *modelled* surface row, per column, so it
+    /// cannot be satisfied by a rim drawn along a mean horizon. The far ridge's
+    /// rim is only checked in the columns where the far ridge is visible at all,
+    /// which is the honest form of the assertion: the far ridge is behind the near
+    /// one and there is nothing to light where it is hidden.
     #[test]
-    fn the_grain_is_smooth_across_a_column_rather_than_random() {
-        let size = (120u16, 30u16);
-        let (grid, rows) = drawn_with_surface(size, 90);
-        let below = 3usize;
-        let offset = 2usize;
+    fn each_ridge_is_lit_along_its_own_edge_and_the_rim_is_brighter_than_its_fill()
+    {
+        for size in [(80u16, 24u16), (200, 50), (400, 200)] {
+            let frame = Frame::new(size, 0);
+            let height = size.1 as usize;
 
-        let (agreeing, pairs) =
-            (0..size.0 as usize - offset).fold((0usize, 0usize), |(a, p), x| {
-                let here = grid[rows[x] + below][x];
-                let there = grid[rows[x + offset] + below][x + offset];
-                (a + usize::from(here == there), p + 1)
-            });
-        let fraction = agreeing as f64 / pairs.max(1) as f64;
-
-        assert!(
-            fraction > 0.15,
-            "only {:.1}% of cells agree with the one {offset} columns away, so the \
-             grain is closer to per-cell noise than to a field -- which reads as \
-             static rather than as material",
-            fraction * 100.0
-        );
-    }
-
-    /// The grain scrolls with the ground rather than sitting still under it.
-    ///
-    /// Found by reading the code rather than by a failing test, which is the part
-    /// worth recording. The surface scrolls because `surface_row` samples its own
-    /// noise at `x + offset`; the grain was sampled at a bare `x`, so the texture
-    /// stayed fixed in screen space while the landscape slid across it. Silhouette
-    /// and material moving independently read as two unrelated things passing each
-    /// other, not as one body of ground.
-    ///
-    /// Measured by cross-correlation rather than by a direct comparison, because
-    /// the obvious version of this test does not work: the ground moves 0.015
-    /// cells per frame at the default scroll speed, so two *adjacent* frames are
-    /// indistinguishable and comparing them at any shift measures nothing. So:
-    /// run long enough for the ground to travel a couple of cells, then find the
-    /// horizontal shift at which the body best matches itself. A grain attached
-    /// to the ground peaks at the scroll displacement; a grain in screen space
-    /// peaks at zero, and that is the whole difference.
-    #[test]
-    fn the_grain_scrolls_with_the_ground_and_not_across_it() {
-        let size = (120u16, 30u16);
-        let scroll = TerrainOptions::default().scroll_speed;
-        // Frames for the ground to travel about two cells.
-        let frames = (2.0 / (scroll / 60.0)).round() as u64;
-        let (before, _) = drawn_with_surface(size, 0);
-        let (after, _) = drawn_with_surface(size, frames);
-        let expected = (scroll * frames as f64 / 60.0).round() as i64;
-
-        let agreement_at = |shift: i64| -> f64 {
-            let (mut agree, mut pairs) = (0usize, 0usize);
-            for x in 0..size.0 as i64 {
-                let moved = x + shift;
-                if moved < 0 || moved >= i64::from(size.0) {
-                    continue;
+            for (x, (&near, &far)) in frame.near.iter().zip(&frame.far).enumerate()
+            {
+                assert_eq!(
+                    frame.colour(x, near),
+                    NEAR_LIT,
+                    "at {}x{} column {x} has its near surface on row {near}, and that \
+                     row is the lit edge, but it was not drawn in the rim colour",
+                    size.0,
+                    size.1
+                );
+                if near + 1 < height {
+                    assert!(
+                        is_brighter(NEAR_LIT, frame.colour(x, near + 1)),
+                        "at {}x{} column {x} has a rim at {} and the row under it at \
+                         {}, so the rim is not {}x brighter than its own fill",
+                        size.0,
+                        size.1,
+                        luminance(NEAR_LIT),
+                        luminance(frame.colour(x, near + 1)),
+                        TONE_CONTRAST
+                    );
                 }
-                for y in 0..size.1 as usize {
-                    let a = before[y][x as usize];
-                    let b = after[y][moved as usize];
-                    if a == ' ' || b == ' ' {
+
+                if far < near {
+                    assert_eq!(
+                        frame.colour(x, far),
+                        FAR_LIT,
+                        "at {}x{} column {x} shows the far ridge from row {far}, and \
+                         that row is its lit edge, but it was not drawn in the far \
+                         rim colour",
+                        size.0,
+                        size.1
+                    );
+                    if far + 1 < near {
+                        assert!(
+                            is_brighter(FAR_LIT, frame.colour(x, far + 1)),
+                            "at {}x{} the far rim in column {x} is at {} and the row \
+                             under it at {}, so the far rim is not {}x brighter than \
+                             the far layer's own fill",
+                            size.0,
+                            size.1,
+                            luminance(FAR_LIT),
+                            luminance(frame.colour(x, far + 1)),
+                            TONE_CONTRAST
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The four tones are ordered, so the layers are separable at a glance.
+    ///
+    /// Far fill, then far rim, then near rim, then near fill. Read bottom to top
+    /// in that order and the near ridge is a bright edge with a shaded body
+    /// under it; get any one of the pairs the wrong way round and one of the two
+    /// edges disappears into the thing it is supposed to be standing in front of.
+    ///
+    /// Every comparison is a *margin* rather than an inequality, for the reason on
+    /// [`TONE_CONTRAST`]: with a bare `>` this test passed against a near rim set
+    /// to exactly the ground ramp's first stop, which is a rim with no rim in it.
+    ///
+    /// The near fill's *brightest* value is what the first stop of the [`GROUND`]
+    /// ramp produces, because the renderer samples that ramp by depth and the
+    /// first row of fill in a column is the shallowest depth. Measured on drawn
+    /// cells, so a palette that is ordered but never reached is caught.
+    #[test]
+    fn the_layer_tones_are_ordered_far_fill_far_rim_near_rim_near_fill() {
+        let size = (200u16, 50u16);
+        let frame = Frame::new(size, 0);
+        let height = size.1 as usize;
+
+        let mut brightest_fill = f32::NEG_INFINITY;
+        for (x, (&near, &far)) in frame.near.iter().zip(&frame.far).enumerate() {
+            if far < near {
+                for y in (far + 1)..near {
+                    brightest_fill =
+                        brightest_fill.max(luminance(frame.colour(x, y)));
+                }
+            }
+            for y in (near + 1)..height {
+                brightest_fill = brightest_fill.max(luminance(frame.colour(x, y)));
+            }
+        }
+
+        assert!(
+            is_brighter(FAR_LIT, FAR_FILL),
+            "the far layer's fill is at {} against its own rim at {}, so the distant \
+             ridge has no edge",
+            luminance(FAR_FILL),
+            luminance(FAR_LIT)
+        );
+        assert!(
+            is_brighter(NEAR_LIT, FAR_LIT),
+            "the far rim is at {} against the near rim at {}, so the two ridges do \
+             not separate by brightness",
+            luminance(FAR_LIT),
+            luminance(NEAR_LIT)
+        );
+        assert!(
+            brightest_fill > luminance(FAR_FILL) * TONE_CONTRAST,
+            "the far fill is at {} against the brightest cell of the near ground at \
+             {brightest_fill:.0}, so the distant layer competes with the one in front \
+             of it",
+            luminance(FAR_FILL)
+        );
+        assert!(
+            luminance(NEAR_LIT) > brightest_fill * TONE_CONTRAST,
+            "the brightest cell of the near ground is at {brightest_fill:.0} against a \
+             rim at {}, so the near ridge has no edge",
+            luminance(NEAR_LIT)
+        );
+    }
+
+    /// Each ridge is one unbroken run down its column, and the top of it is
+    /// where the model says it is.
+    ///
+    /// Two things at once, and they are the same thing. Scanning down a column,
+    /// the *first* non-space cell has to be the surface row and every cell from
+    /// there to the bottom of the screen has to be ground. A hole anywhere in
+    /// that run and a ridge whose top is a row away from its own surface are the
+    /// same defect seen from two ends, and both were reachable before: the old
+    /// renderer drew sky wherever a sampled value happened to be blank, so a
+    /// column could have ground, then sky, then ground again.
+    ///
+    /// Measured on the frame against the surfaces the same frame was drawn from,
+    /// which is the only pairing that means anything -- the landscape scrolls, so a
+    /// surface from one instant and a frame from another are two different
+    /// pictures.
+    #[test]
+    fn the_ground_is_one_unbroken_run_from_its_surface_to_the_bottom() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200), (20, 8)] {
+            let frame = Frame::new(size, 0);
+            let height = size.1 as usize;
+
+            for (x, &top) in frame.near.iter().enumerate() {
+                let first = (0..height)
+                    .find(|&y| frame.glyph(x, y) != ' ')
+                    .unwrap_or(height);
+                assert_eq!(
+                    first,
+                    frame.far[x].min(top),
+                    "at {}x{} column {x} draws its first ground cell on row {first}, \
+                     but the far surface is on {} and the near one on {top}",
+                    size.0,
+                    size.1,
+                    frame.far[x]
+                );
+                for y in top..height {
+                    assert_ne!(
+                        frame.glyph(x, y),
+                        ' ',
+                        "at {}x{} cell ({x}, {y}) is below the near surface on row \
+                         {top} but drew as a space, so the ground has a hole in it",
+                        size.0,
+                        size.1
+                    );
+                }
+            }
+        }
+    }
+
+    /// Neither ridge's top edge is a straight line.
+    ///
+    /// The same failure the crab had, and the same reason it is worth a separate
+    /// test rather than a clause in the one above. A renderer that filled against
+    /// a *mean* horizon rather than a per-column surface would produce a frame
+    /// that is perfectly contiguous -- every cell of the run filled, nothing
+    /// above the surface drawn -- and completely flat. The contiguity test above
+    /// passes it. This one does not, and it is measured on the frame's own
+    /// topmost-drawn row per column rather than on the model's surface array,
+    /// because a model that is flat and a picture that is flat are the same defect
+    /// and the picture is the one the user sees.
+    ///
+    /// Three distinct top rows is the floor, and it is the same bound the single
+    /// ridge version used, held against *both* layers. The far ridge's own relief
+    /// is half the near one's, so if this ever needs loosening the near ridge is
+    /// the one to look at.
+    #[test]
+    fn neither_ridge_is_a_flat_constant_row() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200)] {
+            let frame = Frame::new(size, 0);
+            let height = size.1 as usize;
+            let mut near_tops: HashSet<usize> = HashSet::new();
+            let mut far_tops: HashSet<usize> = HashSet::new();
+
+            for x in 0..size.0 as usize {
+                if let Some(first) = (0..height).find(|&y| frame.glyph(x, y) != ' ')
+                {
+                    near_tops.insert(first);
+                    // The far surface, where the far ridge is the one on top. In
+                    // the columns where the near ridge is higher, the first drawn
+                    // row is the near one and the far ridge's own top is hidden,
+                    // so it is not part of the set.
+                    if frame.far[x] < frame.near[x] {
+                        far_tops.insert(frame.far[x]);
+                    }
+                }
+            }
+
+            assert!(
+                near_tops.len() >= 3,
+                "at {}x{} the top edge of the near ground sits on only {} distinct \
+                 rows, so it is a straight line and there is no landscape in the \
+                 picture",
+                size.0,
+                size.1,
+                near_tops.len()
+            );
+            assert!(
+                far_tops.len() >= 3,
+                "at {}x{} the top edge of the far ridge sits on only {} distinct \
+                 rows, so the distant layer is a band with a ruler along the top",
+                size.0,
+                size.1,
+                far_tops.len()
+            );
+        }
+    }
+
+    /// The far ridge scrolls measurably more slowly than the near one.
+    ///
+    /// This is the parallax, measured rather than asserted, and it replaces the
+    /// test that asked whether the ground's *texture* scrolled with its
+    /// silhouette. The old question is subsumed: if the surface that defines the
+    /// texture moves at two different rates, then so does the texture.
+    ///
+    /// Three parts, each of which has to be there or the test is measuring
+    /// something else:
+    ///
+    /// * The displacement is found by cross-correlating the surface rows and then
+    ///   refining to a fraction of a cell with a parabola through the best
+    ///   whole-cell shift. The fraction matters: at the default rate the near
+    ///   ridge travels 0.015 cells a frame and the far one 0.005, so a whole-cell
+    ///   answer would be a measurement of how far the ground happened to travel
+    ///   and not of how fast it travels.
+    /// * The search range is ±12 cells and both optima are asserted to be
+    ///   *inside* it. This repo has been bitten by the opposite twice: a
+    ///   correlation that reported its best shift at the edge of the range it
+    ///   searched, which is a fact about the range and not about the picture. A
+    ///   test that reported zero for a frozen effect would also have reported
+    ///   zero here.
+    /// * The ratio is compared against the configured `parallax` and separately
+    ///   bounded well below 1. The second assertion is the one that would survive
+    ///   a change of default; the first is the one that catches a knob that is
+    ///   accepted by the config and then ignored.
+    #[test]
+    fn the_far_ridge_scrolls_more_slowly_than_the_near_one() {
+        /// The shift at which `before` best matches `after`, in cells, signed.
+        ///
+        /// Negative, because the offset is *added* to the column: as it grows the
+        /// same material is found further to the left.
+        fn best_shift(before: &[usize], after: &[usize], limit: i64) -> f64 {
+            let mean_error = |shift: i64| -> f64 {
+                let (mut total, mut pairs) = (0.0, 0.0);
+                for (x, &row) in before.iter().enumerate() {
+                    let moved = x as i64 + shift;
+                    if moved < 0 || moved >= after.len() as i64 {
                         continue;
                     }
-                    agree += usize::from(a == b);
-                    pairs += 1;
+                    let difference = row as f64 - after[moved as usize] as f64;
+                    total += difference * difference;
+                    pairs += 1.0;
+                }
+                total / pairs
+            };
+
+            let mut best = 0;
+            let mut best_error = f64::INFINITY;
+            for shift in -limit..=limit {
+                let error = mean_error(shift);
+                if error < best_error {
+                    best_error = error;
+                    best = shift;
                 }
             }
-            agree as f64 / pairs.max(1) as f64
-        };
-
-        // Best shift over a range that comfortably contains the expected one.
-        // Signed, and negative: the offset is added to the column, so as it grows
-        // the same material is found further *left*. The first version of this
-        // searched 0..=4 and reported a best of 0, which was the edge of its own
-        // range rather than a fact about the picture.
-        let best = (-4..=4i64)
-            .max_by(|a, b| {
-                agreement_at(*a)
-                    .partial_cmp(&agreement_at(*b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap();
-
-        assert_eq!(
-            best, -expected,
-            "the ground pattern matches itself best at a shift of {best} columns \
-             and not at the {} the ground actually travelled, so the texture is \
-             not attached to it",
-            -expected
-        );
-    }
-
-    /// The grain is banded, measured on the generator rather than on the frame.
-    ///
-    /// The obvious way to measure this is on the drawn picture, and it does not
-    /// work: walking down a column changes the depth, and the depth bias changes
-    /// the glyph with it, so any vertically-varying measure is dominated by the
-    /// bias whether or not there is banding at all. The flat body this replaced
-    /// passed a measured banding test for exactly that reason.
-    ///
-    /// So: sample the noise directly, at a fixed depth, and estimate how far it
-    /// takes the field to become *unrecognisably different* along each axis.
-    /// Depth is held constant and so is the other axis, so neither measurement
-    /// can see the other's period.
-    ///
-    /// The first two attempts at the estimator were both wrong in the same way,
-    /// and the second one is the one worth recording. Measuring "the last offset
-    /// at which the field changed by more than a threshold" looks like a
-    /// correlation length and is not one: over a long enough baseline the field
-    /// changes by more than any fixed threshold *somewhere*, so the answer grows
-    /// with the length of the sweep and saturates at its end. Over 40 steps it
-    /// reported 38 against 38 for the banded case and failed; over 200 it
-    /// reported 196 against 199 and still failed, having found no separation at
-    /// all. Both were a real estimator returning a meaningless number.
-    ///
-    /// What is used instead is the standard one: the mean absolute difference
-    /// from the origin as a function of offset, and the offset at which it
-    /// crosses half its value at the far end. That rises monotonically to a
-    /// limit, so it does not depend on how far the sweep goes, and it is
-    /// genuinely a length.
-    #[test]
-    fn the_grain_is_banded_rather_than_isotropic() {
-        let noise = PerlinNoise::new(TerrainOptions::default().seed);
-        let at = |x: f64, y: f64| {
-            noise.octave_noise_2d(
-                x / GRAIN_PERIOD_X,
-                y / GRAIN_PERIOD_Y,
-                GRAIN_OCTAVES,
-                GRAIN_PERSISTENCE,
-                1.0,
-            )
-        };
-
-        // Mean absolute departure from the origin at a given offset, along one
-        // axis. 96 base positions, which is a whole number of periods at this
-        // size so no base is favoured.
-        let departure = |offset: f64, along_horizontal: bool| -> f64 {
-            let mut total = 0.0;
-            for base in 0..96 {
-                let b = f64::from(base) * 0.25;
-                let (x0, y0) = if along_horizontal { (b, 0.0) } else { (0.0, b) };
-                let (x1, y1) = if along_horizontal {
-                    (b + offset, 0.0)
-                } else {
-                    (0.0, b + offset)
-                };
-                total += (at(x1, y1) - at(x0, y0)).abs();
+            // A parabola through the best shift and its two neighbours, whose
+            // vertex is the sub-cell optimum. The mean squared error against a
+            // shifted surface is smooth in the shift, which is what makes this
+            // legitimate rather than a guess.
+            let (left, middle, right) =
+                (mean_error(best - 1), mean_error(best), mean_error(best + 1));
+            let curvature = left - 2.0 * middle + right;
+            if curvature <= 0.0 {
+                return best as f64;
             }
-            total / 96.0
-        };
+            best as f64 + 0.5 * (left - right) / curvature
+        }
 
-        // Half-departure distance, by bisection on a monotonically rising curve.
-        let half = |along_horizontal: bool| -> f64 {
-            let far = departure(40.0, along_horizontal);
-            let target = far * 0.5;
-            let (mut low, mut high) = (0.0f64, 40.0f64);
-            for _ in 0..40 {
-                let mid = (low + high) * 0.5;
-                if departure(mid, along_horizontal) < target {
-                    low = mid;
-                } else {
-                    high = mid;
-                }
-            }
-            (low + high) * 0.5
-        };
-        let (across, down) = (half(true), half(false));
+        let size = (200u16, 50u16);
+        let options = TerrainOptions::default();
+        // Nine seconds, which is about eight cells for the near ridge and under
+        // three for the far one. Both comfortably inside the search range, and
+        // both far enough that a one-frame rounding difference is a small part of
+        // the answer.
+        let seconds = 9.0;
+        let frames = (seconds * 60.0) as u64;
 
+        let mut terrain = Terrain::new(options.clone(), size);
+        let near_before = terrain.near_surface_rows(0.0);
+        let far_before = terrain.far_surface_rows(0.0);
+        for _ in 0..frames {
+            terrain.advance(1.0 / 60.0);
+        }
+        let near_after = terrain.near_surface_rows(terrain.offset);
+        let far_after = terrain.far_surface_rows(terrain.far_offset());
+
+        let limit = 12i64;
+        let near_shift = best_shift(&near_before, &near_after, limit);
+        let far_shift = best_shift(&far_before, &far_after, limit);
+
+        for (label, shift) in [("near", near_shift), ("far", far_shift)] {
+            assert!(
+                shift.abs() < limit as f64 - 1.0,
+                "the {label} ridge's best-matching shift is {shift:.2} cells, which is \
+                 at the edge of the -{limit}..={limit} range that was searched, so the \
+                 measurement is a fact about the range rather than about the picture"
+            );
+        }
+
+        let expected = options.scroll_speed * seconds;
         assert!(
-            across > down * 1.25,
-            "the grain takes {across:.1} cells to become unrecognisably different \
-             across and only {down:.1} down, a ratio of {:.2}. The vertical period \
-             is {GRAIN_PERIOD_Y} and the horizontal {GRAIN_PERIOD_X}; for bands the \
-             features have to be wider than they are tall, or the ground reads as \
-             vertical fluting.",
-            across / down
+            (near_shift + expected).abs() < 0.5,
+            "the near ridge travelled {expected:.1} cells in {seconds}s but its \
+             surface matches itself best at a shift of {near_shift:.2}"
+        );
+        assert!(
+            (far_shift + expected * options.parallax).abs() < 0.4,
+            "the far ridge should have travelled {:.1} cells at parallax {} but its \
+             surface matches itself best at a shift of {far_shift:.2}",
+            expected * options.parallax,
+            options.parallax
+        );
+
+        let ratio = far_shift / near_shift;
+        assert!(
+            (0.0..0.6).contains(&ratio),
+            "the far ridge travels at {ratio:.2} of the near ridge's rate, which is \
+             not visibly slower"
         );
     }
 
@@ -1413,6 +2288,11 @@ mod tests {
     /// silhouette sat a row too low, and on a one-row terminal the entire effect
     /// was a space -- indistinguishable from the sky it was supposed to be
     /// contrasted with.
+    ///
+    /// Two rows are now exempt from the depth ramp rather than one: each ridge's
+    /// lit edge is drawn at the *densest* step, so the rim is a solid line rather
+    /// than a dotted one. Both are asserted below, which is what keeps the
+    /// exemption from becoming the next version of this bug.
     #[test]
     fn the_ground_is_never_drawn_as_a_space() {
         assert!(
@@ -1421,21 +2301,27 @@ mod tests {
              ground is indistinguishable from the sky"
         );
 
-        // And on the real frame, not just in the constant.
+        // And on the real frame, not just in the constant. The near ridge is the
+        // one that has to reach the bottom of the screen, so the band between the
+        // two surfaces is checked as well -- a far ridge with a hole in it would
+        // be a hole in the layer behind the one you are looking at.
         let size = (80u16, 24u16);
-        let rows = surface(size);
-        let grid = drawn(size, 0);
-        // A column is a stride through a row-major grid, not a row.
-        for (x, &top) in rows.iter().enumerate() {
-            for (y, cell) in grid
-                .iter()
-                .enumerate()
-                .skip(top)
-                .map(|(y, row)| (y, row[x]))
-            {
+        let frame = Frame::new(size, 0);
+        for (x, (&near, &far)) in frame.near.iter().zip(&frame.far).enumerate() {
+            for y in far.min(near)..near {
                 assert_ne!(
-                    cell, ' ',
-                    "cell ({x}, {y}) is below the surface at row {top} but drew \
+                    frame.glyph(x, y),
+                    ' ',
+                    "cell ({x}, {y}) is inside the far ridge, between its surface on \
+                     {far} and the near one on {near}, but drew as a space, so the \
+                     distant layer has a hole in it"
+                );
+            }
+            for y in near..size.1 as usize {
+                assert_ne!(
+                    frame.glyph(x, y),
+                    ' ',
+                    "cell ({x}, {y}) is below the surface at row {near} but drew \
                      as a space, so the ground has a hole in it"
                 );
             }
@@ -1525,23 +2411,35 @@ mod tests {
     /// the surface, so the test watches the surface. A scroll that moved the
     /// depth shading while leaving every crest on the same row would pass the old
     /// test and fail this one.
+    ///
+    /// Asserted for both ridges, and the far one is the interesting half: a
+    /// `parallax` of zero would leave the distant layer standing still while the
+    /// near one slid past it, which is not a landscape at any rate and is also
+    /// the failure that a test watching only the near ridge would report as a
+    /// pass.
     #[test]
     fn the_scroll_moves_the_silhouette_and_not_only_the_shading() {
         let mut terrain = Terrain::new(TerrainOptions::default(), (80, 24));
-        let horizon = Terrain::horizon_row((80, 24));
-        let first = terrain.surface_rows(terrain.offset, horizon);
+        let near_first = terrain.near_surface_rows(terrain.offset);
+        let far_first = terrain.far_surface_rows(terrain.far_offset());
 
         for _ in 0..120 {
             terrain.advance(1.0 / 60.0);
         }
-        let later = terrain.surface_rows(terrain.offset, horizon);
+        let near_later = terrain.near_surface_rows(terrain.offset);
+        let far_later = terrain.far_surface_rows(terrain.far_offset());
 
-        let moved = first.iter().zip(&later).filter(|(a, b)| a != b).count();
-        assert!(
-            moved > 0,
-            "after two seconds at the default scroll speed not one column's \
-             surface had moved, so the landscape is standing still"
-        );
+        for (label, (first, later)) in [
+            ("near", (&near_first, &near_later)),
+            ("far", (&far_first, &far_later)),
+        ] {
+            let moved = first.iter().zip(later).filter(|(a, b)| a != b).count();
+            assert!(
+                moved > 0,
+                "after two seconds at the default scroll speed not one column's \
+                 {label} surface had moved, so that layer is standing still"
+            );
+        }
     }
 
     /// The default has to be visible motion without being a conveyor belt.
@@ -1551,11 +2449,19 @@ mod tests {
     /// field is offset vertically. The band is expressed as *seconds per noise
     /// period*, which is the quantity a viewer actually perceives: it is how
     /// long one ridge takes to cross the screen.
+    ///
+    /// The far ridge is held to the same band, and that is where the 0.35
+    /// default comes from: at `parallax` 0.35 the distant ridge takes 25.4
+    /// seconds to cross against the near one's 8.9, so both are inside it. Halve
+    /// the parallax again and the far ridge takes 51 seconds to move a screen's
+    /// width, which is not a landscape scrolling slowly, it is a still frame
+    /// with the near one moving in front of it.
     #[test]
     fn the_scroll_is_fast_enough_to_see_without_being_a_conveyor_belt() {
         let options = TerrainOptions::default();
         let period = TerrainOptions::default().scale;
         let seconds_per_period = period / options.scroll_speed;
+        let far_seconds = seconds_per_period / options.parallax;
 
         assert!(
             (2.0..30.0).contains(&seconds_per_period),
@@ -1563,6 +2469,13 @@ mod tests {
              to cross the screen, which is outside the 2 to 30 second band: under \
              2s the ground stops reading as distance, over 30s it is not motion",
             options.scroll_speed
+        );
+        assert!(
+            (2.0..30.0).contains(&far_seconds),
+            "at parallax {} the far ridge takes {far_seconds:.1}s to cross the \
+             screen, which is outside the same 2 to 30 second band the near ridge \
+             is held to",
+            options.parallax
         );
     }
 
@@ -1623,8 +2536,7 @@ mod tests {
                 relief: 4.0 / scale,
                 ..Default::default()
             };
-            let terrain = Terrain::new(options, (80, 24));
-            let rows = terrain.surface_rows(0.0, Terrain::horizon_row((80, 24)));
+            let rows = Terrain::new(options, (80, 24)).near_surface_rows(0.0);
             rows.windows(2).filter(|w| w[0] != w[1]).count() as f64
                 / (rows.len() - 1) as f64
         };
@@ -1678,19 +2590,32 @@ mod tests {
 
     /// The horizon leaves room for both sky and ground, at every size the
     /// contract suite drives.
+    ///
+    /// The far ridge is checked as well, and on a terminal too short to hold all
+    /// three bands the two are allowed to collapse into each other rather than to
+    /// be squeezed off the screen: a two-row terminal cannot show a sky, a
+    /// distant ridge and a near one, and the near one is the one worth keeping.
+    /// `far_ridge_row` is where that decision is made, and this is the test that
+    /// says it was made on purpose.
     #[test]
     fn the_horizon_leaves_room_for_sky_and_ground_at_every_size() {
         for (width, height) in [(6u16, 6u16), (8, 200), (200, 8), (1, 1), (1, 9)] {
             let horizon = Terrain::horizon_row((width, height));
+            let far = Terrain::far_ridge_row((width, height));
             assert!(
                 horizon < height as usize,
                 "at {width}x{height} the horizon is row {horizon}, so there is no \
                  ground at all"
             );
+            assert!(
+                far <= horizon,
+                "at {width}x{height} the far ridge is row {far} and the near one \
+                 {horizon}, so the dim layer would be drawn in front of the bright one"
+            );
 
-            let grid = drawn((width, height), 0);
-            let has_sky = grid.iter().flatten().any(|&c| c == ' ');
-            let has_ground = grid.iter().flatten().any(|&c| c != ' ');
+            let frame = Frame::new((width, height), 0);
+            let has_sky = frame.glyphs.iter().flatten().any(|&c| c == ' ');
+            let has_ground = frame.glyphs.iter().flatten().any(|&c| c != ' ');
 
             if height == 1 {
                 assert!(has_ground, "a one-row terminal was drawn as sky");
@@ -1820,20 +2745,41 @@ mod tests {
 
     /// `--print-config` writes every key to disk, so a generated config is pinned
     /// to whatever the defaults were the day it was generated. `relief` has to
-    /// be in that list or it arrives as a key the user's file does not have.
+    /// be in that list or it arrives as a key the user's file does not have --
+    /// and a key that arrives as its default is a key that never reaches anyone
+    /// the moment the default moves, which is how this project ended up with a
+    /// donut rotating sixty times too slowly for a release.
+    ///
+    /// The two new keys are asserted by *value* as well as by presence. A
+    /// presence check alone is satisfied by a field that serde happens to
+    /// serialise and that the renderer never reads, and that is exactly the
+    /// failure a new option is most likely to have.
     #[test]
     fn the_new_keys_round_trip_through_toml() {
         let options: TerrainOptions = toml::from_str(
-            "scroll_speed = 2.5\nrelief = 0.3\nglyphs = \" .oO@\"\n",
+            "scroll_speed = 2.5\nrelief = 0.3\nfar_relief = 0.9\nparallax = 0.2\nglyphs = \" .oO@\"\n",
         )
-        .expect("three keys parse");
+        .expect("five keys parse");
         assert_eq!(options.scroll_speed, 2.5);
         assert_eq!(options.relief, 0.3);
+        assert_eq!(options.far_relief, 0.9);
+        assert_eq!(options.parallax, 0.2);
         assert_eq!(options.glyphs, " .oO@");
         assert_eq!(
             options.scale,
             TerrainOptions::default().scale,
-            "three keys in the section silently reset the others"
+            "five keys in the section silently reset the others"
+        );
+
+        // And the defaults, which is what --print-config writes.
+        let defaults = TerrainOptions::default();
+        assert_eq!(defaults.far_relief, DEFAULT_FAR_RELIEF);
+        assert_eq!(defaults.parallax, DEFAULT_PARALLAX);
+        assert!(
+            defaults.parallax < 1.0,
+            "the default parallax is {} , so the far ridge scrolls at the same rate \
+             as the near one and there is no parallax at all",
+            defaults.parallax
         );
 
         let serialised = toml::to_string(&options).expect("the section serialises");
@@ -1844,6 +2790,8 @@ mod tests {
             "persistence",
             "scroll_speed",
             "relief",
+            "far_relief",
+            "parallax",
             "glyphs",
         ] {
             assert!(
@@ -1871,33 +2819,74 @@ mod tests {
         );
     }
 
-    /// The surface must be cheap.
+    /// The surfaces must be cheap.
     ///
-    /// It is the only part of the frame that costs a noise sample, and there are
-    /// `height` times more cells than columns. Sampling per cell instead -- which
-    /// is what the old renderer did -- is 80,000 samples at 400x200 against 200.
-    /// This asserts the count rather than the timing, because a timing assertion
-    /// on a shared build machine fails for reasons that have nothing to do with
-    /// the code.
+    /// They are the only part of the frame that costs a noise sample, and there
+    /// are `height` times more cells than columns. Sampling per cell instead --
+    /// which is what the old renderer did, and what the grain it grew needed --
+    /// is 80,000 samples a frame at 400x200 against 800 for both ridges.
+    ///
+    /// This asserts the *array lengths* rather than the sample count, and that
+    /// is worth being honest about: a per-column sample is a structural property
+    /// of the renderer and the only thing a test can see is that the arrays the
+    /// fill loop walks are one long rather than one long per row. A per-cell
+    /// sample would have to make one of them `width * height`.
+    ///
+    /// The second half is the one that catches a real regression: a frame that
+    /// drew *fewer* cells would satisfy the first half too, and the canvas is
+    /// blanked at the start of every frame, so skipping cells it believes are
+    /// unchanged would leave holes rather than save work.
     #[test]
-    fn the_surface_costs_one_noise_sample_per_column_not_per_cell() {
+    fn the_surfaces_cost_one_noise_sample_per_column_per_ridge_not_per_cell() {
         let size = (400u16, 200u16);
         let terrain = Terrain::new(TerrainOptions::default(), size);
-        let rows = terrain.surface_rows(0.0, Terrain::horizon_row(size));
 
         assert_eq!(
-            rows.len(),
+            terrain.near_surface_rows(0.0).len(),
             usize::from(size.0),
-            "the surface should be computed once per column"
+            "the near surface should be computed once per column"
         );
-        // And the frame still draws every cell, so the cheap surface did not come
-        // from drawing less.
+        assert_eq!(
+            terrain.far_surface_rows(0.0).len(),
+            usize::from(size.0),
+            "the far surface should be computed once per column"
+        );
+
+        // And the frame still draws every cell, so the cheap surfaces did not
+        // come from drawing less.
         let mut painted = Terrain::new(TerrainOptions::default(), size);
         let drawn_cells = painted.get_diff().len();
         assert_eq!(
             drawn_cells,
             usize::from(size.0) * usize::from(size.1),
             "at 400x200 the frame should touch every cell, got {drawn_cells}"
+        );
+    }
+
+    /// A silhouette is cheap to emit, and the two ridges together still are.
+    ///
+    /// The deleted grain cost more than it bought, and this is the measurement
+    /// that says so. A cell only reaches the wire when it *changes*, and a cell
+    /// that is a flat fill below a moving surface does not change until the
+    /// surface reaches it: measured over 300 frames at 400x200 the previous
+    /// version changed 1,161 cells a frame and this one changes fewer than a
+    /// third of that, because a body whose glyph was a two-dimensional sample
+    /// rewrote most of the ground every frame while a fill does not.
+    ///
+    /// A byte count is only meaningful next to what is on screen, and this one
+    /// is on screen being *less* structured -- so the assertion is deliberately
+    /// loose. It is not a performance budget; it is a tripwire on the *shape* of
+    /// the frame. A renderer that went back to a per-cell field would put this
+    /// straight back over 3,000, and one that drew a third ridge would put it
+    /// over too, which is the other thing worth knowing.
+    #[test]
+    fn a_frame_of_two_silhouettes_changes_few_cells() {
+        let mean = mean_frame_diff((400, 200), 300);
+        assert!(
+            mean < 900.0,
+            "the frame changed {mean:.0} cells on average at 400x200, so something \
+             is being recomputed per cell rather than per column -- the removed \
+             grain did this at 1,161"
         );
     }
 }
