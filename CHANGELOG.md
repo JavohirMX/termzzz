@@ -244,6 +244,33 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   Corner markers on the cube still skip the hidden corner, deliberately: the
   marker is flat white, so marking the far corner would make it the brightest
   thing on screen while its three dim edges recede.
+- **`[plasma]` is sixteen glyphs and no longer repeats.** The three moving time
+  terms are now `1`, `√2` and `√3` over a common factor of 2, so no interval
+  advances all three by a whole number of cycles. The old set was all rational
+  and had an exact period of `8π` — 25.13 seconds, after which the screen
+  returned cell for cell. The factor of 2 is there to keep the field's existing
+  ordering of speeds; the unscaled set would have made the slow ripple the
+  fastest term.
+
+  Sixteen steps, all sixteen used. The busiest went from 22.4% of the screen to
+  8.8% and the sparsest from 0.20% to 3.7%, measured over 200 frames at 200x50.
+  The re-spacing is a boundary table fitted to the field's measured quantiles
+  rather than a gamma curve: `t^g` can only tilt a bell, and the only thing that
+  flattens one is an S-curve.
+
+  Sixteen *reliably separated* ASCII bands is not available — below about a
+  quarter-cell of ink, ASCII is a crowd of one-mark glyphs, and the ties in the
+  ink table go from three to nine. Sixteen steps is what the technique carries.
+- **`[ink]` has named colour presets**: `green`, `orange`, `blue`, `magenta`,
+  `ice`, `amber`. Every one runs from near-black to exactly `rgb(255,255,255)`
+  at the top — the tinted-white top was reported twice in this project, so there
+  are two tests on it. `green` is the existing phosphor ramp by identity, not a
+  copy, so the default is unchanged and the two cannot drift apart.
+
+  `palette` takes precedence over the `colors` list. That is forced rather than
+  chosen: the default `colors` is always populated, so "the list wins when set"
+  would mean "the list never wins", and a generated config could never be told to
+  use orange. `palette = ""` is the way back to the list.
 - **`--random`** seeds a run from the operating system, so a launch looks
   different every time. `--seed` wins if both are given, and says so rather than
   quietly ignoring one: an explicit seed is a request to reproduce something, and
@@ -259,15 +286,6 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   that is the 3D cue rather than a flourish.
 
 ### Known
-- **`[plasma]` does not use the whole glyph ramp.** Measured over 200 frames at
-  80x24, `+` and `;` between them cover 65% of the screen, `#` appears in 93
-  frames of 200, `%` in 11, and `@` not at all. The cause is the field's
-  distribution rather than the ramp: it is peaked in the middle, so a uniformly
-  quantised ramp spends half its steps where the field rarely is. Six candidate
-  ASCII ramps were measured and every one was worse in a different place, so the
-  fix is not a different set of characters — it would be a curve on the sampling,
-  which changes what the glyph means as a value and so is a decision rather than
-  a tweak. Left alone deliberately.
 - **`life.step_generation` scans a `HashMap`** and costs about 3.94 ms on its
   `update x4` worst case at 400x200, which is the only reason `life` is over the
   2 ms budget.
