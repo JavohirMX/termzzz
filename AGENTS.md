@@ -21,7 +21,7 @@ termzzz donut       # 3D donut rotation
 termzzz pipes       # Pipe maze animation
 termzzz plasma      # Plasma effect, value in the glyph
 termzzz fire        # Fire simulation
-termzzz terrain     # A landscape: height field, surface, filled ground
+termzzz terrain     # A cross-section: surface, banded ground, sky
 termzzz solarsystem # 3D orrery: tilted orbits, real periods
 termzzz dvd         # The real DVD wordmark, bouncing, in braille
 termzzz blank       # Blank screen
@@ -33,6 +33,10 @@ termzzz --shuffle
 
 # Reproducible runs: every effect that uses randomness honours the seed
 termzzz matrix --seed 1234
+
+# Or the other way: a launch that looks different every time. --seed wins if
+# both are given, and the run says so rather than quietly ignoring one.
+termzzz --random
 
 # Development
 cargo test        # Run tests
@@ -260,6 +264,90 @@ Prefer a test that fails without the fix over a test that only passes with it. T
 bug found most cheaply in this project was a `Buffer::diff` coordinate bug, and the
 reason it was found cheaply is that `tests/effect_contracts.rs` was written before
 the fixes rather than after them.
+
+### Tests that pass for the wrong reason
+
+A second pass, driven by watching the effects run rather than reading them,
+produced five tests that passed *against the bug they were written to catch*. That
+is a distinct failure from a missing test and it is worse, because it reports
+coverage that is not being provided. Four patterns, all from real incidents:
+
+**A test that stopped testing its subject.** `the_ground_gets_denser_and_darker_
+with_depth` drove the ramp *function* rather than the render, so after the glyph
+stopped being a function of depth it went on checking that a ramp is ordered —
+which was never in doubt. Meanwhile the crab's shadow test asked for shadows on the
+bottom row, which on a sloping seabed is exactly where the sand is not, so it had
+stopped checking anything at all without failing. After changing what a field
+encodes, ask what each test that mentions it is still measuring.
+
+**A confounded metric.** The obvious way to ask "does the ground body have
+horizontal structure" is to count how many adjacent cells in one *row* differ. Two
+cells in the same row sit at different depths wherever the surface is uneven, so
+they differed with no structure at all — the metric measured the silhouette. The
+version that works compares at *constant depth*. Then it failed again, because it
+took the surface from a fresh effect at offset zero while rendering at offset 1.5,
+so each column was sampled at a different depth. When a measurement passes against
+the code it was written to reject, suspect the sampling, not the threshold.
+
+**A proxy that the defect can satisfy.** `the_picture_changes_on_almost_every_frame`
+asserted the DVD logo changes on most frames, as a proxy for "moves smoothly". A
+proxy like that is satisfiable by moving a whole cell at a time on rare frames,
+which is precisely the staircase it was written to catch. Assert the thing
+directly: no single frame moves the logo more than 0.2 of a cell. Where a proxy is
+unavoidable, say in the test's doc which defect it cannot see.
+
+**A search over the wrong range.** The terrain scroll test cross-correlates for the
+shift at which the ground matches itself, and first searched `0..=4` and reported a
+best of zero. That zero was the edge of its own range, not a fact about the
+picture: the offset is *added* to the column, so the same material is found further
+left. Check that a measured optimum is in the interior of the range you searched.
+
+Two of the five also came from tests that could not see the thing they claimed to.
+The precedence between `--seed` and `--random` happens after argument parsing, so
+the only reachable test was the whole binary; `resolve_seed` is a separate function
+precisely so the decision is testable at all. And the orrery's ghosting needed
+*three* frames, not two, because frame 2's diff is still correct — a two-frame
+comparison passed against the bug.
+
+### Inferring state from a measurement
+
+The crab's collision response gated the turn-away on `position.1 < ground`. That is
+a float comparison against a *sampled* value, and the sample moves. On a flat
+seabed the ground never changed under a crab, so it was free. With a slope, a
+walking crab sits a hundredth of a row above or below its own ground depending on
+which way it is walking, so it read as airborne — and a crab walking downhill could
+never turn away from a neighbour. The collision response was silently dead for half
+the colony, which is the same class of bug that had already been chased once in
+that file.
+
+It is an explicit `airborne` flag now. **When the state is known, store it rather
+than re-deriving it from a measurement**, and be suspicious of any `if a < b` whose
+right-hand side is a function of time or position.
+
+### The noise does not reach ±1
+
+Worth stating once, because it was wrong in three separate places in one session
+and each time it cost a test failure to discover. `terrain::noise`'s octave noise
+was assumed to span the full `-1.0..=1.0` range. Measured over four thousand
+samples at three different periods, it spans **0.79**. So anything dividing by
+1.0 to "normalise" it puts every value inside the middle four fifths and leaves
+the ends of the scale unreachable — quietly, with no error.
+
+It bit three times:
+
+- `terrain`'s `relief` is in rows per noise period, and an amplitude of 3.0
+  moved the surface 1.2 rows, which rounds to *one* row on a flat stretch and is
+  invisible. 7.0 gives the intended three rows.
+- The crab's `seabed_amplitude` first shipped at 3.0 and its own test measured
+  **one row of relief** across eighty columns. Same arithmetic, same cause.
+- The terrain body's grain divides by `NOISE_PRACTICAL_RANGE` for exactly this
+  reason, and a weight that cannot reach both ends of the ramp makes the
+  re-spacing that motivated it do nothing.
+
+The lesson is not "remember the number", it is that a normalisation constant
+derived from a spec sheet rather than a measurement is a guess wearing the
+costume of a fact. Measure it, and name the constant so the measurement is
+visible at the call site.
 
 ## Architecture
 See `specs/overview.md` for the project architecture and technical overview.
