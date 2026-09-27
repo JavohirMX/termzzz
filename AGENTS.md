@@ -282,9 +282,8 @@ whole column. Shading by row instead would be four times cheaper and would paint
 hilltop the same colour as a valley floor, which reads as a mistake. Both numbers
 are at the call site.
 
-**Both of those went up, and both were worth it, and the byte counts are the
-instructive half.** A cheap frame is not a good frame. But do not assume a byte
-count moved because of your change: plasma's went from 466 KB to 476 KB *this
+**The other half of that lesson is not to trust a byte count in the other
+direction either.** Do not assume one moved because of your change: plasma's went from 466 KB to 476 KB *this
 round* and I attributed a six-fold increase to the new glyph calibration before
 measuring the pre-round binary. The old effect was already the second-largest
 emitter in the crate, because a field peaked in the middle was already rewriting
@@ -412,9 +411,14 @@ It bit three times:
 
 - `terrain`'s `relief` is in rows per noise period, and an amplitude of 3.0
   moved the surface 1.2 rows, which rounds to *one* row on a flat stretch and is
-  invisible. 7.0 gives the intended three rows.
+  invisible. 7.0 gave the intended three rows. Both figures have since moved with
+  the effect's redesign, which is the other half of the lesson: these constants
+  are calibrated against a *measurement*, so a redesign invalidates them and
+  nothing but a test notices.
 - The crab's `seabed_amplitude` first shipped at 3.0 and its own test measured
-  **one row of relief** across eighty columns. Same arithmetic, same cause.
+  **one row of relief** across eighty columns. Same arithmetic, same cause. It is
+  now 21.0, and the period moved with it — see the note on the crab's sprite
+  width.
 - The terrain body's grain divided by `NOISE_PRACTICAL_RANGE` for exactly this
   reason. That constant and the grain it served are both gone now; the bullet is
   left because the third instance is what makes the pattern worth writing down.
