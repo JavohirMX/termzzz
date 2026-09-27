@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [0.2.0] - Unreleased
 
+Everything below is in three groups: what a session of watching the effects
+running turned up, then the earlier audit that found the outright bugs, then the
+upgrade notes. The first group is first because it is the most recent and because
+two of its entries — a terminal background setting and a solar system — are the
+only genuinely new features here.
+
 ### Added
 - **`[global] background` and `foreground`.** The terminal's own colours, pinned
   for the duration of the session. This is the fix for a class of complaint that
@@ -65,12 +71,90 @@ All notable changes to this project will be documented in this file.
   different questions — how much rock is there, and how much light reaches it —
   and for ground those disagree. The old effect had both encoding one scalar,
   which only worked because it had no surface for either to be relative to.
-- **`[terrain] relief` is new** (default 0.45): how far the surface may rise
-  above and fall below the horizon, as a fraction of the ground's depth. It is
-  the knob that decides whether the effect reads as a landscape. At 0.0 the
-  ground is a slab with a ruler along the top.
+- **`[terrain] relief` is new** (default 1.0): how far the surface may rise above
+  and fall below the horizon, in rows per period of the base-frequency noise. In
+  units of the period rather than of the screen, because the screen made the
+  landscape's *shape* depend on the terminal — with a fixed horizontal period, a
+  row amplitude that grows with the height made the surface steeper on a tall
+  screen. Measured as silhouette step density, one setting drew a landscape at
+  25% on an 80x24 and a picket fence at 76% on a 200x50.
 
-### Upgrade notes
+  Measured after the rewrite, terrain went from **1.3 ms and 554 KB per frame to
+  350 µs and 17 KB** at 400x200. The byte count fell 32x because unchanged sky
+  cells now drop out of the diff, and the render cost 3.7x because the surface
+  costs one noise sample per *column* rather than per cell — 200 samples at
+  400x200 against 80,000.
+
+### Fixed
+#### Watching them run
+A second pass over the effects, driven by watching them run rather than reading
+them.
+
+- **The ink's white was not white, and had been reported twice.** The top stop of
+  the ramp was `rgb(230, 243, 227)` — 6.6% saturated green — and the first report
+  of it was not acted on. It is `rgb(255, 255, 255)` now, and there is a
+  `[ink] colors` option so the ramp can be pinned to a single hue if the phosphor
+  look is not wanted. Two further bugs surfaced while fixing it: the field was
+  the last in the crate still setting `Attribute::Bold`, and it did so on exactly
+  `value >= 0.72` — the white that was being complained about — so on a terminal
+  that honours the hint there was a second brightness term on top of the ramp's.
+  And a configured `colors` list was accepted by the config and then discarded by
+  the renderer, which passed an empty vector.
+- **The crabs overlapped and flickered.** They had no runtime separation at all,
+  only spawn-time placement; pairs sharing a drawn column went from 28 of 39,600
+  at 200x50 to zero. `WALK_GAIN` is back to 1.0, so 2.1–3.9 cells a second rather
+  than the 10.5–19.5 that a previous change introduced. Separately, the leg
+  animation is a plain 0.2 s timer and is *not* derived from the walk speed, so
+  slowing the body left the legs snapping five times a second — which is what
+  "they change too fast" was about. Now 0.4 s, and the test's bound came down from
+  8 Hz to 4 to match.
+  Two bugs had to be fixed to make separation work at all, neither of them in the
+  brief: the collision response was reversing *both* crabs on an overtake, which
+  converts a catch-up into a head-on pair that is more closing (571 reversals in
+  600 frames, the colony vibrating in place), and a crab between two head-on
+  neighbours was being reversed once per pair per frame.
+- **Conway's Game of Life changed every cell's character every frame.** It now
+  runs at 3 generations a second rather than 8, and the glyph is banded into
+  three bands of three generations, so cells that changed character per
+  generation fell from 94% to 14.3%. The colour ramp was left continuous and
+  carries the gradient the glyph gave up. The bands divide evenly rather than
+  following the age curve, because bands sized by population give the newborn
+  band — where 92% of a soup lives — the shortest hold.
+- **The cube is edges-only again.** `filled` defaults to false. The filled version
+  is still there and still works; the report was that the wireframe gave a better
+  *feeling*, because a filled near face runs its own dither up to the same
+  densities as its edges and the silhouette stops being a silhouette.
+- **The donut gained a `palette` knob** and its dark end was lifted, measured as
+  CIE76 ΔE against a greyish-blue `rgb(60,70,85)`: the darkest stop went from
+  ΔE 24.6 to 67.8, and the worst of the twelve shades from 24.6 to 55.1. The
+  cost is real and is in the comment: a torus on a black background is now a
+  mid-tone mass where it had a deep shadow, because the ramp's usable range
+  starts at 52 rather than 0. Pin `[global] background` if you want the old
+  relationship.
+- **The matrix's character pool is now defended rather than explained.** The pool
+  is mostly katakana because a pool of one script is a pool of a few distinct
+  shapes, which is not visible in the code and which a future reader would
+  plausibly "fix". It is a test now, counting by range over the live pool rather
+  than against a copy of the string — a copy measures the copy, and the first
+  version of this test was satisfied by a pool trimmed to 16 of 54 characters.
+
+### Known
+- **`[plasma]` does not use the whole glyph ramp.** Measured over 200 frames at
+  80x24, `+` and `;` between them cover 65% of the screen, `#` appears in 93
+  frames of 200, `%` in 11, and `@` not at all. The cause is the field's
+  distribution rather than the ramp: it is peaked in the middle, so a uniformly
+  quantised ramp spends half its steps where the field rarely is. Six candidate
+  ASCII ramps were measured and every one was worse in a different place, so the
+  fix is not a different set of characters — it would be a curve on the sampling,
+  which changes what the glyph means as a value and so is a decision rather than
+  a tweak. Left alone deliberately.
+- **`life.step_generation` scans a `HashMap`** and costs about 3.94 ms on its
+  `update x4` worst case at 400x200, which is the only reason `life` is over the
+  2 ms budget.
+- **`mandelbrot` render is 11.9 ms at 400x200**, and its cost is very close to
+  linear in `max_iterations` because nearly every interior pixel spends the whole
+  budget discovering it never escapes. A region-marking rewrite is where the real
+  win is.
 - **`termzzz constellation` is now `termzzz solarsystem`.** Renamed with no
   deprecated alias, for the same reason as `ascii` → `ink`: the old name says
   star chart and the effect is an orrery, so keeping it would have meant
@@ -87,6 +171,7 @@ All notable changes to this project will be documented in this file.
   other, so an old value will look different rather than wrong.
 
 ### Fixed
+#### The audit
 Fourteen effects were audited against what they actually draw. Most of what came
 back was not a matter of taste, and several of these effects had never once shown
 their output to anyone.

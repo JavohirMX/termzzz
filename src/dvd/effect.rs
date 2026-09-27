@@ -156,8 +156,7 @@ pub struct DvdOptions {
     /// only coincide after 25 and 17 of them -- about 95 seconds, and a figure
     /// that moves with the logo's width rather than being a property of anything.
     /// The logo sat at one colour for a minute and a half, which is the same as
-    /// never changing.
-    ///
+    /// never changing.    ///
     /// lemonyte's `dvd-screensaver`, which is the reference for this effect,
     /// recolours on *every* wall hit, and that is what [`ColorChange::Bounce`]
     /// still does. It is no longer the default: with a 30-cell wordmark and a

@@ -60,21 +60,24 @@ cargo clippy       # Run linter
 
 ## Current Focus
 Ship the `termzzz` 0.2.0 release. Global speed control, the DVD logo, playlist
-mode, and the effect registry are all done. What remains is the canonical GitHub
-repository and the distribution metadata (crates.io publication, Homebrew, Nix).
+mode, the effect registry, a pinnable terminal background, and a 3D solar system
+are all done. What remains is the canonical GitHub repository and the
+distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **`mandelbrot` render cost at large sizes.** 12.3 ms per frame at 400x200,
+1. **`mandelbrot` render cost at large sizes.** 11.9 ms per frame at 400x200,
    which is over half a 60 Hz budget spent before a single byte is written. The
    cost is very close to linear in `max_iterations`, because nearly every interior
    pixel spends the whole budget discovering it never escapes. Lowering the
    default is the first thing to try; a region-marking rewrite is where the real
-   win is, and that is a rewrite rather than a tweak.
-   `terrain` is now also over the 2 ms budget at 400x200 (1.3 ms render, 554 KB),
-   which it was not when it drew one frame and then nothing. That is the honest
-   cost of an effect that moves, and it is the same trade `mandelbrot` and
-   `boids` are in. `life` is over on its `update x4` worst case only
+   win is, and that is a rewrite rather than a tweak. `life` is over the 2 ms
+   budget on its `update x4` worst case only, and only because
+   `step_generation` scans a `HashMap`.
+   `terrain` is *no longer* over, and by a lot: the height-field rewrite took it
+   from 1.3 ms and 554 KB to 350 µs and 17 KB, because the surface costs one
+   noise sample per column rather than per cell and unchanged sky cells drop out
+   of the diff
 2. **More effects on the sub-cell renderer.** `starfield` and `flow` want
    braille (line art, one colour per cell); `physarum` and a Gray-Scott
    reaction-diffusion want half-block (smooth colour). Each is roughly 150-350
@@ -143,8 +146,14 @@ frame any more.
 The sub-cell renderers are in `src/render/`: `braille` (8x density, one colour
 per cell), `halfblock` (2x vertical, two colours per cell, which is what gave
 `Cell` its background), `quadrant` (2x on *both* axes, two-tone), plus `dither`
-and `palette`. All four now have callers: `mandelbrot` uses `halfblock`, `cube`
-uses `braille` and `dither`, and `dvd` uses `quadrant`.
+and `palette`. Three of the four have callers: `mandelbrot` uses `halfblock`,
+`cube` uses `braille` and `dither`, `dvd` and `solarsystem` use `braille`.
+
+`quadrant` currently has **none**. `dvd` was its only caller and moved to
+`braille` when the real DVD wordmark arrived, because that logo is a
+single-colour silhouette and braille's trade is density rather than hue. It is
+kept rather than deleted -- it is tested, and it is still the only sub-cell on
+both axes in the crate -- but do not describe it as having a caller.
 
 Note the aspect-ratio caveat, which applies to all of them: they assume a cell
 about twice as tall as it is wide, and DejaVu Sans Mono is nearer 1:1.2, so output
@@ -157,13 +166,28 @@ deliberately limited to a *two-tone* bitmap, since four arbitrary colours cannot
 shown in two. Its font risk is local rather than global: a solid interior is `█`
 and stays solid, so a terminal missing `▛▜▙▟` only loses a shape's outline.
 
-There is also a shared `GlyphRamp` in the same directory, and eight effects now
-draw their characters from it. Read its module doc before choosing a set: the
-ORDERING is the whole point, and a ramp that puts the light characters on the ones
-covering most of the screen makes the majority of the frame the brightest thing on
-it. `presets::BLOCKS` is the only set whose ordering Unicode defines rather than
-taste, which makes it the right default for anything using the character as a
-*value* rather than as texture.
+Braille is one colour per cell, which is a real constraint and not a detail: an
+effect that wants per-dot colour has to keep a parallel per-cell colour array, and
+`dvd` and `solarsystem` both pair theirs with a depth buffer. Without the buffer
+the first thing drawn wins every contested cell -- `solarsystem` draws the sun
+first, so a planet crossing in front of it would vanish for the length of the
+conjunction.
+
+There is also a shared `GlyphRamp` in the same directory, and five effects draw
+their characters from it: `cube`, `donut`, `life`, `plasma` and `terrain`. (`crab`
+uses only the module's character-width filter, not the ramp. This said "eight" for
+a while, which is how a count drifts when nobody checks it against `rg`.) Read its
+module doc before choosing a set: the ORDERING is the whole point, and a ramp that
+puts the light characters on the ones covering most of the screen makes the
+majority of the frame the brightest thing on it. `presets::BLOCKS` is the only set
+whose ordering Unicode defines rather than taste, which made it the right default
+for anything using the character as a *value* rather than as texture — and
+`terrain` and `plasma` have both now moved off it to ASCII, with the cost written
+down on each constant. Two things that cost is worth knowing before moving a third:
+an ASCII ramp cannot be monotonic in ink at all, and a ramp for a *filled region*
+must not begin with a space, because the sparsest step lands on the row at the top
+of the region and a space there makes the region invisible against whatever is
+behind it.
 
 Determinism is done: all nine effects that used an unseeded generator now carry a
 `seed` option and a seeded `StdRng`, `--seed <N>` overrides all of them, and
@@ -180,12 +204,22 @@ At 400x200, which is an eight-times-heavier terminal than that budget assumes,
 `mandelbrot` and `life` are still over; `life` only on its `update x4` worst case
 at high `--speed`, and `mandelbrot` on render, which is item 1 above.
 
-Two numbers in the frame table went *up* in the recent work, and both are
+Two numbers in the frame table went *up* in the earlier audit, and both are
 correct. `mandelbrot` went from 31 KB to 215 KB of escape sequences per frame at
 400x200, and `matrix` from 63 KB to 67 KB. Each was previously cheap because it
 was broken: the mandelbrot was showing a flat wash with no detail to change, and
 the matrix drop tails were all one saturated colour because a truncating cast
 destroyed the fade. A byte count is only meaningful next to what is on screen.
+
+Two numbers then went sharply *down*, and both are worth understanding rather
+than just noting. `terrain` fell from 554 KB to 17 KB because the height-field
+rewrite leaves the sky as a space that matches the cleared cell, so unchanged sky
+drops out of the diff entirely — the effect got *more* structured and 32x cheaper
+to emit. `dvd` is 596 bytes at 400x200 for the same reason in braille: a cell with
+no raised dot is not written. **Not writing a cell is the cheapest rendering
+optimisation there is**, and both of these found it by accident rather than by
+looking for it. Check whether an effect is writing cells that did not change before
+optimising anything it computes.
 
 ## Working Practices
 
