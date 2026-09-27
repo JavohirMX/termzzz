@@ -224,6 +224,26 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   asserted 18 while its own comment claimed to preserve something it did not.
 
 ### Changed
+- **`[cube]` is an X-ray wireframe.** Hidden-line removal is gone: all twelve
+  edges are drawn, with the three facing away dimmer than the three facing
+  toward you. The dimming is the cube's own depth ramp rather than a per-edge
+  flag, so it stays one function of `z` — but the ramp needed extending, because
+  it was normalised against the *visible* faces' own planes and so the farthest
+  front-facing face sat at the top of the range. A far edge clamped past it landed
+  on the same ramp stop: the brightest far edge and the dimmest near edge measured
+  **114.9 and 114.9**, identical. The range now reaches 15% of the way past the
+  front faces to the farthest face of any kind.
+- **`[life]` draws every live cell with one character.** `@`, for every age from
+  0 to `MAX_AGE`. Age is still shown, by colour, which was always continuous.
+
+  This is the third version in one direction, each removing a way for the
+  character to move: random per generation, then a continuous ramp of the age,
+  then three bands of three, now a constant. Age was being shown *twice* — once
+  by colour and once by character — and only one of the two was wanted.
+
+  Corner markers on the cube still skip the hidden corner, deliberately: the
+  marker is flat white, so marking the far corner would make it the brightest
+  thing on screen while its three dim edges recede.
 - **`--random`** seeds a run from the operating system, so a launch looks
   different every time. `--seed` wins if both are given, and says so rather than
   quietly ignoring one: an explicit seed is a request to reproduce something, and
