@@ -289,7 +289,7 @@ impl Default for DvdOptions {
             // 12 puts it at 40%, i.e. movement on roughly every other frame,
             // which at 60 Hz is the point where the eye stops seeing discrete
             // steps and starts integrating them as motion. 15 and 18 keep
-            /// going up and there is no cliff; this is a taste line, and
+            // going up and there is no cliff; this is a taste line, and
             // `speed` in the config moves it.
             //
             // ## The two wrong answers this replaced
