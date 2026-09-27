@@ -11,6 +11,24 @@ two of its entries — a terminal background setting and a solar system — are 
 only genuinely new features here.
 
 ### Added
+- **An unseeded run is random.** Every effect that uses randomness now gets a
+  fresh seed on each launch, so no two runs look the same. Previously every
+  effect started from the same fixed seed, which meant a screensaver looked
+  identical every time you started it and a playlist of sixteen was the same
+  sixteen forever.
+
+  `--seed <N>` still pins every effect, for a reproducible run. `--random` is
+  kept and is now a no-op, because a flag that used to do something should not
+  start erroring; the help says so rather than pretending otherwise.
+
+  **One upgrade note.** A config that pins `seed = 42` is now indistinguishable
+  from one that omits it, and both mean "give me something different each
+  launch". If you were relying on 42, use `--seed 42`. This also fixes a trap
+  that has been documented in `AGENTS.md`: `--print-config` writes every default
+  to disk, so a generated config used to pin whatever the defaults were when you
+  generated it — which is how a 60x-too-slow donut rotation survived a default
+  change in this project. For seeds that trap now dissolves rather than being
+  worked around, because 42 no longer pins anything.
 - **`[global] background` and `foreground`.** The terminal's own colours, pinned
   for the duration of the session. This is the fix for a class of complaint that
   no amount of per-effect tuning reaches: on a terminal with a tinted profile,
@@ -224,6 +242,25 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   asserted 18 while its own comment claimed to preserve something it did not.
 
 ### Changed
+- **The DVD logo is roughly twice as quick, and no longer stutters.** 5 → 12
+  cells a second. Measured by accumulating every frame's diff the way a terminal
+  does and counting how often the picture actually changes:
+
+  | speed | 5 | 8 | 10 | 12 | 15 | 18 |
+  |---|---|---|---|---|---|---|
+  | frames it moves on | 17% | 28% | 34% | 40% | 51% | 82% |
+
+  At 5 it moved on **one frame in six** — five identical frames and then a lurch,
+  each lurch rewriting 41% of the logo's dots. That reads as flicker, not as slow
+  motion, which is why "a little slow" and "flickers" were the same complaint.
+  The jump is one dot at every speed; going faster makes the jumps more frequent,
+  not bigger.
+
+  The previous value came from the reference implementation's measured pace, and
+  the arithmetic was right and the question was wrong: a 1920-pixel window has
+  1920 positions to choose from where a braille cell has two dots. Copying the
+  reference's pace onto a medium with a hundredth of its spatial resolution does
+  not copy its pace, it copies a stutter.
 - **`[cube]` is an X-ray wireframe.** Hidden-line removal is gone: all twelve
   edges are drawn, with the three facing away dimmer than the three facing
   toward you. The dimming is the cube's own depth ramp rather than a per-edge
