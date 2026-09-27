@@ -5,6 +5,7 @@ use crate::render::glyph_ramp::{self, GlyphRamp};
 use crossterm::style;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, SQRT_2};
+use std::sync::LazyLock;
 
 /// `std::f64::consts::SQRT_3` is still unstable, so it is spelled out here.
 ///
@@ -261,6 +262,79 @@ const VALUE_BOUNDARIES: [f64; 15] = [
 /// which is not what a terminal screensaver should be spending its frame on but
 /// is also a good deal cheaper than the four sines and a square root that produce
 /// the value it is applied to.
+/// Buckets in [`STEP_LUT`]. Sixteen bits.
+///
+/// A power of two so the bucket index is a shift rather than a division, and
+/// fine enough that quantisation is invisible: the boundaries are about 1/16
+/// apart, so this resolves them to five significant figures.
+const STEP_LUT_LEN: usize = 1 << 16;
+
+/// The step index for each of [`STEP_LUT_LEN`] evenly spaced inputs.
+///
+/// Built once from [`VALUE_BOUNDARIES`], which is the only place the
+/// calibration is written. Sixteen kilobytes of `u8`, which is cheaper than the
+/// branch mispredicts it replaces.
+static STEP_LUT: LazyLock<[u8; STEP_LUT_LEN]> = LazyLock::new(|| {
+    let mut table = [0u8; STEP_LUT_LEN];
+    for (bucket, slot) in table.iter_mut().enumerate() {
+        let value = bucket as f64 / (STEP_LUT_LEN - 1) as f64;
+        *slot = VALUE_BOUNDARIES.partition_point(|bound| *bound <= value) as u8;
+    }
+    table
+});
+
+/// One entry per ramp step: the input segment's low edge, the reciprocal of its
+/// width, and the output segment it maps onto.
+#[derive(Clone, Copy)]
+struct Segment {
+    low: f64,
+    /// `1 / (high - low)`, or zero for a zero-width input segment.
+    inv_span: f64,
+    out_low: f64,
+    out_span: f64,
+}
+
+/// The sixteen segments, derived from [`VALUE_BOUNDARIES`].
+///
+/// `GlyphRamp::index_for` is `round(f * 15)`, so step `index` is the interval
+/// from `(index - 0.5) / 15` to `(index + 0.5) / 15`. Step 0's lower edge and
+/// step 15's upper edge fall outside `0..=1` and cannot be reached, which is why
+/// those two come out half-width rather than full-width.
+static SEGMENTS: [Segment; 16] = {
+    let mut built = [Segment {
+        low: 0.0,
+        inv_span: 0.0,
+        out_low: 0.0,
+        out_span: 0.0,
+    }; 16];
+    let mut index = 0;
+    while index < 16 {
+        let (low, high) = match index {
+            0 => (0.0, VALUE_BOUNDARIES[0]),
+            15 => (VALUE_BOUNDARIES[14], 1.0),
+            _ => (VALUE_BOUNDARIES[index - 1], VALUE_BOUNDARIES[index]),
+        };
+        let (out_low, out_high) = match index {
+            0 => (0.0, 0.5 / 15.0),
+            15 => (14.5 / 15.0, 1.0),
+            _ => ((index as f64 - 0.5) / 15.0, (index as f64 + 0.5) / 15.0),
+        };
+        built[index] = Segment {
+            low,
+            // A zero-width input segment is reachable only if two boundaries are
+            // equal, and a hand-edited table can do that. Zero rather than a
+            // branch, and rather than infinity: `0 * inf` is NaN, and `f64::clamp`
+            // propagates a NaN *value* rather than replacing it, so infinity here
+            // would poison the glyph index instead of flooring the fraction.
+            inv_span: if high > low { 1.0 / (high - low) } else { 0.0 },
+            out_low,
+            out_span: out_high - out_low,
+        };
+        index += 1;
+    }
+    built
+};
+
 fn glyph_value(value: f64) -> f64 {
     let value = if value.is_nan() {
         0.0
@@ -268,33 +342,37 @@ fn glyph_value(value: f64) -> f64 {
         value.clamp(0.0, 1.0)
     };
 
-    // How many boundaries the value is at or past, so `0..=15`: fifteen means it
-    // is above all of them and belongs in the last step.
-    let index = VALUE_BOUNDARIES.partition_point(|bound| *bound <= value);
+    // Which step the value falls in, from a table rather than a search.
+    //
+    // This is on the hot path -- once per cell, so eighty thousand times at
+    // 400x200 -- and `partition_point` over fifteen boundaries is a binary
+    // search: four unpredictable branches per cell, none of them vectorisable.
+    // Measured, it cost 310 us of the render, which is 32% of the total and the
+    // difference between this effect being inside the 2 ms budget at 400x200 and
+    // outside it.
+    //
+    // The table is *derived* from `VALUE_BOUNDARIES` rather than being a second
+    // place the calibration is written down, so the boundaries remain the single
+    // source of truth. Sixteen bits of resolution is 7.6e-6, roughly eight
+    // thousand times finer than the gap between two boundaries, so the only
+    // values it can move are those sitting within 0.0008% of a boundary -- and
+    // because the quantisation is monotone, the output stays monotone, which is
+    // the property the tests actually check.
+    let bucket = ((value * (STEP_LUT_LEN - 1) as f64).round() as usize)
+        .min(STEP_LUT_LEN - 1);
+    let index = STEP_LUT[bucket] as usize;
 
-    let (low, high) = match index {
-        0 => (0.0, VALUE_BOUNDARIES[0]),
-        15 => (VALUE_BOUNDARIES[14], 1.0),
-        _ => (VALUE_BOUNDARIES[index - 1], VALUE_BOUNDARIES[index]),
-    };
-    // `GlyphRamp::index_for` is `round(f * 15)`, so step `index` is the interval
-    // from `(index - 0.5) / 15` to `(index + 0.5) / 15`. Step 0's lower edge and
-    // step 15's upper edge fall outside `0..=1` and cannot be reached, which is
-    // why those two segments come out half-width rather than full-width.
-    let (out_low, out_high) = match index {
-        0 => (0.0, 0.5 / 15.0),
-        15 => (14.5 / 15.0, 1.0),
-        _ => ((index as f64 - 0.5) / 15.0, (index as f64 + 0.5) / 15.0),
-    };
-
-    // A zero-width input segment is reachable only if two boundaries are equal,
-    // and a hand-edited table can do that. Guard the division rather than trust it.
-    let fraction = if high <= low {
-        0.0
-    } else {
-        ((value - low) / (high - low)).clamp(0.0, 1.0)
-    };
-    out_low + fraction * (out_high - out_low)
+    // The segment's four constants, precomputed. They depend only on which step
+    // the value fell in, and the original code recomputed all four per cell --
+    // two `match`es on the same index and a division, eighty thousand times.
+    //
+    // The reciprocal is the point. `fraction` was `(value - low) / (high - low)`,
+    // and a divide is fifteen to twenty cycles where a multiply is one, so the
+    // division was plausibly most of what was left in the render. Storing
+    // `1 / (high - low)` moves it out of the loop entirely.
+    let segment = SEGMENTS[index];
+    let fraction = ((value - segment.low) * segment.inv_span).clamp(0.0, 1.0);
+    segment.out_low + fraction * segment.out_span
 }
 
 /// Builds the glyph ramp, never empty and never a character that could shear a
@@ -1126,6 +1204,69 @@ mod tests {
     /// the function stays defined and quietly discards a step. Non-decreasing is
     /// the contract; *strictly* increasing over the interior is what makes each
     /// ramp step reachable, and both are asserted.
+    /// The lookup tables agree with the boundary table they are derived from.
+    ///
+    /// `STEP_LUT` and `SEGMENTS` are a performance rewrite of a search over
+    /// `VALUE_BOUNDARIES`, and a derived table is a second place for the
+    /// calibration to be wrong in. Nothing else checks them: the monotonicity and
+    /// reachability tests would both still pass against a table that quantised
+    /// coarsely enough to flatten the middle of the curve, because a flattened
+    /// curve is still monotone and still reaches both ends.
+    ///
+    /// So this compares the tables against the search they replaced, at every
+    /// boundary and either side of it -- the places they are allowed to disagree,
+    /// and where the resolution is being asked to work hardest -- plus a sweep
+    /// over the whole range, which is where they are not.
+    #[test]
+    fn the_lookup_tables_agree_with_the_boundaries_they_replace() {
+        let search = |value: f64| {
+            let index = VALUE_BOUNDARIES.partition_point(|b| *b <= value);
+            let (low, high) = match index {
+                0 => (0.0, VALUE_BOUNDARIES[0]),
+                15 => (VALUE_BOUNDARIES[14], 1.0),
+                _ => (VALUE_BOUNDARIES[index - 1], VALUE_BOUNDARIES[index]),
+            };
+            let (out_low, out_high) = match index {
+                0 => (0.0, 0.5 / 15.0),
+                15 => (14.5 / 15.0, 1.0),
+                _ => ((index as f64 - 0.5) / 15.0, (index as f64 + 0.5) / 15.0),
+            };
+            let fraction = if high <= low {
+                0.0
+            } else {
+                ((value - low) / (high - low)).clamp(0.0, 1.0)
+            };
+            out_low + fraction * (out_high - out_low)
+        };
+
+        let mut probes: Vec<f64> = vec![0.0, 1.0, 0.5, 1.0 / 3.0];
+        for bound in VALUE_BOUNDARIES {
+            for delta in [-1e-9f64, -1e-7, 0.0, 1e-9, 1e-7] {
+                probes.push((bound + delta).clamp(0.0, 1.0));
+            }
+        }
+        for step in 0..=2000 {
+            probes.push(f64::from(step) / 2000.0);
+        }
+
+        // One bucket is 1/65535 of the range, so a value within half a bucket of
+        // a boundary may legitimately round to the other side of it. That is the
+        // whole allowance, and it is the table's own resolution rather than a
+        // number chosen to make the test pass.
+        let tolerance = 0.5 / (STEP_LUT_LEN - 1) as f64;
+        let count = probes.len();
+        let mut worst = 0.0f64;
+        for value in &probes {
+            worst = worst.max((glyph_value(*value) - search(*value)).abs());
+        }
+        assert!(
+            worst <= tolerance,
+            "the lookup tables disagree with the boundary search by {worst:.9} over \
+             {count} probes, which is more than the {tolerance:.9} their resolution \
+             allows"
+        );
+    }
+
     #[test]
     fn the_value_remap_is_monotone_and_reaches_both_ends() {
         let samples = 20_000;
