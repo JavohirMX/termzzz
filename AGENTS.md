@@ -78,19 +78,18 @@ Open engineering work, in priority order:
    win is, and that is a rewrite rather than a tweak. `life` is over the 2 ms
    budget on its `update x4` worst case only, and only because
    `step_generation` scans a `HashMap`.
-   `plasma` is now also over, at 2.05 ms, and it is the only one of the three
-   that got there this round. Its render went from 960 µs to 1.27 ms because the
-   new glyph remap runs once per cell; a lookup table took it back to 1.09 ms.
-   What is left is the four sines per cell the effect has always evaluated, plus
-   957 µs of encoding a 476 KB frame. **That byte count is not new** — it emitted
-   466 KB before this round, because a field peaked in the middle was already
-   rewriting most of the screen every frame. Measure the old code before
-   attributing a byte count to a change.
-   `terrain` is not over, but its render did go from 350 µs to 996 µs when the
-   ground gained a body — see the note on it below. The height-field rewrite had
-   taken it from 1.3 ms and 554 KB, because the surface costs one
-   noise sample per column rather than per cell and unchanged sky cells drop out
-   of the diff
+   `plasma` was over at 2.05 ms and is now back under at 1.99, because the field
+   rewrite took its ANSI volume from 476 KB to **265 KB**. Its render did rise, to
+   1.48 ms — the diagonal term is two more sines per cell, on top of a glyph remap
+   that is now a lookup table rather than a binary search. The net is under budget
+   because the field is less busy, and that is the trade: a field with a diagonal
+   term in it has more structure and rewrites fewer cells. **That byte count is not
+   a new low.** It emitted 466 KB before this round, because a field peaked in the
+   middle was already rewriting most of the screen every frame. Measure the old
+   code before attributing a byte count to a change.
+   `terrain` is at 373 µs and 16 KB at 400x200, from 1.3 ms and 554 KB before the
+   height-field rewrite — because the surface costs one noise sample per column
+   rather than per cell, and unchanged sky cells drop out of the diff
 2. **More effects on the sub-cell renderer.** `starfield` and `flow` want
    braille (line art, one colour per cell); `physarum` and a Gray-Scott
    reaction-diffusion want half-block (smooth colour). Each is roughly 150-350
@@ -239,8 +238,15 @@ Not worth doing soon: further performance work at ordinary sizes. Nothing is
 dropping frames at 200x50 — the worst effect there uses about 10% of a 60 fps
 budget, and `frame_times` now passes its own 2 ms check at that size outright.
 At 400x200, which is an eight-times-heavier terminal than that budget assumes,
-`mandelbrot` and `life` are still over; `life` only on its `update x4` worst case
-at high `--speed`, and `mandelbrot` on render, which is item 1 above.
+only `mandelbrot` and `life` are over: `life` on its `update x4` worst case at
+high `--speed`, and `mandelbrot` on render, which is item 1 above.
+
+`plasma` is the one to watch. It has been over and under again inside one round —
+2.05 ms from the glyph remap, 1.99 ms after the field rewrite — and both numbers
+are the *sum* of two effects that move in opposite directions. Its render is
+dominated by sine count and its encode by how much of the screen changes, so
+making the field more structured raises the first and lowers the second. Read both
+columns before concluding anything from either.
 
 Two numbers in the frame table went *up* in the earlier audit, and both are
 correct. `mandelbrot` went from 31 KB to 215 KB of escape sequences per frame at
