@@ -85,9 +85,16 @@ pub struct SolarSystemOptions {
     pub tilt: f64,
     /// Degrees per second that the camera circles the system.
     ///
-    /// The source of the parallax. At zero the view is static and correct; the
-    /// default is slow enough that any single frame looks composed and fast
-    /// enough that the depth is unmistakable over a few seconds.
+    /// **Zero by default.** The report was "it is rotating. We don't need to
+    /// rotate the whole solar system; just look at it from some angle, and let
+    /// the planets circle around the Sun" -- which is a request for a fixed
+    /// viewpoint with the motion inside the system rather than outside it.
+    ///
+    /// Non-zero is kept because the swing is what makes the projected orbits
+    /// change orientation, and that is a real 3D cue rather than a flourish --
+    /// it is the same rotation the module docs describe as load-bearing. It is
+    /// also what made the parallax worth having: the stars drift against the
+    /// planets. At zero the stars sit still, which is what a starfield does.
     pub camera_speed: f64,
     /// Earth years per second.
     ///
@@ -118,7 +125,7 @@ impl Default for SolarSystemOptions {
         Self {
             seed: DEFAULT_SEED,
             tilt: 60.0,
-            camera_speed: 4.0,
+            camera_speed: 0.0,
             year_speed: 0.1,
             radius_exponent: 0.55,
             sun_size: 1.8,
@@ -343,6 +350,18 @@ pub struct SolarSystem {
 
 impl TerminalEffect for SolarSystem {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
+        // The canvas, cleared. This line was missing, and it was the whole of
+        // the reported "it feels like it's leaving behind previous frames".
+        //
+        // `Canvas::commit` swaps its two surfaces rather than clearing the one
+        // it hands back, so drawing into an uncleared canvas paints this frame on
+        // top of whatever the surface held *two frames ago*. Cells inked last
+        // frame and not inked now were never written as cleared, so they
+        // survived -- and the diff, which compares the two surfaces, never
+        // mentioned them. Every effect that repaints in full clears first; this
+        // one cleared the braille grid and the colour arrays, which is what made
+        // it look like it was doing the same thing.
+        self.canvas.clear();
         self.dots.clear();
         for slot in &mut self.cell_colors {
             *slot = None;
@@ -991,7 +1010,7 @@ fn rgb(color: [u8; 3]) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
     fn drawn(size: (u16, u16), frames: u64) -> Vec<Vec<char>> {
         let mut system = SolarSystem::new(SolarSystemOptions::default(), size);
@@ -1533,6 +1552,91 @@ mod tests {
             .iter()
             .filter(|(_, _, cell)| cell.symbol != ' ')
             .count()
+    }
+
+    /// A cell the effect stops drawing must be cleared, and the frame the
+    /// terminal is sent must be the frame that was drawn.
+    ///
+    /// This is the "it feels like it's leaving behind previous frames" report,
+    /// and the test is the strongest form available: it compares the *incremental*
+    /// diff against a full repaint of the same instant. A correct double buffer
+    /// sends the same picture either way, so any cell where they disagree is a
+    /// cell the terminal has been told the wrong thing about.
+    ///
+    /// A two-frame comparison would not have caught it, and that is worth
+    /// recording because the first attempt at this test did exactly that and
+    /// passed. `Canvas::commit` swaps its two surfaces rather than clearing the
+    /// one it hands back, so frame N is painted onto whatever frame N-2 left
+    /// there. Frame 2's diff is still *correct* -- it compares frame 1 against
+    /// frame 2 -- and the damage only appears at frame 3, when a cell that was
+    /// inked at frame 1, blank at frame 2 and blank at frame 3 is reported as
+    /// inked, because the surface it is being drawn onto still has frame 1's
+    /// copy.
+    #[test]
+    fn the_incremental_frame_agrees_with_a_full_repaint() {
+        let size = (80u16, 24u16);
+        let options = SolarSystemOptions::default();
+        let frames = 3u64;
+        let delta = 1.0 / 60.0;
+
+        // The incremental path: three diffs, the last of which is what the
+        // terminal would actually be sent.
+        let mut live = SolarSystem::new(options.clone(), size);
+        let mut incremental = Vec::new();
+        for _ in 0..frames {
+            live.advance(delta);
+            incremental = live.get_diff();
+        }
+
+        // The full repaint at the same instant. A fresh instance's first diff is
+        // its entire frame, because `previous` starts blank.
+        let mut reference = SolarSystem::new(options, size);
+        for _ in 0..frames {
+            reference.advance(delta);
+        }
+        let truth: BTreeMap<(usize, usize), char> = reference
+            .get_diff()
+            .into_iter()
+            .map(|(x, y, cell)| ((x, y), cell.symbol))
+            .collect();
+
+        let mut disagreed = Vec::new();
+        for (x, y, cell) in &incremental {
+            match truth.get(&(*x, *y)) {
+                Some(symbol) if *symbol == cell.symbol => {}
+                Some(symbol) => disagreed.push(format!(
+                    "({x}, {y}) sent {:?} but the frame draws {symbol:?}",
+                    cell.symbol
+                )),
+                // Absent from the reference means *blank*, not "unknown": a
+                // first diff only mentions cells that differ from the cleared
+                // surface, so a blank cell is simply not in it. Sending a blank
+                // for one of those is correct -- that is how a cell gets cleared.
+                None if cell.symbol == ' ' || cell.symbol == '\u{2800}' => {}
+                None => disagreed.push(format!(
+                    "({x}, {y}) sent {:?} but the frame is blank there",
+                    cell.symbol
+                )),
+            }
+        }
+
+        assert!(
+            disagreed.is_empty(),
+            "the incremental diff disagrees with a full repaint on {} cells, so \
+             the terminal is being told to draw something the effect did not \
+             draw. First few: {}",
+            disagreed.len(),
+            disagreed
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        assert!(
+            !incremental.is_empty(),
+            "the third frame was empty, so this test is comparing nothing"
+        );
     }
 
     /// The determinism contract, which `tests/effect_contracts.rs` also checks
