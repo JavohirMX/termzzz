@@ -398,6 +398,30 @@ It is an explicit `airborne` flag now. **When the state is known, store it rathe
 than re-deriving it from a measurement**, and be suspicious of any `if a < b` whose
 right-hand side is a function of time or position.
 
+### The crab's sprite width caps its relief
+
+`crab` is asked to have "eight rows of seabed", and it has them. It does not *show*
+eight rows on an 80-column terminal, and the reason is worth knowing before anyone
+tunes `seabed_amplitude` or `seabed_period` again.
+
+The sprite is **fifteen columns wide and four tall** (`RIGHT_POSES`, `sprite()`).
+For it to look planted rather than floating at one end, the ground can rise at
+most about **one row across the sprite's own width** — a slope of 1/15, about 0.067
+rows per column. A sinusoid of amplitude `A` and period `P` has a steepest slope
+of `2πA/P`, so for `A = 4` that is **P ≥ 375 cells**, which is longer than a wide
+terminal is.
+
+So the shipped values are amplitude 21.0 and period 500, which measure 8 rows of
+relief and 0.92 rows of drift across the sprite. The trade is forced: **tall relief
+or frequent hills, not both.** The colony does climb — measured, row 19 to row
+13.8 over forty-five seconds, against 15.1 before — but an 80-column window shows
+two fifths of one bank, so the ground rises about a row at a time.
+
+If the crabs still read as bottom-heavy, **the lever is the sprite's width, not the
+period.** A smaller crab allows a shorter period, which shows more bank at once.
+That is a redesign of the art rather than a tuning change, which is why it was not
+done unasked.
+
 ### The noise does not reach ±1
 
 Worth stating once, because it was wrong in three separate places in one session
