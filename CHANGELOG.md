@@ -186,6 +186,26 @@ them.
   version of this test was satisfied by a pool trimmed to 16 of 54 characters.
 
 ### Fixed
+#### Saturn's rings were sized in the wrong unit
+
+"I think the rings of saturn are too big" was diagnosed here as a taste problem —
+the constants are astronomically correct, so the instinct was to scale them down
+and write down that the medium exaggerates them. That was wrong, and it was a bug
+in the only sense that matters.
+
+`draw_rings` computed the ring's radius as `body_radius_cells(planet) * edge`,
+which is a count of **cells**, and then added it to `centre`, which is in
+**world units**. Saturn orbits at 2.76 world units and is drawn 2.30 cells
+across, so the ring came out at 5.22 world units — 1.9× its own planet's orbit,
+and past Neptune's. It also grew with the terminal while the planet did not,
+which is what a unit mismatch always does.
+
+The ring is now offset around the *projected* centre in cells, the same
+convention `draw_disc` already used. Measured over four rotations at 80x24 and
+200x50, the outer edge went from 12.6× and 29.4× the planet's own drawn radius
+to **1.7× at both sizes** — and the size-independence is the part the test names,
+because it is the part that says *unit*.
+
 #### Second pass
 A round driven by watching the effects run rather than reading them. Four of
 these were bug reports, and two of the four turned out not to be bugs at all.
@@ -242,6 +262,11 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   asserted 18 while its own comment claimed to preserve something it did not.
 
 ### Changed
+- **`[life]` draws a live cell as `●`.** Asked for twice: the first request was
+  "one big circle for one live cell" and it was answered with `@` plus a comment
+  arguing that `O` would read as a lattice of outlines, which was substituting a
+  judgement about how a population should look for the picture that was asked
+  for. Age is still shown by colour, and colour is still continuous.
 - **The DVD logo is roughly twice as quick, and no longer stutters.** 5 → 12
   cells a second. Measured by accumulating every frame's diff the way a terminal
   does and counting how often the picture actually changes:
@@ -261,6 +286,19 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   1920 positions to choose from where a braille cell has two dots. Copying the
   reference's pace onto a medium with a hundredth of its spatial resolution does
   not copy its pace, it copies a stutter.
+- **`[crab]` has eight rows of seabed instead of three.** The slope shipped last
+  round and was real, but far too small to see: the ground varied about three rows
+  on a twenty-four row terminal, which is the bottom eighth of the screen.
+
+  It is now eight rows of relief, with the crab colony measured climbing from row
+  19 to row 13.8 over forty-five seconds rather than staying pinned. There is a
+  real tension behind the number, worth knowing before moving either knob: the
+  sprite is **fifteen columns wide**, so for it to look planted the ground can
+  only rise about one row across the sprite's own width, which forces a very long
+  period. On an eighty column terminal that means the ground rises about a row at
+  a time rather than showing eight rows of bank at once. The relief is real and
+  the crabs climb it; the *visible* bank is bounded by the sprite's width, not by
+  the period.
 - **`[cube]` is an X-ray wireframe.** Hidden-line removal is gone: all twelve
   edges are drawn, with the three facing away dimmer than the three facing
   toward you. The dimming is the cube's own depth ramp rather than a per-edge
