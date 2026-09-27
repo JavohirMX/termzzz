@@ -21,7 +21,7 @@ termzzz donut       # 3D donut rotation
 termzzz pipes       # Pipe maze animation
 termzzz plasma      # Plasma effect, value in the glyph
 termzzz fire        # Fire simulation
-termzzz terrain     # A cross-section: surface, banded ground, sky
+termzzz terrain     # A side-view landscape: two ridges, parallax, sky
 termzzz solarsystem # 3D orrery: tilted orbits, real periods
 termzzz dvd         # The real DVD wordmark, bouncing, in braille
 termzzz blank       # Blank screen
@@ -259,22 +259,28 @@ optimisation there is**, and both of these found it by accident rather than by
 looking for it. Check whether an effect is writing cells that did not change before
 optimising anything it computes.
 
-**And that terrain number then went back up, for a good reason.** Giving the
-ground a body — a two-dimensional grain rather than a function of depth — took it
-from 11 KB to **24 KB** at 400x200, and from 519 changed cells a frame to 1,127.
-That is the direct cost of the structure being real: a body whose glyph was a pure
-function of depth barely changed from frame to frame, and a picture that changes
-519 cells a second is a picture not doing anything. The old number was cheap
-*because* it was featureless, which is the same lesson as the mandelbrot's flat
-wash in the other direction. At 200x50 it is 3 KB, so this only matters on a
-screen eight times heavier than an ordinary one.
+**And that terrain number then went back up, and then all the way back down
+again.** Giving the ground a 2D grain took it from 11 KB to 24 KB at 400x200 and
+519 changed cells a frame to 1,127, because a body whose glyph was a pure function
+of depth barely changed between frames and a picture that changes 519 cells a
+second is a picture not doing anything. That was round two, and the user called
+the result "still shit" — correctly, and for a reason no byte count would have
+shown. The effect had been a *cutaway* the whole time, which is not what anyone
+means by terrain.
 
-Its render cost went the same way, 350 µs to 996 µs at 400x200, because the grain
-costs one noise sample per ground cell where the height field costs one per
-*column*. That is the trade the surface optimisation bought and this one spent:
-54,000 samples a frame against 200. Still inside budget, and the surface is still
-one sample per column, so the two are not alternatives — the body simply costs
-more than the surface did.
+Round three deleted the grain entirely and added a second ridge. Back to 526
+changed cells a frame, and the render's 54,000 noise samples a frame down to 800
+— two per column, which is the number the height-field rewrite bought and the
+grain spent. **The lesson is not that grain is expensive.** It is that a
+measurement of efficiency is not a measurement of whether the thing works, and
+two rounds of making this effect measurably busier moved it further from what was
+asked for. The frame table cannot tell you whether an effect reads.
+
+The remaining 526 is not 77, and that is deliberate: the near fill's shading is
+measured from each column's *own* surface, so a one-row surface move re-shades the
+whole column. Shading by row instead would be four times cheaper and would paint a
+hilltop the same colour as a valley floor, which reads as a mistake. Both numbers
+are at the call site.
 
 **Both of those went up, and both were worth it, and the byte counts are the
 instructive half.** A cheap frame is not a good frame. But do not assume a byte
@@ -409,9 +415,9 @@ It bit three times:
   invisible. 7.0 gives the intended three rows.
 - The crab's `seabed_amplitude` first shipped at 3.0 and its own test measured
   **one row of relief** across eighty columns. Same arithmetic, same cause.
-- The terrain body's grain divides by `NOISE_PRACTICAL_RANGE` for exactly this
-  reason, and a weight that cannot reach both ends of the ramp makes the
-  re-spacing that motivated it do nothing.
+- The terrain body's grain divided by `NOISE_PRACTICAL_RANGE` for exactly this
+  reason. That constant and the grain it served are both gone now; the bullet is
+  left because the third instance is what makes the pattern worth writing down.
 
 The lesson is not "remember the number", it is that a normalisation constant
 derived from a spec sheet rather than a measurement is a guess wearing the
