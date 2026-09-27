@@ -286,6 +286,33 @@ these were bug reports, and two of the four turned out not to be bugs at all.
   1920 positions to choose from where a braille cell has two dots. Copying the
   reference's pace onto a medium with a hundredth of its spatial resolution does
   not copy its pace, it copies a stutter.
+- **`[cube]` and `[donut]` are different every launch.** Both were deterministic,
+  so "all the effects are random every time" was not true without them. Each draws
+  its rotation rates and starting pose from its seed once at startup, and `reset`
+  rebuilds from the same values so a resize returns to the same opening frame
+  rather than a new one.
+
+  Rates are jittered **multiplicatively about the configured value**, so `0.0`
+  still holds an axis still, a negative rate still turns the other way, and `2×`
+  the default is still `2×` — a band *added* to the number would break all three.
+
+  The option defaults are unchanged at 0.25 / 0.35 / 0.18, but they are now the
+  band *centre* rather than the rate a launch turns at: a config pinning
+  `rotation_speed_x = 0.25` gets 0.15–0.45. That is the trade, and it is on the
+  field.
+- **`[plasma]` has a diagonal term and no longer goes up and down.** You have said
+  this twice. The first time I read it as "it repeats" and fixed the time
+  frequencies — correct, and the wrong thing, because repetition and *character*
+  are different problems and the field stopped repeating while still going up and
+  down.
+
+  Three structural causes, all of them vertical motion. The `y` term's phase was
+  swept by up to ±2 full cycles, which is literally half the field's amplitude
+  moving vertically; there was no diagonal term at all, so every term was a
+  function of `x`, `y` or radius alone and the field was axis-aligned stripes; and
+  the two radial terms were a 2:1 harmonic, which reinforces into concentric
+  banding instead of interfering. Measured drift — rows per second ÷ columns per
+  second — went from **5.81 to 0.98** at 200x50.
 - **`[terrain]` is a side-view landscape with parallax, not a cutaway.** It has
   been rejected twice — "terrible, I don't understand what it's showing me", and
   then "still shit" after a 2D grain was added to the underground — and both
