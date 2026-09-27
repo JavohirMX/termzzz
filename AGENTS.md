@@ -78,15 +78,20 @@ Open engineering work, in priority order:
    win is, and that is a rewrite rather than a tweak. `life` is over the 2 ms
    budget on its `update x4` worst case only, and only because
    `step_generation` scans a `HashMap`.
-   `plasma` was over at 2.05 ms and is now back under at 1.99, because the field
-   rewrite took its ANSI volume from 476 KB to **265 KB**. Its render did rise, to
-   1.48 ms — the diagonal term is two more sines per cell, on top of a glyph remap
-   that is now a lookup table rather than a binary search. The net is under budget
-   because the field is less busy, and that is the trade: a field with a diagonal
-   term in it has more structure and rewrites fewer cells. **That byte count is not
-   a new low.** It emitted 466 KB before this round, because a field peaked in the
-   middle was already rewriting most of the screen every frame. Measure the old
-   code before attributing a byte count to a change.
+   `plasma` is at **2.01 ms — straddling the 2 ms line**, and the two halves of it
+   moved in opposite directions. The field rewrite took its ANSI volume from
+   476 KB to **265 KB**, because a field with a diagonal term in it has more
+   structure and rewrites fewer cells. Its render went the other way, to 1.48 ms,
+   because the diagonal term is two more sines per cell on top of a glyph remap
+   that is now a lookup table rather than a binary search. It was 2.05 ms before
+   this round and it is 2.01 ms now, so the field rewrite bought about 40 µs and
+   the diagonal cost about 400. **That byte count is not a new low.** It emitted
+   466 KB before this round, because a field peaked in the middle was already
+   rewriting most of the screen every frame. Measure the old code before
+   attributing a byte count to a change, and re-run `frame_times` before
+   believing one — a single run of it read 2.50 ms for this row against 2.01 ms
+   on the next two, which is contention from the release build in the same
+   command and not a property of the effect.
    `terrain` is at 373 µs and 16 KB at 400x200, from 1.3 ms and 554 KB before the
    height-field rewrite — because the surface costs one noise sample per column
    rather than per cell, and unchanged sky cells drop out of the diff
