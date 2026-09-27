@@ -38,7 +38,7 @@ termzzz dvd
 termzzz pipes
 termzzz fire
 termzzz plasma
-termzzz constellation
+termzzz solarsystem
 termzzz terrain
 termzzz blank
 termzzz ink

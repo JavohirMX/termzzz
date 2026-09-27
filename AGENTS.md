@@ -21,9 +21,9 @@ termzzz donut       # 3D donut rotation
 termzzz pipes       # Pipe maze animation
 termzzz plasma      # Plasma effect, value in the glyph
 termzzz fire        # Fire simulation
-termzzz terrain     # Scrolling terrain with a horizon
-termzzz constellation # Drifting stars and sparse figures
-termzzz dvd         # Bouncing block-letter DVD logo
+termzzz terrain     # A landscape: height field, surface, filled ground
+termzzz solarsystem # 3D orrery: tilted orbits, real periods
+termzzz dvd         # The real DVD wordmark, bouncing, in braille
 termzzz blank       # Blank screen
 termzzz ink         # Interactive generative field you pour ink into
 
@@ -170,7 +170,8 @@ Determinism is done: all nine effects that used an unseeded generator now carry 
 `tests/effect_contracts.rs` asserts both reproducibility and seed sensitivity for
 every effect. Because they became comparable, that suite also found that five of
 them advanced by a fixed step per rendered frame — `maze`, `boids`, `crab`,
-`pipes` and `constellation` ignored the speed keys — which is fixed too.
+`pipes` and `constellation` (now `solarsystem`) ignored the speed keys —
+which is fixed too.
 
 Not worth doing soon: further performance work at ordinary sizes. Nothing is
 dropping frames at 200x50 — the worst effect there uses about 10% of a 60 fps

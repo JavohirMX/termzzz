@@ -4,6 +4,88 @@ All notable changes to this project will be documented in this file.
 
 ## [0.2.0] - Unreleased
 
+### Added
+- **`[global] background` and `foreground`.** The terminal's own colours, pinned
+  for the duration of the session. This is the fix for a class of complaint that
+  no amount of per-effect tuning reaches: on a terminal with a tinted profile,
+  every effect that draws its dark end near black looks broken rather than
+  different, and the gaps in a logo let the profile show through. Emitted once as
+  a single `SetBackgroundColor`/`SetForegroundColor` pair when the session starts
+  and reset on the way out — including from the panic hook, which reads the same
+  static the normal restore does so the two cannot disagree.
+
+  Painting the background cell by cell was the alternative and it is the wrong
+  one: it would double the byte volume of every sparse effect and need the same
+  code in eight of them. The default is `reset`, so a user who never touched the
+  setting gets no escape sequence at all rather than a redundant pair of resets
+  that repaints for nothing.
+
+  crossterm's `serde` feature is enabled so `style::Color` can sit in the config
+  directly, which means a typo is a TOML error with a line number instead of a
+  silent fallback at the moment the screen is already being drawn. The accepted
+  spellings are crossterm's serde ones and differ from `FromStr`'s — `dark_grey`,
+  not `darkgrey`; `rgb_(12,12,20)`, not `rgb(12,12,20)`.
+- **`solarsystem`**, replacing `constellation`. A real 3D projection rather than a
+  tilted drawing of one: the world is tilted about the x axis and *then* rotated
+  about the vertical, and the order is the whole effect — rotating the other way
+  round pivots on the ecliptic's own axis, on which a circular orbit is
+  symmetric, so the camera would do nothing at all. Perspective makes a planet
+  on the near side of its orbit larger than the same planet at the far side,
+  which is the depth cue that stops a tilted view of concentric circles reading
+  as a spiral. Drawn in braille at 2x4 density, with a depth buffer so a planet
+  crossing in front of the sun is not painted over by the sun's glow.
+
+  Orbital *periods* are the real ones, which is why the inner planets race and
+  Jupiter crawls. Orbital *radii* are compressed by `radius_exponent` (0.6),
+  because Neptune really is 78 times further out than Mercury and drawn to scale
+  on a 24-row screen the inner system is a single dot. `radius_exponent = 1.0`
+  gives true scale, at which point the effect is correct and unreadable.
+
+### Changed
+- **`terrain` is a landscape now.** It did not have one. The renderer sampled
+  2D noise at every cell below a fixed horizon and mapped the value straight onto
+  a glyph: no surface, nothing filled below anything, and the result was a
+  full-screen wash with a blank sky above it. It was reported as "cut off,
+  showing only half of my terminal", which is close to the truth — the top half
+  really was empty sky and the bottom half was texture with no shape in it.
+  There is now a height field sampled per column, a surface that undulates
+  around the horizon, ground filled from the surface to the bottom row, and
+  shading by depth below it. The surface costs one noise sample per *column*
+  rather than per cell, which at 400x200 is 200 samples against 80,000.
+- **`[terrain] glyphs` now defaults to ASCII** (` .:-=+*#%@`) instead of the
+  shade blocks, which were described in the report as "full locks" and
+  unnecessary. The cost is written down on the constant: `░▒▓█` was monotonic in
+  ink *by the Unicode standard*, and no ASCII set has that property. Two adjacent
+  pairs in the conventional ramp run backwards — `=` carries more than the `+`
+  after it, `+` less than the `*` after it — and a test names them rather than
+  asserting monotonicity, so the next person to reorder the ramp finds out that
+  it is a decision.
+- **`terrain`'s glyph and colour ramps now encode different things.** The glyph
+  gets denser with depth and the colour gets darker, because they answer
+  different questions — how much rock is there, and how much light reaches it —
+  and for ground those disagree. The old effect had both encoding one scalar,
+  which only worked because it had no surface for either to be relative to.
+- **`[terrain] relief` is new** (default 0.45): how far the surface may rise
+  above and fall below the horizon, as a fraction of the ground's depth. It is
+  the knob that decides whether the effect reads as a landscape. At 0.0 the
+  ground is a slab with a ruler along the top.
+
+### Upgrade notes
+- **`termzzz constellation` is now `termzzz solarsystem`.** Renamed with no
+  deprecated alias, for the same reason as `ascii` → `ink`: the old name says
+  star chart and the effect is an orrery, so keeping it would have meant
+  shipping a solar system under a label that describes something else. An old
+  `[constellation]` config section is **silently ignored** and the effect runs at
+  its defaults; rename it to `[solarsystem]` to keep your settings. An old
+  `effect = "constellation"` playlist entry is reported on stderr with the list
+  of names this build knows, rather than dropped in silence.
+- **`[terrain] scroll_speed` now measures something else.** It was a vertical
+  offset applied to a field sampled per cell; it is now how fast the landscape
+  travels sideways past the camera, in cells of the field per second. The default
+  of 0.9 is kept because it lands in the right band for the new model, but the
+  two are not the same measurement and there is no way to convert one into the
+  other, so an old value will look different rather than wrong.
+
 ### Fixed
 Fourteen effects were audited against what they actually draw. Most of what came
 back was not a matter of taste, and several of these effects had never once shown

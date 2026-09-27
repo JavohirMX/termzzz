@@ -12,7 +12,7 @@
 //! | `check`  | Terminal event checking (input, resize)  |
 //! | `common` | Shared traits and types (TerminalEffect) |
 //! | `config` | TOML configuration loading and options     |
-//! | `constellation` | Drifting stars and dotted connections |
+//! | `solarsystem` | A 3D orrery: planets on tilted orbits, real periods |
 //! | `crab`   | ASCII crab walking animation             |
 //! | `cube`   | 3D rotating cube in ASCII                |
 //! | `donut`  | 3D rotating donut in ASCII               |
@@ -43,7 +43,7 @@ pub mod canvas;
 pub mod check;
 pub mod common;
 pub mod config;
-pub mod constellation;
+pub mod solarsystem;
 pub mod crab;
 pub mod cube;
 pub mod donut;

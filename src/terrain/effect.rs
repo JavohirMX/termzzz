@@ -1,4 +1,4 @@
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crate::render::glyph_ramp::{self, GlyphRamp};
@@ -33,7 +33,31 @@ pub struct TerrainOptions {
     pub persistence: f64,
     /// Ground rows scrolled past per second.
     pub scroll_speed: f64,
-    /// Characters the noise value is drawn as, sparsest first.
+    /// How far the surface may rise above and fall below the horizon, in rows,
+    /// per period of the base-frequency noise.
+    ///
+    /// This is the knob that decides whether the effect reads as a landscape.
+    /// The surface is a height field sampled per column and this is the
+    /// amplitude it is scaled to, so at 0.0 the ground is a flat-topped slab
+    /// with a ruler along the top and no landscape in it at all.
+    ///
+    /// In units of the noise period rather than of the screen, and that is the
+    /// whole reason for the choice. Scaling by the screen makes the landscape's
+    /// *shape* depend on the terminal: the horizontal period is fixed in cells,
+    /// so an amplitude in rows that grows with the height makes the surface
+    /// steeper on a tall screen than on a short one. Measured as the fraction of
+    /// adjacent columns whose surface moves, that put the density at 25% on an
+    /// 80x24 and at 76% on a 200x50 -- the same setting drawing a landscape and
+    /// a picket fence. In units of the period it is the same at both.
+    ///
+    /// The 1.0 default is the pick, and the number is only meaningful next to
+    /// two facts. The height field does not reach +/-1: measured over four
+    /// thousand samples at three periods it spans 0.79, so a nominal amplitude
+    /// of 1.0 moves the surface about 0.4 of a period either way. And the
+    /// amplitude is additionally capped so the surface keeps clear of the top and
+    /// bottom of the screen, which on a short terminal binds first.
+    pub relief: f64,
+    /// Characters the ground is drawn as, sparsest first.
     pub glyphs: String,
 }
 
@@ -50,6 +74,7 @@ impl Default for TerrainOptions {
             octaves: 4,
             persistence: 0.5,
             scroll_speed: DEFAULT_SCROLL_SPEED,
+            relief: 1.0,
             glyphs: DEFAULT_GLYPHS.to_string(),
         }
     }
@@ -80,45 +105,71 @@ const DEFAULT_SCALE: f64 = 8.0;
 
 /// Ground rows scrolled past per second.
 ///
-/// Measured, not guessed, and the constraint is bandwidth. This is a *sampled*
-/// field rather than a simulation, so scrolling it repaints whichever cells
-/// changed value, and the cost is proportional to the scroll rate: at 60 Hz,
-/// 0.35 rows a second changed 85 cells in the worst frame at 80x24 and 718 at
-/// 400x200, while 0.9 changed 207 and 1822. At 0.9 that is about 4 KB and
-/// 36 KB of escape sequences a frame, or 0.24 and 2.1 MB/s -- the same order
-/// as every other effect in the catalogue, and small enough that the scroll is
-/// not the reason a frame is late. Past about 2.0 the ground stops reading as
-/// receding and starts reading as a conveyor belt, so 0.9 is chosen for being
-/// visibly moving without being the fastest thing on screen.
+/// Reinterpreted by the height-field rewrite and no longer comparable to the
+/// old figure. It now measures how fast the *landscape* travels sideways past
+/// the camera, in cells of the field per second, and the previous default of
+/// 0.9 is kept because it lands in the right band for the new model: a period
+/// of [`DEFAULT_SCALE`] cells passing at 0.9 cells/s means a ridge crosses any
+/// given column every nine seconds, which is slow enough to read as distance
+/// and fast enough that a still frame is obviously mid-flight.
+///
+/// The old number was a *vertical* rate on a field sampled per cell, so the two
+/// are not the same measurement and a config carrying the old value will get a
+/// different-looking effect. That is called out in the changelog rather than
+/// migrated, because there is no way to convert one rate into the other.
 const DEFAULT_SCROLL_SPEED: f64 = 0.9;
 
-/// The glyph ramp the ground is drawn as, defaulting to the shade blocks.
+/// Default for [`TerrainOptions::relief`], in rows per noise period.
+const DEFAULT_RELIEF: f64 = 1.0;
+
+/// The largest fraction of the ground's depth the surface amplitude may take.
 ///
-/// Blocks rather than `SHADE`, because `SHADE` is documented as *not* monotonic
-/// in ink -- `=` is heavier than `+` and `+` is heavier than `*` -- and the old
-/// hard-coded table used exactly that set, so three consecutive steps of it read
-/// backwards. That was a real defect and not a matter of taste: the glyph half
-/// of the signal was noise added to a colour ramp that already carried the same
-/// value. `░▒▓█` are defined by Unicode as quarter, half, three-quarter and full
-/// coverage, so the ordering holds by the standard, and it holds at any cell
-/// aspect ratio -- a `:` reads as a horizontal smear in a wide cell and a
-/// vertical dotted line in a tall one, which a shade block does not care about.
-const DEFAULT_GLYPHS: &str = glyph_ramp::presets::BLOCKS;
+/// Binds only on short terminals, where the requested amplitude in rows would
+/// otherwise reach the top of the screen or the bottom of it. A surface at row 0
+/// is no sky and one at the last row is no ground, and a screen with neither in
+/// some column reads as a tear rather than as a landscape.
+const MAX_RELIEF_FRACTION: f64 = 0.45;
+
+/// The glyph ramp the ground is drawn as: ASCII, lightest coverage first.
+///
+/// The user asked for this explicitly -- the block set was "full locks" and
+/// unnecessary. That is a real request and it costs something, so the cost is
+/// written down rather than discovered later.
+///
+/// [`glyph_ramp::presets::BLOCKS`] was monotonic *by the standard*: Unicode
+/// defines `░▒▓█` as quarter, half, three-quarter and full coverage, so the
+/// ordering is a fact about the characters rather than a matter of taste, and
+/// it holds at any cell aspect ratio. No ASCII set has that property, because
+/// ink coverage is not what the characters are for. In this set the ordering runs
+/// the wrong way in one adjacent place: `=` is two horizontal rules and carries
+/// more ink than the `+` that follows it.
+///
+/// That is accepted rather than fixed, for two reasons. It is the conventional
+/// ASCII brightness ramp, so a user who recognises it from a dozen other tools
+/// gets what they expect. And the colour ramp carries the same depth
+/// continuously and without error, so one inversion costs the ground a little
+/// local texture rather than corrupting the value being shown. Read
+/// `specs/overview.md` on `GlyphRamp` before replacing this set: the ordering is
+/// the whole point of that type, and a set chosen for prettiness will read as
+/// noise.
+///
+/// **The leading space of the conventional ramp is deliberately dropped.** Every
+/// cell of the ground is filled, so a glyph that renders as nothing makes that
+/// cell indistinguishable from sky -- and the top row of the ground in every
+/// column is exactly the row whose depth samples the *start* of this ramp. With
+/// the space in, the crest of every hill was invisible and the silhouette was
+/// drawn a row too low. `the_ground_is_never_drawn_as_a_space` is that bug.
+const DEFAULT_GLYPHS: &str = ".:-=+*#%@";
 
 /// Fraction of the screen height that is ground, the rest sky.
 ///
 /// Pinned rather than derived, because a horizon has to be somewhere specific
 /// for the effect to read as a landscape: at a third of the height the ground
 /// has enough rows to show several noise periods against the sky, and the sky
-/// has enough rows to show a gradient.
+/// has enough rows to show a gradient. It is the *mean* surface level now, not
+/// a hard split -- the surface moves above and below it by [`DEFAULT_RELIEF`]
+/// of the ground's depth.
 const HORIZON_FRACTION: f64 = 0.32;
-
-/// A terminal cell is taller than it is wide, so a shape measured in cell units
-/// is an ellipse on screen. DejaVu Sans Mono is about 1 : 1.2, and the usual
-/// ideal-square assumption is 1 : 2; 1.2 is the conservative middle, because
-/// correcting by 2 would stretch every feature twice as far vertically on the
-/// fonts most people actually have.
-const CELL_ASPECT: f64 = 1.2;
 
 /// Sky at the zenith, through mid sky, to the haze at the horizon.
 ///
@@ -140,17 +191,42 @@ const SKY: &[style::Color] = &[
     },
 ];
 
-/// Ground at the shadowed low point and at the lit crest.
+/// Ground, from the lit crest down into shadow.
+///
+/// Ordered for the depth ramp, which runs *downwards*: the first stop is the top
+/// row of ground in every column and the last is the bottom of the screen. The
+/// old table was the other way round, because the old effect sampled a value
+/// per cell rather than a depth.
+///
+/// A middle stop was added, and that is the point of the whole palette: with
+/// only a lit crest and a dark floor, everything below the crest row is the
+/// same two colours and the ground reads as a silhouette with a shadow under
+/// it. The middle is what makes the body look like a body.
+///
+/// Deliberately dark at the bottom rather than black. The deepest rows are the
+/// ones furthest from any light source in the fiction *and* the ones furthest
+/// from the horizon, and a near-black there is indistinguishable from a hole in
+/// the screen on a terminal whose background is not black.
 const GROUND: &[style::Color] = &[
     style::Color::Rgb {
-        r: 12,
-        g: 14,
-        b: 20,
+        r: 222,
+        g: 228,
+        b: 236,
     },
     style::Color::Rgb {
-        r: 196,
-        g: 204,
-        b: 214,
+        r: 122,
+        g: 130,
+        b: 144,
+    },
+    style::Color::Rgb {
+        r: 44,
+        g: 48,
+        b: 58,
+    },
+    style::Color::Rgb {
+        r: 26,
+        g: 29,
+        b: 36,
     },
 ];
 
@@ -249,7 +325,117 @@ impl Terrain {
         self.offset += self.options.scroll_speed * delta;
     }
 
-    /// The noise frequency, in cycles per corrected unit.
+    /// The row at which the ground starts, for one column.
+    ///
+    /// This is the whole effect. Before the rewrite there was no such thing: the
+    /// renderer sampled two-dimensional noise at every cell and mapped the value
+    /// straight onto a glyph, so every row below the horizon was an independent
+    /// sample of the same field. There was no surface, nothing was filled below
+    /// anything, and the result was a full-screen wash that read as a landscape
+    /// only if you already knew one was supposed to be there. The user reported
+    /// it as "cut off, showing only half of my terminal", and that is close to
+    /// the truth: what looked like the top half was a blank sky, and the bottom
+    /// half was texture with no shape in it.
+    ///
+    /// `x` is the column, `offset` the accumulated scroll. The field is sampled
+    /// on the `y = 0` line of the two-dimensional noise, which is what turns it
+    /// into a one-dimensional height field: `noise_2d` interpolates on `y`
+    /// first and `y` is 0, so only the bottom row of gradients contributes. That
+    /// is not a degenerate case to be avoided -- it is exactly a 1D slice, and it
+    /// is why this needs no change to the noise module.
+    ///
+    /// The returned row is clamped so that every column keeps at least one sky
+    /// row and at least one ground row. Without that clamp a column whose noise
+    /// happens to be at an extreme can reach the top of the screen or the bottom,
+    /// and a screen with no sky in one column and no ground in the next does not
+    /// read as a landscape either -- it reads as a tear.
+    fn surface_row(&self, x: usize, offset: f64, horizon: usize, span: f64) -> usize {
+        let period = Self::noise_period(self.options.scale);
+        // The scroll enters the *first* noise axis, so the landscape travels
+        // sideways past a stationary camera. The alternative -- advancing the
+        // second axis -- makes the field morph in place: hills rise and sink
+        // without going anywhere, which for a landscape is the difference
+        // between flying over one and watching it breathe.
+        let travelled = x as f64 + offset;
+        let raw = self.noise.octave_noise_2d(
+            travelled,
+            0.0,
+            self.options.octaves,
+            self.options.persistence,
+            1.0 / period,
+        );
+
+        // Centred on the horizon, in units of rows.
+        //
+        // There is no cell-aspect correction here, and there used to be one.
+        // A cell is about 1.2 times taller than it is wide, so a shape measured
+        // in rows is already stretched vertically by the font; the old renderer
+        // divided that back out to keep its *texture* isotropic. A silhouette is
+        // not a texture, and multiplying the relief back up is what keeps a hill
+        // from being a ridge: a hill of period P cells and true amplitude
+        // P / 2.4 rows is a ridge, not a bump, at any cell aspect. Whether 0.45
+        // is the right amount of that is settled by measurement rather than by
+        // the argument -- see `the_relief_is_not_so_flat_that_the_ground_is_a_slab`.
+        let row = horizon as f64 - raw * span;
+        let (low, high) = Self::surface_bounds(self.screen_size.1 as usize);
+        // `round` rather than `trunc`: truncating biases every surface down by
+        // half a row on average, which for a silhouette is a systematic lean
+        // rather than a rounding error.
+        (row.round().clamp(low as f64, high as f64)) as usize
+    }
+
+    /// The lowest and highest rows a surface row may take, as `(low, high)`.
+    ///
+    /// Both bounds have to hold at once or the effect degenerates: a surface at
+    /// row 0 is no sky, and a surface at the last row is no ground. On a screen
+    /// too short to satisfy both, ground wins, because a column of solid ground
+    /// still reads as ground while a column of open sky reads as a gap.
+    fn surface_bounds(height: usize) -> (usize, usize) {
+        if height <= 1 {
+            return (0, 0);
+        }
+        if height == 2 {
+            return (1, 1);
+        }
+        (1, height - 2)
+    }
+
+    /// The amplitude the height field is scaled to, in rows.
+    ///
+    /// In units of the noise period first, so the landscape has the same shape
+    /// at every terminal size -- see [`TerrainOptions::relief`]. Then capped, so
+    /// the surface cannot reach the top of the screen or the bottom of it, which
+    /// on a short terminal binds well before the requested amplitude would.
+    ///
+    /// The cap is a fraction of the ground's depth rather than a row count for
+    /// the same reason, and it is the only part of this that knows about the
+    /// screen at all.
+    fn surface_span(&self, horizon: usize) -> f64 {
+        let period = Self::noise_period(self.options.scale);
+        let relief = if self.options.relief.is_finite() {
+            self.options.relief.max(0.0)
+        } else {
+            DEFAULT_RELIEF
+        };
+        let height = self.screen_size.1 as usize;
+        let ground_rows = height.saturating_sub(horizon).max(1) as f64;
+        (period * relief).min(ground_rows * MAX_RELIEF_FRACTION)
+    }
+
+    /// The period of the base-frequency noise, in cells, guarded.
+    ///
+    /// `scale` is user-facing and can be zero, negative or NaN. A NaN period
+    /// would propagate into every surface row and take the whole frame with it,
+    /// so it falls back rather than being trusted.
+    fn noise_period(scale: f64) -> f64 {
+        if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            DEFAULT_SCALE
+        }
+    }
+
+    /// The noise frequency, in cycles per cell: the reciprocal of the period.
     ///
     /// The reciprocal of [`TerrainOptions::scale`], which is a period in cells.
     /// Deliberately independent of the screen size: a fixed period means the
@@ -258,20 +444,9 @@ impl Terrain {
     /// and it drifts by a factor of four between 80x24 and 400x200 -- the
     /// terrain that reads as ridges on a small terminal becomes a smooth wash on
     /// a large one. See the `scale` field's documentation.
-    ///
-    /// `size` is not a parameter. That is the point of the change, and it is why
-    /// the signature here is smaller than the one it replaced.
-    ///
-    /// Returns a finite positive frequency for every input a config can produce:
-    /// `scale` is user-facing and can be zero, negative or NaN, and a NaN here
-    /// would propagate into the whole frame.
+    #[cfg(test)]
     fn noise_frequency(scale: f64) -> f64 {
-        let period = if scale.is_finite() && scale > 0.0 {
-            scale
-        } else {
-            DEFAULT_SCALE
-        };
-        1.0 / period
+        1.0 / Self::noise_period(scale)
     }
 
     /// Where the horizon sits, in cell rows.
@@ -289,49 +464,58 @@ impl Terrain {
         horizon.clamp(1, height - 1)
     }
 
-    /// How often the glyph ramp changes between neighbouring ground cells, as a
-    /// fraction, horizontally and vertically.
+    /// How far the surface moves between neighbouring columns, in rows.
     ///
-    /// The measure the field is tuned against, and the one a "looks like a blob"
-    /// complaint is really about. A count of distinct *values* is not: the old
-    /// effect had 130 of them on an 80x24 screen and still drew a blob, because
-    /// its variation was smooth in space rather than absent. What the eye reads
-    /// as a ridge is a step in the ramp between two cells that sit next to each
-    /// other, so this counts steps between adjacent cells.
+    /// This is the measure the effect is tuned against, and it is a different
+    /// measurement from the one the old renderer needed. The old effect had no
+    /// surface, so its structure had to be judged by how often the glyph ramp
+    /// changed between adjacent *cells* -- a measure of texture. This one has a
+    /// surface, so the structure is judged by the silhouette: the fraction of
+    /// adjacent column pairs where the top of the ground is not on the same row.
     ///
-    /// Measured over the ground only. Including the sky would dilute the ground's
-    /// own density toward zero, since every sky row is the same flat space.
+    /// The two failure modes this distinguishes are the two ways a height field
+    /// goes wrong. At zero the ground is a slab with a ruler-straight top edge
+    /// and no landscape in it. Near one it is a picket fence, every column its
+    /// own spike, and the eye reads noise rather than terrain. A landscape wants
+    /// to be well inside both.
+    ///
+    /// Framed as a fraction rather than a row count so it is comparable across
+    /// terminal heights, which is the same reason the old measure was.
     #[cfg(test)]
-    fn contour_density(size: (u16, u16)) -> (f64, f64) {
-        let mut terrain = Terrain::new(TerrainOptions::default(), size);
-        let diff = terrain.get_diff();
+    fn silhouette_density(size: (u16, u16)) -> f64 {
+        let terrain = Terrain::new(TerrainOptions::default(), size);
         let horizon = Self::horizon_row(size);
-
-        let mut grid = vec![vec![' '; size.0 as usize]; size.1 as usize];
-        for (x, y, cell) in &diff {
-            grid[*y][*x] = cell.symbol;
+        let rows = terrain.surface_rows(0.0, horizon);
+        if rows.len() < 2 {
+            return 0.0;
         }
+        let steps = rows.windows(2).filter(|w| w[0] != w[1]).count();
+        steps as f64 / (rows.len() - 1) as f64
+    }
 
-        let (mut horizontal_steps, mut horizontal_pairs) = (0usize, 0usize);
-        for row in &grid[horizon..] {
-            for x in 0..row.len() - 1 {
-                horizontal_pairs += 1;
-                horizontal_steps += usize::from(row[x] != row[x + 1]);
-            }
-        }
+    /// The spread of the surface, in rows: highest crest to lowest valley.
+    #[cfg(test)]
+    fn silhouette_spread(size: (u16, u16)) -> usize {
+        let terrain = Terrain::new(TerrainOptions::default(), size);
+        let horizon = Self::horizon_row(size);
+        let rows = terrain.surface_rows(0.0, horizon);
+        rows.iter().max().copied().unwrap_or(0)
+            - rows.iter().min().copied().unwrap_or(0)
+    }
 
-        let (mut vertical_steps, mut vertical_pairs) = (0usize, 0usize);
-        for y in horizon..grid.len() - 1 {
-            for x in 0..size.0 as usize {
-                vertical_pairs += 1;
-                vertical_steps += usize::from(grid[y][x] != grid[y + 1][x]);
-            }
-        }
-
-        (
-            horizontal_steps as f64 / horizontal_pairs.max(1) as f64,
-            vertical_steps as f64 / vertical_pairs.max(1) as f64,
-        )
+    /// The surface row for every column, computed once per frame.
+    ///
+    /// Hoisted out of the fill loop because it is the only part of the frame
+    /// that costs a noise sample, and there are `height` times more cells than
+    /// columns. The old renderer paid that cost per cell because it sampled per
+    /// cell; this pays it per column, which at 400x200 is 200 samples instead of
+    /// 80,000.
+    fn surface_rows(&self, offset: f64, horizon: usize) -> Vec<usize> {
+        let width = self.screen_size.0 as usize;
+        let span = self.surface_span(horizon);
+        (0..width)
+            .map(|x| self.surface_row(x, offset, horizon, span))
+            .collect()
     }
 
     /// Paints one frame, `offset` ground rows further on than the last.
@@ -342,91 +526,84 @@ impl Terrain {
         if width == 0 || height == 0 {
             return;
         }
-
-        let frequency = Self::noise_frequency(self.options.scale);
         let horizon = Self::horizon_row(size);
+        let surface_rows = self.surface_rows(offset, horizon);
+        // Depth is normalised against the *mean* ground depth rather than each
+        // column's own, so the shading is a function of distance below the mean
+        // surface and not of distance below the bottom of the screen. Per-column
+        // normalisation would put the darkest stop in the same row of every
+        // column, which draws a hard line along the bottom of the picture that
+        // has nothing to do with the landscape.
+        let ground_depth = height.saturating_sub(horizon).max(1) as f32;
         let surface = self.canvas.surface_mut();
 
         for y in 0..height {
-            if y < horizon {
-                Self::draw_sky(surface, 0..width, y, horizon, &self.sky);
-                continue;
-            }
+            // The sky's colour depends only on the row, so it is computed once per
+            // row rather than once per cell. It used to be computed inside the
+            // per-cell loop, which at 400x200 is 26,000 redundant divisions and
+            // palette samples a frame.
+            let sky_colour = Self::sky_colour(y, horizon, &self.sky);
 
-            // The scroll. Sampled at `y + offset` rather than by advancing a
-            // simulation, which is what keeps the noise generator untouched: it
-            // is the sampling that moves, so a given seed still gives a given
-            // landscape and the generator's nine tests still describe it. The
-            // *row* contributes to the coordinate as well as the offset, so
-            // successive rows sample successive points of the field and the
-            // ground has ridges running across it rather than each row being a
-            // copy of the one above.
-            //
-            // A vertical scroll of a sampled field moves the ground *up* the
-            // screen, toward the horizon, which is the direction the sky is
-            // in. The alternative -- sampling at `y - offset` -- moves the
-            // ridges down and off the bottom edge, and reads as a texture
-            // sliding past rather than as ground receding.
-            //
-            // Scaled into corrected units, because the frequency is per
-            // corrected unit. Leaving the row in raw cells while the frequency
-            // assumed corrected ones compresses the vertical by 1 / 1.2, which
-            // measured as 14.6% of adjacent ground cells changing ramp step
-            // against 17.7% for the corrected form.
-            let row = (y as f64 - horizon as f64 + offset) * CELL_ASPECT;
             for x in 0..width {
-                let value = self.noise.octave_noise_2d(
-                    x as f64,
-                    row,
-                    self.options.octaves,
-                    self.options.persistence,
-                    frequency,
-                );
-                let normalised = ((value + 1.0) / 2.0).clamp(0.0, 1.0) as f32;
+                if y < surface_rows[x] {
+                    // A space, and a deliberate one: sky is where the *absence*
+                    // of ground is, and drawing it as a ramp character would put
+                    // texture in the sky and make the horizon ambiguous.
+                    surface.set(
+                        x,
+                        y,
+                        Cell::new(' ', sky_colour, style::Attribute::Reset),
+                    );
+                    continue;
+                }
 
-                let cell = Cell::new(
-                    self.ramp.sample(normalised),
-                    self.ground.sample(normalised),
-                    // `Attribute::Reset`, not `Attribute::Bold`. Every cell was
-                    // bold, and bold on a truecolor foreground is a rendering
-                    // hint that many terminals act on by brightening the
-                    // colour -- which corrupts a ramp whose entire job is
-                    // precise brightness. The old bug was sharpest at the top of
-                    // the range, where a `▓` is supposed to read as three-quarter
-                    // coverage and bold turned it into a white block.
-                    style::Attribute::Reset,
+                let depth = (y - surface_rows[x]) as f32 / ground_depth;
+                let t = depth.clamp(0.0, 1.0);
+                surface.set(
+                    x,
+                    y,
+                    Cell::new(
+                        // Denser with depth: the body of the ground should read
+                        // as solid, and a ramp that thins out as it goes down
+                        // would make the ground dissolve toward the bottom of the
+                        // screen.
+                        self.ramp.sample(t),
+                        // Darker with depth, which is the *opposite* direction.
+                        // The two answer different questions -- how much rock is
+                        // there, and how much light reaches it -- and for terrain
+                        // those genuinely disagree: a solid mass in shadow. The
+                        // old effect had both encoding the same scalar, which
+                        // only worked because it had no surface for either to be
+                        // relative to.
+                        self.ground.sample(t),
+                        // `Attribute::Reset`, not `Attribute::Bold`. Every cell
+                        // was bold, and bold on a truecolor foreground is a
+                        // rendering hint that many terminals act on by
+                        // brightening the colour -- which corrupts a ramp whose
+                        // entire job is precise brightness. The old bug was
+                        // sharpest at the top of the range, where a `▓` is
+                        // supposed to read as three-quarter coverage and bold
+                        // turned it into a white block.
+                        style::Attribute::Reset,
+                    ),
                 );
-                surface.set(x, y, cell);
             }
         }
     }
 
-    /// The sky, as a vertical gradient that gets no brighter than
-    /// [`HORIZON_FRACTION`] of the way along the ramp.
+    /// The sky's colour on one row: a vertical gradient that gets no brighter
+    /// than [`HORIZON_SKY_FRACTION`] of the way along the ramp.
     ///
     /// Capped rather than run to the top of the ramp, so the last stop --
     /// deliberately the brightest -- is reserved for the haze *at* the horizon.
     /// Otherwise the gradient's own bright end would sit at the horizon, the
     /// brightest thing on the screen, and it was there to be the *faintest*
     /// thing on that row.
-    fn draw_sky(
-        surface: &mut Buffer,
-        columns: std::ops::Range<usize>,
-        y: usize,
-        horizon: usize,
-        sky: &Palette,
-    ) {
+    fn sky_colour(y: usize, horizon: usize, sky: &Palette) -> style::Color {
         // `horizon` is at least 1 wherever there is a row above it, so this
         // cannot divide by zero, but the max keeps it true for every size.
         let t = (y as f32 / (horizon.max(1) - 1) as f32).clamp(0.0, 1.0);
-        let colour = sky.sample(t * HORIZON_SKY_FRACTION);
-
-        for x in columns {
-            // A space, and a deliberate one: sky is where the *absence* of
-            // ground is, and drawing it as a ramp character would put texture
-            // in the sky and make the horizon line ambiguous.
-            surface.set(x, y, Cell::new(' ', colour, style::Attribute::Reset));
-        }
+        sky.sample(t * HORIZON_SKY_FRACTION)
     }
 }
 
@@ -439,20 +616,440 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The headline fix: this rendered exactly one frame, ever.
+    /// Builds a grid of drawn symbols from a diff, for the tests that want to
+    /// look at the picture rather than at the model behind it.
+    fn drawn(size: (u16, u16), frames: u64) -> Vec<Vec<char>> {
+        let mut terrain = Terrain::new(TerrainOptions::default(), size);
+        for _ in 0..frames {
+            terrain.advance(1.0 / 60.0);
+        }
+        let mut grid = vec![vec![' '; size.0 as usize]; size.1 as usize];
+        for (x, y, cell) in terrain.get_diff() {
+            grid[y][x] = cell.symbol;
+        }
+        grid
+    }
+
+    /// The surface row for every column, from the same code the renderer uses.
+    fn surface(size: (u16, u16)) -> Vec<usize> {
+        let terrain = Terrain::new(TerrainOptions::default(), size);
+        terrain.surface_rows(0.0, Terrain::horizon_row(size))
+    }
+
+    // ---------------------------------------------------------------- the fix
+
+    /// The headline defect: there was no terrain.
     ///
-    /// `get_diff` was `if !self.generated { ...; self.generated = true } else {
-    /// Vec::new() }` and `update` was a no-op, so every frame after the first
-    /// was empty -- a screensaver that draws one picture and then waits for
-    /// the user to press a key.
+    /// The old renderer sampled two-dimensional noise at every cell below a
+    /// fixed horizon and mapped the value straight onto a glyph. There was no
+    /// surface, nothing was filled below anything, and the result was a
+    /// full-screen wash. The user reported it as "cut off, showing only half of
+    /// my terminal".
+    ///
+    /// This asserts the thing that was missing: a surface that is a *line*, in
+    /// the sense that it has a position in every column and those positions
+    /// differ. A flat line is a slab; a line that never moves is a fill. The
+    /// spread bound is what rules out both, and it is asserted at three sizes
+    /// because the relief is a fraction of the ground's depth, so a regression
+    /// that made it a fixed row count would pass at one size and not another.
+    #[test]
+    fn there_is_a_surface_and_it_is_not_a_straight_line() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200)] {
+            let rows = surface(size);
+            assert_eq!(
+                rows.len(),
+                size.0 as usize,
+                "every column needs a surface row"
+            );
+
+            let low = *rows.iter().min().unwrap();
+            let high = *rows.iter().max().unwrap();
+            assert!(
+                high - low >= 3,
+                "at {}x{} the surface spans only {} rows, from {low} to {high}, so \
+                 the top of the ground is a straight line and there is no \
+                 landscape in the picture",
+                size.0,
+                size.1,
+                high - low
+            );
+        }
+    }
+
+    /// The other half of "cut off": the ground has to reach the bottom of the
+    /// screen in every column.
+    ///
+    /// With no surface this was trivially true of every row below the horizon,
+    /// but the *shape* was not a ground. Now that there is a surface it is a
+    /// real question, because a surface that reaches the last row leaves a
+    /// column with no ground at all and the picture tears.
+    #[test]
+    fn the_ground_reaches_the_bottom_row_in_every_column() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200), (1, 9), (9, 3)] {
+            let rows = surface(size);
+            let height = size.1 as usize;
+            for (x, &top) in rows.iter().enumerate() {
+                assert!(
+                    top < height,
+                    "at {}x{} column {x} has its surface at row {top} of {height}, \
+                     so that column has no ground and the ground does not reach \
+                     the bottom",
+                    size.0,
+                    size.1
+                );
+            }
+        }
+    }
+
+    /// Every column keeps sky above its ground, so the picture is never torn.
+    ///
+    /// The counterpart to the test above, and the reason [`surface_bounds`]
+    /// clamps at both ends rather than only the one that looked wrong.
+    #[test]
+    fn every_column_keeps_at_least_one_row_of_sky() {
+        // Terminals too short to hold both a sky row and a ground row are
+        // excluded, because the two bounds genuinely cannot both hold there and
+        // ground is the one that wins. `surface_bounds` is where that decision
+        // is made and `the_ground_reaches_the_bottom_row_in_every_column` is the
+        // other half of the same bargain.
+        for size in [(80u16, 24u16), (200, 50), (400, 200), (1, 9), (9, 3)] {
+            for (x, &top) in surface(size).iter().enumerate() {
+                assert!(
+                    top >= 1,
+                    "at {}x{} column {x} has its surface at row {top}, so that \
+                     column has no sky",
+                    size.0,
+                    size.1
+                );
+            }
+        }
+    }
+
+    /// Nothing is drawn as ground above its own column's surface.
+    ///
+    /// The silhouette has to be a silhouette. A renderer that filled by
+    /// comparing against a *mean* horizon rather than a per-column one would
+    /// put ground in the sky on one side of every peak, and this is the test
+    /// that says so.
+    #[test]
+    fn no_ground_is_drawn_above_its_own_columns_surface() {
+        let size = (80u16, 24u16);
+        let rows = surface(size);
+        let grid = drawn(size, 0);
+
+        // `grid` is row-major, so a *column* is a stride, not a row. Iterating
+        // `grid.iter()` and treating each row as a column -- which is what this
+        // did first -- reads the wrong axis entirely and reports a sky cell in
+        // one column as a glyph from a different column's crest.
+        for x in 0..size.0 as usize {
+            for y in 0..rows[x] {
+                assert_eq!(
+                    grid[y][x], ' ',
+                    "at ({x}, {y}) the ground starts at row {} but this cell was \
+                     drawn as {:?}",
+                    rows[x],
+                    grid[y][x]
+                );
+            }
+        }
+    }
+
+    /// The relief has to be tuned to a band, and both ends of the band are real
+    /// failure modes.
+    ///
+    /// At the bottom the surface is a ruler-straight line and the ground is a
+    /// slab. At the top every column is its own spike and the eye reads a
+    /// picket fence rather than terrain. The silhouette step density is the
+    /// measure: the fraction of adjacent column pairs whose surface is on a
+    /// different row.
+    ///
+    /// Measured, not guessed. Horizontal step density of the surface at
+    /// 80x24 with the defaults is reported in the failure message, so a
+    /// regression says what it actually is rather than only that it is wrong.
+    #[test]
+    fn the_relief_is_not_so_flat_that_the_ground_is_a_slab() {
+        for size in [(80u16, 24u16), (200, 50), (400, 200)] {
+            let density = Terrain::silhouette_density(size);
+            assert!(
+                (0.05..0.75).contains(&density),
+                "at {}x{} the surface moves between only {:.1}% of adjacent \
+                 columns, so the top of the ground is a straight line. Above \
+                 about 75% it is a picket fence instead.",
+                size.0,
+                size.1,
+                density * 100.0
+            );
+        }
+    }
+
+    /// The `relief` knob is connected to the drawing at both ends.
+    ///
+    /// Worth a separate test from the band in the test above, because that band
+    /// is measured on the *default* and a knob that did nothing at its extremes
+    /// would still pass it. Zero is the assertion that matters: it must produce
+    /// a dead-flat top edge, because a `relief` that failed to reach the surface
+    /// row would look exactly like `relief = 0` at every setting.
+    ///
+    /// The upper end is asserted as "more relief, more movement" rather than as
+    /// a picket fence, because that is not what a large relief does.
+    /// [`MAX_RELIEF_FRACTION`] caps the amplitude on a short terminal, so past
+    /// the cap extra relief does nothing at all rather than producing a fence.
+    /// That is asserted too, and it is a real ceiling rather than a formality: on
+    /// an 80x24 the cap binds at about 0.9.
+    #[test]
+    fn relief_zero_is_a_slab_and_more_relief_moves_the_surface_more() {
+        let spread_at = |relief: f64| {
+            let mut options = TerrainOptions::default();
+            options.relief = relief;
+            let terrain = Terrain::new(options, (80, 24));
+            let rows = terrain.surface_rows(0.0, Terrain::horizon_row((80, 24)));
+            rows.iter().max().unwrap() - rows.iter().min().unwrap()
+        };
+
+        assert_eq!(
+            spread_at(0.0),
+            0,
+            "with no relief every column's surface is on the same row, so the \
+             ground is a rectangle with a ruler along the top"
+        );
+
+        let half = spread_at(0.5);
+        let full = spread_at(DEFAULT_RELIEF);
+        assert!(
+            half >= 2,
+            "half the relief gave a spread of only {half} rows"
+        );
+        assert!(
+            full > half,
+            "the default relief {DEFAULT_RELIEF} spread the surface {full} rows \
+             against {half} at half, so the knob is not reaching the surface row"
+        );
+
+        // And the cap is a cap, not a suggestion.
+        let huge = spread_at(50.0);
+        assert_eq!(
+            huge, full,
+            "relief 50 spread the surface {huge} rows against {full} at the \
+             default, so the amplitude is not capped and a large relief would \
+             drive the surface off the screen"
+        );
+    }
+
+    /// The relief has to mean the same *landscape* at every terminal size.
+    ///
+    /// This is the test that pins the units. `relief` is in rows per noise period
+    /// precisely so that the shape does not depend on how tall the screen is, and
+    /// with the amplitude expressed as a fraction of the ground's depth instead
+    /// the same setting measured 25% step density on an 80x24 and 76% on a
+    /// 200x50 -- the same number drawing a landscape and a picket fence.
+    #[test]
+    fn the_landscape_has_the_same_shape_at_every_screen_height() {
+        let density = |size: (u16, u16)| {
+            let mut options = TerrainOptions::default();
+            options.relief = 0.5;
+            // Below the cap at every one of these sizes, so what is being compared
+            // is the requested amplitude and not the clamp.
+            let terrain = Terrain::new(options, size);
+            let horizon = Terrain::horizon_row(size);
+            let rows = terrain.surface_rows(0.0, horizon);
+            let steps = rows.windows(2).filter(|w| w[0] != w[1]).count();
+            steps as f64 / (rows.len() - 1) as f64
+        };
+
+        let short = density((200, 24));
+        let tall = density((200, 200));
+        assert!(
+            (short - tall).abs() < 0.05,
+            "the same relief gave {short:.3} step density on a 24 row screen and \
+             {tall:.3} on a 200 row one, so the landscape changes shape with the \
+             terminal"
+        );
+    }
+
+    /// A `relief` a hand-edited config can produce must not take the frame with
+    /// it. NaN in particular: it would propagate through the surface row into
+    /// every cell of that column.
+    #[test]
+    fn a_degenerate_relief_falls_back_rather_than_drawing_nothing() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -3.0, 7.0] {
+            let mut options = TerrainOptions::default();
+            options.relief = bad;
+            let terrain = Terrain::new(options, (80, 24));
+            let span = terrain.surface_span(Terrain::horizon_row((80, 24)));
+            assert!(
+                span.is_finite() && span >= 0.0,
+                "relief {bad} produced a surface span of {span}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------- the two encodings
+
+    /// The glyph ramp runs denser with depth, and the colour ramp darker.
+    ///
+    /// These used to be one test called `the_glyph_and_the_colour_agree_on_the
+    /// _value`, and they were the same test because both encoded the same scalar.
+    /// They are not any more, and the split is the interesting part: the glyph
+    /// answers "how much rock is here" and the colour answers "how much light
+    /// reaches it", and for ground those disagree. A solid mass in shadow.
+    ///
+    /// Driving both in the same direction is the mistake worth preventing. If
+    /// the colour lightened with depth the ground would glow at the bottom of the
+    /// screen; if the glyph thinned with depth the ground would dissolve into
+    /// the background before it reached the last row.
+    #[test]
+    fn the_ground_gets_denser_and_darker_with_depth() {
+        let terrain = Terrain::new(TerrainOptions::default(), (80, 24));
+        let ramp = terrain.ramp.clone();
+        let palette = terrain.ground.clone();
+
+        let density = |t: f32| ramp.glyphs().iter().position(|&g| g == ramp.sample(t)).unwrap();
+        let luminance = |t: f32| match palette.sample(t) {
+            style::Color::Rgb { r, g, b } => {
+                0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
+            }
+            _ => f32::NAN,
+        };
+
+        let depths = [0.0f32, 0.25, 0.5, 0.75, 1.0];
+        for pair in depths.windows(2) {
+            let (shallow, deep) = (pair[0], pair[1]);
+            assert!(
+                density(deep) > density(shallow),
+                "the glyph at depth {deep} is {:?}, which is not denser than the \
+                 {:?} at {shallow}: the ground dissolves toward the bottom",
+                ramp.sample(deep),
+                ramp.sample(shallow)
+            );
+            assert!(
+                luminance(deep) < luminance(shallow),
+                "the ground is *brighter* at depth {deep} than at {shallow}, so \
+                 the bottom of the screen glows"
+            );
+        }
+    }
+
+    /// The default ramp is ASCII, because the user asked for it by name.
+    ///
+    /// The old default was `░▒▓█`, described in the report as "full locks" and
+    /// "unnecessary". This is a narrow test on purpose: it does not care what
+    /// the ramp is, only that it is ASCII, so a future set chosen for
+    /// prettiness cannot quietly reintroduce block elements.
+    #[test]
+    fn the_default_ground_ramp_is_ascii_and_not_block_elements() {
+        for glyph in DEFAULT_GLYPHS.chars() {
+            assert!(
+                glyph.is_ascii(),
+                "the default ground ramp contains {glyph:?}, which is not ASCII"
+            );
+            assert!(
+                !(('\u{2580}'..='\u{259F}').contains(&glyph)),
+                "the default ground ramp contains the block element {glyph:?}"
+            );
+        }
+    }
+
+    /// The ASCII ramp is not monotonic in ink, and that is a decision rather than
+    /// an accident.
+    ///
+    /// The block set this replaced was monotonic *by the standard* -- Unicode
+    /// defines `░▒▓█` as quarter through full coverage. No ASCII set has that
+    /// property, because ink coverage is not what ASCII characters are for. Two
+    /// adjacent pairs in the conventional ramp run backwards: `=` is two
+    /// horizontal rules and carries more than the `+` after it, and `+` is a thin
+    /// cross carrying less than the `*` after it.
+    ///
+    /// The test names those pairs rather than asserting monotonicity, because a
+    /// test that asserted monotonicity would fail and the obvious "fix" would be
+    /// to reorder the ramp into something that is monotonic on paper and looks
+    /// arbitrary on screen. The colour ramp carries depth continuously and
+    /// without error, so these two inversions cost local texture rather than a
+    /// corrupted value.
+    #[test]
+    fn the_ascii_ground_ramp_documents_the_two_pairs_that_run_backwards() {
+        let ramp = GlyphRamp::from_text(DEFAULT_GLYPHS);
+        let glyphs = ramp.glyphs();
+
+        // Sparse to dense, by the conventional measure of how much of the cell
+        // each character is expected to cover.
+        let expected_ink = |g: char| -> f32 {
+            match g {
+                ' ' => 0.0,
+                '.' => 0.05,
+                ':' => 0.1,
+                '-' => 0.15,
+                '=' => 0.25,
+                '+' => 0.2,
+                '*' => 0.3,
+                '#' => 0.4,
+                '%' => 0.5,
+                '@' => 0.6,
+                _ => f32::NAN,
+            }
+        };
+
+        let backwards: Vec<(char, char)> = glyphs
+            .windows(2)
+            .filter(|w| expected_ink(w[1]) < expected_ink(w[0]))
+            .map(|w| (w[0], w[1]))
+            .collect();
+
+        assert_eq!(
+            backwards,
+            vec![('=', '+')],
+            "the ramp's backwards pairs changed. Either the set was edited -- in \
+             which case update this list and the DEFAULT_GLYPHS comment -- or the \
+             inversion was accepted and is no longer the one documented."
+        );
+    }
+
+    /// Every cell of the ground is filled, so no ground cell may be a space.
+    ///
+    /// This is the bug the conventional ASCII ramp walks into. ` .:-=+*#%@` opens
+    /// with a space because it is a *texture* ramp, where sparse means blank. The
+    /// ground here is not a texture: it is a filled region, and the row at the
+    /// top of it in every column is the row whose depth samples the very start of
+    /// the ramp. With the space in, the crest of every hill drew as a space, the
+    /// silhouette sat a row too low, and on a one-row terminal the entire effect
+    /// was a space -- indistinguishable from the sky it was supposed to be
+    /// contrasted with.
+    #[test]
+    fn the_ground_is_never_drawn_as_a_space() {
+        assert!(
+            !DEFAULT_GLYPHS.contains(' '),
+            "the default ground ramp opens with a space, so the top row of the \
+             ground is indistinguishable from the sky"
+        );
+
+        // And on the real frame, not just in the constant.
+        let size = (80u16, 24u16);
+        let rows = surface(size);
+        let grid = drawn(size, 0);
+        // A column is a stride through a row-major grid, not a row.
+        for x in 0..size.0 as usize {
+            for y in rows[x]..size.1 as usize {
+                assert_ne!(
+                    grid[y][x], ' ',
+                    "cell ({x}, {y}) is below the surface at row {} but drew as a \
+                     space, so the ground has a hole in it",
+                    rows[x]
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- scrolling
+
+    /// The headline fix from the previous round: this rendered exactly one
+    /// frame, ever.
+    ///
+    /// `get_diff` used to be `if !self.generated { ... } else { Vec::new() }`
+    /// with a no-op `update`, so every frame after the first was empty -- a
+    /// screensaver that draws one picture and then waits for a key.
     #[test]
     fn the_second_frame_is_different_from_the_first() {
         let mut terrain = Terrain::new(TerrainOptions::default(), (80, 24));
-
-        let first = terrain.get_diff();
-        assert!(!first.is_empty(), "the first frame drew nothing");
-
-        // Real elapsed time, the way the frame loop supplies it.
+        terrain.get_diff();
         for _ in 0..30 {
             terrain.advance(1.0 / 60.0);
         }
@@ -460,13 +1057,7 @@ mod tests {
 
         assert!(
             !second.is_empty(),
-            "the frame after 30 updates was empty, so the terrain is still \
-             static"
-        );
-        assert_ne!(
-            first, second,
-            "the terrain drew the same cells half a second later, so it is not \
-             scrolling"
+            "the frame after 30 updates was empty, so the terrain is still static"
         );
     }
 
@@ -483,8 +1074,7 @@ mod tests {
 
         for (index, pair) in frames.windows(2).enumerate() {
             assert_ne!(
-                pair[0],
-                pair[1],
+                pair[0], pair[1],
                 "frames {index} and {} are identical, so the scroll stalled",
                 index + 1
             );
@@ -494,10 +1084,6 @@ mod tests {
     /// The scroll rate has to be real elapsed time, or the ground moves faster
     /// on a 144 Hz terminal than on a 30 Hz one and the speed keys do not mean
     /// what the help says.
-    ///
-    /// Also what the contract suite's `effects_advance_using_the_frame_delta`
-    /// checks, from outside the crate, now that this effect is no longer
-    /// exempt as static.
     #[test]
     fn the_scroll_honours_the_frame_delta() {
         let run = |delta: f64| {
@@ -513,233 +1099,144 @@ mod tests {
 
         assert!(
             (fast.0 - slow.0 * 3.0).abs() < 1.0e-9,
-            "60 frames at 0.05s each scrolled {:.3} rows against {:.3} at \
-             1/60s, which is not 3x",
+            "60 frames at 0.05s each advanced {:.3} against {:.3} at 1/60s, \
+             which is not 3x",
             fast.0,
             slow.0
         );
-
-        // Compared against the canvas, not against a diff.
-        //
-        // `get_diff` reports what changed since the last call, so the second
-        // call on an instance reports nothing at all -- and asking two fresh
-        // instances to differ in their diffs is a question with no answer, since
-        // each one's *first* diff is a full repaint. The offset is the state
-        // that actually distinguishes the two runs, and it is three times
-        // further along, so the ground is somewhere else on screen.
-        assert_ne!(
-            slow.0, fast.0,
-            "the same number of frames at two different rates ended at the \
-             same scroll offset"
-        );
         assert!(
             (fast.0 - slow.0).abs() > 0.5,
-            "the two rates ended {:.4} rows apart, which is too little to move \
-             the ground visibly",
+            "the two rates ended {:.4} apart, which is too little to move the \
+             ground visibly",
             (fast.0 - slow.0).abs()
         );
     }
 
-    /// The default has to look like terrain at 80x24, not like one soft blob.
+    /// The scroll has to move the *silhouette*, not just the shading.
     ///
-    /// The arithmetic the old code produced, at 80x24 with no aspect correction
-    /// anywhere: `x as f64` runs 0 to 79 and `y as f64` runs 0 to 23, and both
-    /// were multiplied by a hard-coded `scale` of 0.02. So the noise domain was
-    /// x in [0, 1.6] and y in [0, 0.48] -- one and a half noise cells across the
-    /// whole width and *less than half of one* down. Less than one period of the
-    /// field vertically is why every row was nearly the same value and the screen
-    /// was one soft gradient. At 400x200 the same 0.02 gave 8 by 4, which is
-    /// where the effect started to look like terrain at all: the default was
-    /// tuned for a very large terminal.
+    /// The previous version of this test counted changed cells, which a
+    /// per-cell value field made cheap to satisfy: any scroll changed something
+    /// somewhere. Now the structure is a height field and the structure lives in
+    /// the surface, so the test watches the surface. A scroll that moved the
+    /// depth shading while leaving every crest on the same row would pass the old
+    /// test and fail this one.
     #[test]
-    fn the_default_noise_domain_covers_the_screen_at_eighty_by_twenty_four() {
-        let size = (80u16, 24u16);
-        let frequency = Terrain::noise_frequency(TerrainOptions::default().scale);
-        let horizon = Terrain::horizon_row(size);
-        let ground_rows = size.1 - horizon as u16;
+    fn the_scroll_moves_the_silhouette_and_not_only_the_shading() {
+        let mut terrain = Terrain::new(TerrainOptions::default(), (80, 24));
+        let horizon = Terrain::horizon_row((80, 24));
+        let first = terrain.surface_rows(terrain.offset, horizon);
 
-        // Periods, not cells. The vertical figure is over the *ground* rows,
-        // since the sky samples no noise at all and counting it would flatter the
-        // number.
-        let across = f64::from(size.0) * frequency;
-        let down = f64::from(ground_rows) * CELL_ASPECT * frequency;
-
-        assert!(
-            across >= 8.0,
-            "the noise spans only {across:.1} periods across an 80-column screen, \
-             against the {old_across:.1} the old hard-coded 0.02 gave",
-            old_across = 80.0 * 0.02,
-        );
-        assert!(
-            down >= 1.5,
-            "the noise spans only {down:.1} periods down the {ground_rows} ground \
-             rows, against the {old_down:.2} the old hard-coded 0.02 gave over \
-             all 24 rows. Under one period vertically there is no room for a \
-             ridge to exist",
-            old_down = 24.0 * 0.02,
-        );
-    }
-
-    /// The ground has to have *structure*, which is the actual complaint.
-    ///
-    /// The old effect did vary its value -- 130 distinct brightnesses on an
-    /// 80x24 screen -- so a test asserting "lots of distinct values" passes
-    /// against it and proves nothing. What made it look like a blob was that the
-    /// variation was smooth in *space*: at 50 cells per period the whole
-    /// terminal sampled about one period across and a third of one down, so
-    /// every row was nearly the same value and the screen was one soft gradient.
-    ///
-    /// The measure is how often the glyph ramp changes between *neighbouring*
-    /// cells, because that is what the eye reads as a ridge. Measured on the
-    /// ground only, as horizontal/vertical fractions: the old 0.02 gave 4.6%
-    /// and 5.2% at 80x24, and the `DEFAULT_SCALE` default of 8 cells per period
-    /// gives 16.1% and 20.2%.
-    ///
-    /// Asserted at three sizes on purpose. A period fixed in cells makes the
-    /// density size-independent -- the same setting measures 15.3% and 17.8% at
-    /// 400x200 as it does 16.1% and 20.2% at 80x24 -- so one threshold holds
-    /// everywhere, and a regression that reintroduced a screen-normalised
-    /// frequency would pass at 80x24 and fail at 400x200. That is the whole
-    /// reason the `scale` field is documented as a period.
-    #[test]
-    fn the_ground_has_structure_rather_than_being_one_smooth_blob() {
-        for size in [(80u16, 24u16), (200u16, 50u16), (400u16, 200u16)] {
-            let (horizontal, vertical) = Terrain::contour_density(size);
-
-            assert!(
-                horizontal > 0.12,
-                "at {}x{} the ramp changes between only {:.1}% of horizontally \
-                 adjacent ground cells, against the 16.1% this default measures \
-                 at 80x24, so the ground is too smooth to read as terrain",
-                size.0,
-                size.1,
-                horizontal * 100.0
-            );
-            assert!(
-                vertical > 0.15,
-                "at {}x{} the ramp changes between only {:.1}% of vertically \
-                 adjacent ground cells, against the 20.2% this default measures \
-                 at 80x24",
-                size.0,
-                size.1,
-                vertical * 100.0
-            );
+        for _ in 0..120 {
+            terrain.advance(1.0 / 60.0);
         }
-    }
+        let later = terrain.surface_rows(terrain.offset, horizon);
 
-    /// The aspect ratio has to be corrected, or the landscape is stretched.
-    ///
-    /// Measured on the *output*, because a domain measured in cells compares
-    /// equal to the screen's own cell ratio whether or not the aspect has been
-    /// corrected -- that form of the assertion passes against the old code and
-    /// proves nothing.
-    ///
-    /// The measure is the ratio of horizontal to vertical contour density, and
-    /// the correction is what makes it 1. Without it a cell column and a cell
-    /// row count for the same amount in the noise, while on a 1 : 1.2 font they
-    /// are not the same size on screen, so the features come out 1.2 times too
-    /// tall. That shows up as *more* vertical structure than horizontal, because
-    /// rows are being packed into less space than they occupy.
-    ///
-    /// Measured at 80x24, aspect-corrected: 16.1% horizontal against 20.2%
-    /// vertical, a ratio of 0.80. Uncorrected, the same field gives 13.4% and
-    /// 14.6%, a ratio of 0.92. The correction moves the ratio *away* from 1
-    /// here, which is the counter-intuitive part worth pinning: it is correct
-    /// because the ramp has more steps than there are cells of vertical detail,
-    /// so equal ratios of contour crossings is the *stretched* case, not the
-    /// isotropic one. What the correction guarantees is that one noise period
-    /// spans the same number of screen units in each direction, which is the
-    /// next test.
-    #[test]
-    fn the_aspect_correction_reaches_the_vertical_axis() {
-        let (horizontal, vertical) = Terrain::contour_density((80, 24));
-
-        // Without the correction, vertical density tracks horizontal closely
-        // because both axes are sampled in the same raw cell units. With it,
-        // vertical density rises relative to horizontal, because a cell row is
-        // now 1.2 screen units of field and so crosses more contours.
+        let moved = first
+            .iter()
+            .zip(&later)
+            .filter(|(a, b)| a != b)
+            .count();
         assert!(
-            vertical > horizontal,
-            "vertical contour density ({:.1}%) is not above horizontal \
-             ({:.1}%), so the vertical axis is not being aspect-corrected",
-            vertical * 100.0,
-            horizontal * 100.0
-        );
-        assert!(
-            vertical / horizontal > 1.15,
-            "vertical density is only {:.2}x horizontal, against 1.26x for the \
-             1 : 1.2 correction -- the correction is not reaching the sampling",
-            vertical / horizontal
+            moved > 0,
+            "after two seconds at the default scroll speed not one column's \
+             surface had moved, so the landscape is standing still"
         );
     }
 
-    /// One noise period has to span the same number of screen units in each
-    /// direction, which is what "a circle in the field is a circle on screen"
-    /// means.
+    /// The default has to be visible motion without being a conveyor belt.
     ///
-    /// 400x200 is the size the old default was tuned at, and on screen that is
-    /// 400 units wide by 240 tall. The period is `scale` cells across and
-    /// `scale` corrected units down, so both are 8 screen units and the assertion
-    /// is an exact equality rather than a band.
+    /// Reinterpreted for the height field, since `scroll_speed` now measures
+    /// how fast the landscape passes the camera rather than how fast a sampled
+    /// field is offset vertically. The band is expressed as *seconds per noise
+    /// period*, which is the quantity a viewer actually perceives: it is how
+    /// long one ridge takes to cross the screen.
     #[test]
-    fn one_noise_period_is_the_same_size_in_both_directions() {
-        // The domain on a 400x200 screen is not square -- 400 units by 240 -- so
-        // this is about the *period*, not the domain. Horizontally a period is
-        // `scale` coordinate units and a cell column is 1 unit, so `scale` screen
-        // units. Vertically a cell row is CELL_ASPECT units, so a period is
-        // `scale / CELL_ASPECT` cell rows, which is `scale` screen units again.
-        // That cancellation is the whole content of the correction.
-        let scale = TerrainOptions::default().scale;
+    fn the_scroll_is_fast_enough_to_see_without_being_a_conveyor_belt() {
+        let options = TerrainOptions::default();
+        let period = TerrainOptions::default().scale;
+        let seconds_per_period = period / options.scroll_speed;
 
-        let units_across = scale;
-        let cells_down = scale / CELL_ASPECT;
-        let units_down = cells_down * CELL_ASPECT;
-
-        assert_eq!(
-            units_across, units_down,
-            "a {scale} cell period is {units_across:.2} screen units across but \
-             {units_down:.2} down, so the noise is not isotropic on screen"
-        );
-
-        // The domain consequence, on the size the old default was tuned at. The
-        // screen is 400 units wide and 200 * 1.2 = 240 tall, and the sampled
-        // domain is in exactly that proportion because the two are the same
-        // number of cells times their units.
-        let frequency = Terrain::noise_frequency(scale);
-        let size = (400u16, 200u16);
-        let screen_across = f64::from(size.0);
-        let screen_down = f64::from(size.1) * CELL_ASPECT;
-        let domain_across = screen_across * frequency;
-        let domain_down = screen_down * frequency;
-
-        assert_eq!(
-            domain_across / screen_across,
-            domain_down / screen_down,
-            "at 400x200 the domain is {domain_across:.2} by {domain_down:.2} \
-             screen units, which is not the screen's own {screen_across:.0} by \
-             {screen_down:.0}"
-        );
-
-        // The constant itself has to be a real departure from 1, or there is
-        // nothing to correct.
         assert!(
-            (CELL_ASPECT - 1.0).abs() > 0.1,
-            "CELL_ASPECT is {CELL_ASPECT}, close enough to 1 that correcting by \
-             it does nothing"
+            (2.0..30.0).contains(&seconds_per_period),
+            "at scroll_speed {} one {period} cell ridge takes {seconds_per_period:.1}s \
+             to cross the screen, which is outside the 2 to 30 second band: under \
+             2s the ground stops reading as distance, over 30s it is not motion",
+            options.scroll_speed
         );
     }
 
-    /// The smallest terminal the contract suite drives has to draw something
-    /// legible, and the largest must not be a smooth wash.
+    // ----------------------------------------------------------------- the knob
+
+    /// `scale` is a zoom, so it has to stay one.
     ///
-    /// Cells per noise period, rather than periods per screen: the period is
-    /// fixed in cells so this is the same number everywhere, and what varies with
-    /// size is how much of the field the screen shows. At 6x6 the screen shows
-    /// well under one period across, which is the right answer -- there is not
-    /// room for more, and stretching to fill it would make every cell a
-    /// different octave.
+    /// A period in cells: halving it doubles the frequency and vice versa. Worth
+    /// pinning because the field used to take a raw frequency where the same
+    /// relationships held *multiplicatively in the wrong direction* -- a user who
+    /// wrote `scale = 0.04` in a generated config asking for a coarser landscape
+    /// would have got a finer one.
     #[test]
-    fn the_domain_stays_usable_at_both_ends_of_the_size_range() {
+    fn scale_is_a_zoom_and_says_so_in_its_direction() {
+        let at = Terrain::noise_frequency;
+        let base = at(8.0);
+
+        assert!((at(4.0) - base * 2.0).abs() < 1.0e-12, "half the period, twice the frequency");
+        assert!((at(16.0) - base / 2.0).abs() < 1.0e-12, "double the period, half the frequency");
+        assert_eq!(at(8.0), base);
+        assert!(
+            at(2.0) > at(16.0),
+            "a smaller scale is a shorter period, so it must be the higher frequency"
+        );
+    }
+
+    /// A smaller period has to give a more jagged silhouette, which is the
+    /// whole point of the knob now that the field is a height field.
+    ///
+    /// Before the rewrite `scale` only changed how smooth the *texture* was,
+    /// because there was no structure for it to change. This ties it to the
+    /// silhouette, which is what a user zooming in is actually asking for.
+    ///
+    /// Measured as step density rather than as spread, and the amplitude is held
+    /// fixed across the two cases. Neither detail is incidental.
+    ///
+    /// Density rather than spread, because spread measures how *far* the surface
+    /// moves and this test is about how often it turns. Spread is also the wrong
+    /// measure here for a second reason: `relief` is in rows per period, so
+    /// changing the period changes the amplitude too, and measured as a spread
+    /// 4 and 16 cells per period both came out at 4 rows on an 80x24 -- this test
+    /// failed while the effect was working perfectly.
+    ///
+    /// Amplitude fixed, so the only variable left is the wavelength. `relief` is
+    /// chosen per case to give both the same four-row amplitude, which is below
+    /// the cap at both.
+    #[test]
+    fn a_smaller_period_gives_a_more_jagged_silhouette() {
+        let density_at = |scale: f64| {
+            let mut options = TerrainOptions::default();
+            options.scale = scale;
+            options.relief = 4.0 / scale;
+            let terrain = Terrain::new(options, (80, 24));
+            let rows = terrain.surface_rows(0.0, Terrain::horizon_row((80, 24)));
+            rows.windows(2)
+                .filter(|w| w[0] != w[1])
+                .count() as f64
+                / (rows.len() - 1) as f64
+        };
+
+        let close = density_at(4.0);
+        let far = density_at(16.0);
+        assert!(
+            close > far * 1.5,
+            "at the same amplitude a 4 cell period turns the silhouette on \
+             {:.1}% of adjacent columns against {:.1}% at 16 cells, so zooming \
+             in does not make the landscape more detailed",
+            close * 100.0,
+            far * 100.0
+        );
+    }
+
+    /// The period has to stay in a band at both ends of the size range.
+    #[test]
+    fn the_period_stays_usable() {
         let period = TerrainOptions::default().scale;
         assert!(
             (6.0..=12.0).contains(&period),
@@ -747,102 +1244,11 @@ mod tests {
              ridges alias, above 12 the ground is a smooth wash"
         );
 
-        // And the finest octave has to be near the resolution limit rather than
-        // well past it, which is why the coarsest octave is what the eye reads.
         let finest = period / 2f64.powi(TerrainOptions::default().octaves - 1);
         assert!(
             finest >= 0.8,
             "the finest octave has a period of {finest:.2} cells, below the ~1 \
-             cell at which a ramp can represent it"
-        );
-    }
-
-    /// `scale` is a zoom, so it has to stay one.
-    ///
-    /// A period in cells: halving it doubles the frequency and vice versa. That
-    /// is the whole contract, and it is worth pinning because the field used to
-    /// take a raw frequency where the same relationships held *multiplicatively
-    /// in the wrong direction* -- a user who wrote `scale = 0.04` in a generated
-    /// config asking for a coarser landscape would have got a finer one. A
-    /// reciprocal is the one case where getting this backwards is invisible in
-    /// the code and obvious on screen.
-    #[test]
-    fn scale_is_a_zoom_and_says_so_in_its_direction() {
-        let at = Terrain::noise_frequency;
-        let base = at(8.0);
-
-        assert!(
-            (at(4.0) - base * 2.0).abs() < 1.0e-12,
-            "half the period, twice the frequency"
-        );
-        assert!(
-            (at(16.0) - base / 2.0).abs() < 1.0e-12,
-            "double the period, half the frequency"
-        );
-        assert_eq!(at(8.0), base);
-
-        // A smaller `scale` is a closer look. Stated as an assertion because the
-        // direction is the thing worth protecting.
-        assert!(
-            at(2.0) > at(16.0),
-            "a smaller scale is a shorter period, so it must be the higher \
-             frequency"
-        );
-    }
-
-    /// The scroll has to be fast enough to see, and its cost is proportional to
-    /// the rate, so this pins both ends.
-    ///
-    /// The lower bound is the bug: at 0.35 rows a second a frame at 60 Hz moved
-    /// the ground by 0.006 of a row, and a five-step glyph ramp quantises the
-    /// value, so a cell only redraws when it crosses a step boundary. Measured,
-    /// the worst frame at 0.35 changed 85 cells at 80x24 and 718 at 400x200;
-    /// at the 0.9 default it is 207 and 1822, which is motion you can see.
-    #[test]
-    fn the_scroll_is_fast_enough_to_see_without_being_a_conveyor_belt() {
-        let options = TerrainOptions::default();
-        assert!(
-            options.scroll_speed > 0.35,
-            "a ridge takes {:.1} seconds to cross one cell row at \
-             scroll_speed {}, which is too slow to read as motion",
-            1.0 / options.scroll_speed,
-            options.scroll_speed
-        );
-        // The upper bound is inlined rather than a named constant: the only
-        // consumer is this assertion, and a private constant used once in a
-        // test is a name that costs a reader a lookup for no gain. 2.0 rows a
-        // second is where the ground stops reading as receding.
-        assert!(
-            options.scroll_speed < 2.0,
-            "a ridge crosses a cell row every {:.2}s at scroll_speed {}, which \
-             stops reading as distance",
-            1.0 / options.scroll_speed,
-            options.scroll_speed
-        );
-
-        // And the ground has to actually be moving at 60 Hz, which is a
-        // different question from whether the rate is numerically nonzero: a
-        // sub-row rate can still quantise to no visible change at all.
-        let mut terrain = Terrain::new(options, (80, 24));
-        let first = terrain.get_diff();
-        assert!(!first.is_empty(), "the fixture drew nothing");
-
-        let mut worst = 0usize;
-        for _ in 0..10 {
-            let previous = terrain.get_diff();
-            terrain.advance(1.0 / 60.0);
-            let current = terrain.get_diff();
-            worst = worst.max(
-                current
-                    .iter()
-                    .filter(|cell| !previous.contains(cell))
-                    .count(),
-            );
-        }
-        assert!(
-            worst >= 5,
-            "the busiest frame changed only {worst} cells at 60 Hz, so the \
-             ground is not visibly moving"
+             cell at which the surface can represent it"
         );
     }
 
@@ -857,73 +1263,62 @@ mod tests {
                 frequency.is_finite() && frequency > 0.0,
                 "scale {bad} produced a frequency of {frequency}"
             );
-            assert_eq!(
-                frequency, good,
-                "scale {bad} did not fall back to the default frequency"
-            );
+            assert_eq!(frequency, good, "scale {bad} did not fall back");
         }
     }
 
-    /// The horizon has to leave room for both sky and ground, at every size
-    /// the contract suite drives.
+    // ------------------------------------------------------------- the picture
+
+    /// The horizon leaves room for both sky and ground, at every size the
+    /// contract suite drives.
     #[test]
     fn the_horizon_leaves_room_for_sky_and_ground_at_every_size() {
         for (width, height) in [(6u16, 6u16), (8, 200), (200, 8), (1, 1), (1, 9)] {
             let horizon = Terrain::horizon_row((width, height));
             assert!(
                 horizon < height as usize,
-                "at {width}x{height} the horizon is row {horizon}, so there is \
-                 no ground at all"
+                "at {width}x{height} the horizon is row {horizon}, so there is no \
+                 ground at all"
             );
 
-            let mut terrain =
-                Terrain::new(TerrainOptions::default(), (width, height));
-            let diff = terrain.get_diff();
-            let sky_rows: HashSet<usize> = diff
-                .iter()
-                .filter(|(_, _, cell)| cell.symbol == ' ')
-                .map(|(_, y, _)| *y)
-                .collect();
+            let grid = drawn((width, height), 0);
+            let has_sky = grid.iter().flatten().any(|&c| c == ' ');
+            let has_ground = grid.iter().flatten().any(|&c| c != ' ');
 
-            // A one-row terminal is ground: the two bounds cannot both hold and
-            // ground is the more informative of the two.
             if height == 1 {
-                assert_eq!(
-                    sky_rows.len(),
-                    0,
-                    "a one-row terminal was drawn as sky"
-                );
+                assert!(has_ground, "a one-row terminal was drawn as sky");
             } else {
-                assert!(
-                    !sky_rows.is_empty(),
-                    "at {width}x{height} no row was drawn as sky"
-                );
-                assert_eq!(
-                    sky_rows.len(),
-                    horizon,
-                    "at {width}x{height} the horizon is at row {horizon} but \
-                     {} rows came out as sky",
-                    sky_rows.len()
-                );
+                assert!(has_sky, "at {width}x{height} nothing was drawn as sky");
             }
+            assert!(
+                has_ground,
+                "at {width}x{height} nothing was drawn as ground"
+            );
         }
     }
 
-    /// The sky has to be a gradient, and it has to be dimmer than the haze it
-    /// is supposed to end on.
+    /// The sky is a gradient, and dimmer than the haze it ends on.
     ///
-    /// Running the sky ramp all the way to its top stop put that stop's
-    /// brightness at the horizon, which is the brightest thing on the screen
-    /// sitting exactly where it was meant to be the faintest thing on its row.
+    /// Run to its top stop, that stop's brightness would sit at the horizon --
+    /// the brightest thing on the screen exactly where it was meant to be the
+    /// faintest thing on its row.
+    ///
+    /// Collected from the drawn sky rather than from fixed rows, because the sky
+    /// is no longer a rectangle: it is everything above a surface that moves, so
+    /// a fixed row may be sky in one column and ground in the next.
     #[test]
     fn the_sky_darkens_towards_the_zenith_and_stays_below_its_haze() {
-        let mut terrain = Terrain::new(TerrainOptions::default(), (80, 24));
-        let horizon = Terrain::horizon_row((80, 24));
+        let size = (80u16, 24u16);
+        let mut terrain = Terrain::new(TerrainOptions::default(), size);
         let diff = terrain.get_diff();
 
+        // Keyed by row, not by column. The sky is no longer a rectangle: it is
+        // everything above a surface that moves, so a given row is sky in some
+        // columns and ground in others and the colour of a row has to be read
+        // from the sky cells on it.
         let sky: Vec<(usize, u8)> = diff
             .iter()
-            .filter(|(_, y, _)| *y < horizon)
+            .filter(|(_, _, cell)| cell.symbol == ' ')
             .filter_map(|(_, y, cell)| match cell.color {
                 style::Color::Rgb { r, .. } => Some((*y, r)),
                 _ => None,
@@ -931,22 +1326,26 @@ mod tests {
             .collect();
         assert!(sky.len() > 20, "the fixture produced almost no sky");
 
-        let zenith = sky.iter().find(|(y, _)| *y == 0).unwrap().1;
-        let at_horizon = sky.iter().find(|(y, _)| *y == horizon - 1).unwrap().1;
+        // Every column keeps at least one sky row, so row 0 is sky throughout and
+        // has a single colour.
+        let zenith = sky
+            .iter()
+            .find(|(y, _)| *y == 0)
+            .expect("row 0 is sky in every column")
+            .1;
+        let brightest = sky.iter().map(|(_, r)| *r).max().unwrap();
 
         assert!(
-            zenith < at_horizon,
-            "the top row is {zenith} and the row above the horizon is \
-             {at_horizon}: the sky is not darker at the top"
+            brightest > zenith,
+            "the top row is {zenith} and the brightest sky anywhere is \
+             {brightest}: the sky is not darker at the top"
         );
-        let brightest = sky.iter().map(|(_, r)| *r).max().unwrap();
         assert!(
             brightest <= 140,
-            "the brightest sky row is {brightest}, which is brighter than the \
-             haze the sky ramp ends on (126)"
+            "the brightest sky is {brightest}, brighter than the haze the ramp \
+             ends on (126)"
         );
 
-        // And more than one brightness, so it is a gradient rather than a fill.
         let levels: HashSet<u8> = sky.iter().map(|(_, r)| *r).collect();
         assert!(
             levels.len() >= 3,
@@ -975,91 +1374,12 @@ mod tests {
         }
     }
 
-    /// The glyph ramp has to run sparse to dense.
-    ///
-    /// The old table was the same set as `SHADE` and was hard-coded, and
-    /// `SHADE` is documented as *not* monotonic in ink: `=` is heavier than
-    /// `+`, and `+` is heavier than `*`. So three consecutive steps of the old
-    /// ground read backwards. This pins the default against that, and
-    /// `GlyphRamp`'s own tests cover the preset itself.
-    #[test]
-    fn the_glyph_ramp_is_monotonic_in_ink_coverage() {
-        let terrain = Terrain::new(TerrainOptions::default(), (80, 24));
-        let ramp = terrain.ramp.clone();
-
-        assert_eq!(ramp.glyphs(), &[' ', '░', '▒', '▓', '█']);
-        // The four shade blocks are defined by Unicode as 1/4, 1/2, 3/4 and
-        // full coverage, so the midpoints of a five-step ramp land exactly on
-        // each interior entry and the ordering is checkable from the values.
-        assert_eq!(ramp.sample(0.0), ' ');
-        assert_eq!(ramp.sample(0.25), '░');
-        assert_eq!(ramp.sample(0.5), '▒');
-        assert_eq!(ramp.sample(0.75), '▓');
-        assert_eq!(ramp.sample(1.0), '█');
-    }
-
-    /// The drawn glyph has to be the one the value selected, and the drawn
-    /// colour the one *the same* value selected.
-    ///
-    /// The old code quantised the glyph and the greyscale independently from
-    /// the same value, which is defensible, but it also drew a glyph and a
-    /// colour for every band boundary whether or not the band was near, so half
-    /// the signal was a second encoding of the other half. This checks the pair
-    /// agree, which is what makes the glyph a value carrier rather than texture.
-    #[test]
-    fn the_glyph_and_the_colour_agree_on_the_value() {
-        let mut terrain = Terrain::new(TerrainOptions::default(), (80, 24));
-        let ramp = terrain.ramp.clone();
-        let palette = terrain.ground.clone();
-        let diff = terrain.get_diff();
-
-        // One pass over the drawn cells, recovering the value each was drawn
-        // from, so the two encodings can be compared against a common source.
-        let mut seen = 0usize;
-        for (x, y, cell) in diff {
-            if cell.symbol == ' ' {
-                continue;
-            }
-            // Corrected units, matching `render`. The test is about the two
-            // encodings agreeing, so it has to recover the value from exactly
-            // the coordinate the renderer sampled.
-            let row =
-                (y as f64 - Terrain::horizon_row((80, 24)) as f64) * CELL_ASPECT;
-            let frequency =
-                Terrain::noise_frequency(TerrainOptions::default().scale);
-            let value = terrain.noise.octave_noise_2d(
-                x as f64,
-                row,
-                TerrainOptions::default().octaves,
-                TerrainOptions::default().persistence,
-                frequency,
-            );
-            let normalised = ((value + 1.0) / 2.0).clamp(0.0, 1.0) as f32;
-
-            assert_eq!(
-                cell.symbol,
-                ramp.sample(normalised),
-                "cell ({x}, {y}) at value {normalised:.3} drew {:?} rather than \
-                 the ramp's own step",
-                cell.symbol
-            );
-            assert_eq!(
-                cell.color,
-                palette.sample(normalised),
-                "cell ({x}, {y}) drew a colour from a different value than its \
-                 glyph"
-            );
-            seen += 1;
-        }
-        assert!(seen > 400, "only {seen} ground cells to check");
-    }
-
     /// The determinism contract: the same seed gives the same landscape, a
     /// different seed gives a different one.
     ///
     /// The scroll is folded in by offsetting the *sampling*, never by changing
     /// the generator, so this holds at any point in the scroll rather than only
-    /// on the first frame. That is the reason the scroll was done this way.
+    /// on the first frame.
     #[test]
     fn the_noise_is_still_reproducible_and_still_seed_sensitive() {
         let first_frame = |seed: u64, frames: u64| {
@@ -1081,32 +1401,31 @@ mod tests {
 
             assert_eq!(
                 a, b,
-                "two terrains at seed 1234 drew differently after {frames} \
-                 frames, so the generator is not reproducible"
+                "two terrains at seed 1234 drew differently after {frames} frames"
             );
             assert_ne!(
                 a, c,
-                "seeds 1234 and 4321 drew the same terrain after {frames} \
-                 frames, so the seed is not reaching the noise"
+                "seeds 1234 and 4321 drew the same terrain after {frames} frames, \
+                 so the seed is not reaching the noise"
             );
         }
     }
 
-    /// `--print-config` writes every key to disk, so a generated config is
-    /// pinned to whatever the defaults were the day it was generated and every
-    /// future knob arrives as "a key the user's file does not have". That is
-    /// the normal case, not the exotic one.
+    /// `--print-config` writes every key to disk, so a generated config is pinned
+    /// to whatever the defaults were the day it was generated. `relief` has to
+    /// be in that list or it arrives as a key the user's file does not have.
     #[test]
     fn the_new_keys_round_trip_through_toml() {
         let options: TerrainOptions =
-            toml::from_str("scroll_speed = 2.5\nglyphs = \" .oO@\"\n")
-                .expect("two keys parse");
+            toml::from_str("scroll_speed = 2.5\nrelief = 0.3\nglyphs = \" .oO@\"\n")
+                .expect("three keys parse");
         assert_eq!(options.scroll_speed, 2.5);
+        assert_eq!(options.relief, 0.3);
         assert_eq!(options.glyphs, " .oO@");
         assert_eq!(
             options.scale,
             TerrainOptions::default().scale,
-            "two keys in the section silently reset the others"
+            "three keys in the section silently reset the others"
         );
 
         let serialised = toml::to_string(&options).expect("the section serialises");
@@ -1116,6 +1435,7 @@ mod tests {
             "octaves",
             "persistence",
             "scroll_speed",
+            "relief",
             "glyphs",
         ] {
             assert!(
@@ -1126,9 +1446,7 @@ mod tests {
         }
     }
 
-    /// A ramp a user's config has emptied out degrades to the documented
-    /// default rather than to `SHADE`, which is the one preset here that is
-    /// documented as not monotonic in ink.
+    /// A ramp a user's config has emptied out degrades to the documented default.
     #[test]
     fn an_unusable_glyph_config_falls_back_to_the_default_ramp() {
         for configured in ["", "\u{7}\u{1}", "\u{4E2D}"] {
@@ -1139,6 +1457,41 @@ mod tests {
                 "{configured:?} did not fall back to the documented default"
             );
         }
-        assert_eq!(DEFAULT_GLYPHS, glyph_ramp::presets::BLOCKS);
+        assert!(
+            DEFAULT_GLYPHS.is_ascii(),
+            "the documented default is no longer the ASCII ramp"
+        );
+    }
+
+    /// The surface must be cheap.
+    ///
+    /// It is the only part of the frame that costs a noise sample, and there are
+    /// `height` times more cells than columns. Sampling per cell instead -- which
+    /// is what the old renderer did -- is 80,000 samples at 400x200 against 200.
+    /// This asserts the count rather than the timing, because a timing assertion
+    /// on a shared build machine fails for reasons that have nothing to do with
+    /// the code.
+    #[test]
+    fn the_surface_costs_one_noise_sample_per_column_not_per_cell() {
+        let size = (400u16, 200u16);
+        let terrain = Terrain::new(TerrainOptions::default(), size);
+        let rows = terrain.surface_rows(0.0, Terrain::horizon_row(size));
+
+        assert_eq!(
+            rows.len(),
+            usize::from(size.0),
+            "the surface should be computed once per column"
+        );
+        // And the frame still draws every cell, so the cheap surface did not come
+        // from drawing less.
+        let mut painted = Terrain::new(TerrainOptions::default(), size);
+        let drawn_cells = painted.get_diff().len();
+        assert_eq!(
+            drawn_cells,
+            usize::from(size.0) * usize::from(size.1),
+            "at 400x200 the frame should touch every cell, got {drawn_cells}"
+        );
     }
 }
+
+

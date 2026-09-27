@@ -3,7 +3,7 @@ use crate::boids::Boids;
 use crate::buffer::Cell;
 use crate::common::TerminalEffect;
 use crate::config::Config;
-use crate::constellation::Constellation;
+use crate::solarsystem::SolarSystem;
 use crate::crab::Crab;
 use crate::cube::Cube;
 use crate::donut::Donut;
@@ -39,7 +39,7 @@ pub enum EffectId {
     Pipes,
     Plasma,
     Fire,
-    Constellation,
+    SolarSystem,
     Ink,
     Terrain,
 }
@@ -174,12 +174,12 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         config_section: "fire",
     },
     EffectSpec {
-        id: EffectId::Constellation,
-        name: "constellation",
-        description: "Drifting stars and dotted connections",
+        id: EffectId::SolarSystem,
+        name: "solarsystem",
+        description: "A solar system on tilted orbits, real orbital periods",
         default_duration: 20.0,
         needs_mouse: false,
-        config_section: "constellation",
+        config_section: "solarsystem",
     },
     EffectSpec {
         id: EffectId::Ink,
@@ -294,7 +294,7 @@ pub enum AnyEffect {
     Pipes(Pipes),
     Plasma(Plasma),
     Fire(Fire),
-    Constellation(Constellation),
+    SolarSystem(SolarSystem),
     Ink(AsciiField),
     Terrain(Terrain),
 }
@@ -315,7 +315,7 @@ impl AnyEffect {
             Self::Pipes(_) => EffectId::Pipes,
             Self::Plasma(_) => EffectId::Plasma,
             Self::Fire(_) => EffectId::Fire,
-            Self::Constellation(_) => EffectId::Constellation,
+            Self::SolarSystem(_) => EffectId::SolarSystem,
             Self::Ink(_) => EffectId::Ink,
             Self::Terrain(_) => EffectId::Terrain,
         }
@@ -368,8 +368,8 @@ impl AnyEffect {
             EffectId::Fire => {
                 Self::Fire(Fire::new(config.get_fire_options(), screen_size))
             }
-            EffectId::Constellation => Self::Constellation(Constellation::new(
-                config.get_constellation_options(),
+            EffectId::SolarSystem => Self::SolarSystem(SolarSystem::new(
+                config.get_solarsystem_options(),
                 screen_size,
             )),
             EffectId::Ink => {
@@ -457,7 +457,7 @@ impl_terminal_effect_for_any!(
     Pipes,
     Plasma,
     Fire,
-    Constellation,
+    SolarSystem,
     Ink,
     Terrain,
 );
@@ -486,7 +486,7 @@ mod tests {
         EffectId::Pipes,
         EffectId::Plasma,
         EffectId::Fire,
-        EffectId::Constellation,
+        EffectId::SolarSystem,
         EffectId::Ink,
         EffectId::Terrain,
     ];

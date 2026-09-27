@@ -1,7 +1,6 @@
 use crate::{
     blank::BlankOptions,
     boids::BoidsOptions,
-    constellation::ConstellationOptions,
     crab::CrabOptions,
     cube::CubeOptions,
     donut::DonutOptions,
@@ -16,6 +15,7 @@ use crate::{
     plasma::PlasmaOptions,
     playlist::PlaylistOptions,
     rain::digital_rain::DigitalRainOptions,
+    solarsystem::SolarSystemOptions,
     terrain::TerrainOptions,
 };
 use crossterm::style::Color;
@@ -159,7 +159,7 @@ pub struct Config {
     pub plasma: PlasmaOptions,
     pub fire: FireOptions,
     pub terrain: TerrainOptions,
-    pub constellation: ConstellationOptions,
+    pub solarsystem: SolarSystemOptions,
     pub playlist: PlaylistOptions,
 }
 
@@ -289,8 +289,8 @@ impl Config {
         self.terrain.clone()
     }
 
-    pub fn get_constellation_options(&self) -> ConstellationOptions {
-        self.constellation.clone()
+    pub fn get_solarsystem_options(&self) -> SolarSystemOptions {
+        self.solarsystem.clone()
     }
 
     pub fn get_playlist_options(&self) -> PlaylistOptions {
@@ -322,7 +322,7 @@ impl Config {
         self.pipes.seed = seed;
         self.fire.seed = seed;
         self.terrain.seed = seed;
-        self.constellation.seed = seed;
+        self.solarsystem.seed = seed;
     }
 }
 
@@ -349,7 +349,7 @@ impl Default for Config {
             plasma: PlasmaOptions::default(),
             fire: FireOptions::default(),
             terrain: TerrainOptions::default(),
-            constellation: ConstellationOptions::default(),
+            solarsystem: SolarSystemOptions::default(),
             playlist: PlaylistOptions::default(),
         }
     }
