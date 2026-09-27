@@ -163,6 +163,18 @@ pub struct CubeOptions {
     /// `4 * height`, which the bounds check drops.
     pub fit: f32,
     /// Fill the faces, or draw the wireframe alone.
+    ///
+    /// **Off by default**, and the reason is a person watching the effect rather
+    /// than a measurement. Filled, the cube is a solid whose three visible faces
+    /// are dithered fields of raised dots; the edge lines are then no longer the
+    /// brightest thing on screen, because the near face's own dither runs up to
+    /// the same densities near its own edges, and the silhouette stops being a
+    /// silhouette. The wireframe is the version that reads as a cube from across
+    /// the room, which is what a screensaver has to do. The fill is kept
+    /// because it is a real alternative look and `true` still renders it; it is
+    /// simply not what a person gets without asking.
+    ///
+    /// Pinned by `the_default_is_the_wireframe_rather_than_the_filled_cube`.
     pub filled: bool,
     /// Mark the eight corners.
     pub vertex_markers: bool,
@@ -189,7 +201,7 @@ impl Default for CubeOptions {
             distance: DEFAULT_DISTANCE,
             use_braille: true,
             fit: DEFAULT_FIT,
-            filled: true,
+            filled: DEFAULT_FILLED,
             vertex_markers: true,
             glyphs: DEFAULT_GLYPHS.to_string(),
         }
@@ -246,6 +258,13 @@ const MAX_DISTANCE: f32 = 1000.0;
 /// reason the old 0.8 fudge was replaced is that a constant which happens to
 /// fit at one size is not a fit.
 const DEFAULT_FIT: f32 = 0.95;
+
+/// Whether the faces are filled by default.
+///
+/// A constant rather than a bare `false` so the default has one name, and so the
+/// doc comment above can be attached to the value rather than to a literal that a
+/// later edit can move. See [`CubeOptions::filled`].
+const DEFAULT_FILLED: bool = false;
 
 /// Vertical compression of the projection, as a fraction of the horizontal.
 ///
@@ -1638,6 +1657,26 @@ mod tests {
         Cube::new(options, size)
     }
 
+    /// `placed`, with the faces filled.
+    ///
+    /// The tests that are *about* the fill have to ask for it now that the
+    /// default is the wireframe, and that is the point of the default having
+    /// moved rather than a nuisance: a test that inherited `filled: true` from
+    /// the default was measuring a picture nobody sees. Naming it in the helper
+    /// also means the tests that want the default look -- the geometry ones, the
+    /// markers, the glyph widths -- keep inheriting whatever the default is, so
+    /// a future change to it is exercised rather than frozen here.
+    fn filled(cube_size: f32, size: (u16, u16)) -> Cube {
+        Cube::new(
+            CubeOptions {
+                cube_size,
+                filled: true,
+                ..Default::default()
+            },
+            size,
+        )
+    }
+
     /// Runs one frame at a rotation, returning the first frame's full diff.
     fn frame(
         cube: &mut Cube,
@@ -1964,6 +2003,11 @@ mod tests {
     /// but it means any single-rotation threshold is a threshold on the
     /// rotation. Aggregating over a sweep is the only version of this that
     /// measures the ramp rather than the cube's pose.
+    ///
+    /// `filled = true`, because this is measuring what the *face* ramp does.
+    /// With the wireframe the faces contribute nothing and the near/far split
+    /// would be carried entirely by the edge ramp, which is a different claim
+    /// about a different ramp.
     #[test]
     fn nearer_geometry_is_brighter_than_farther_geometry() {
         let mut near = Vec::new();
@@ -1974,7 +2018,7 @@ mod tests {
 
         for step in 0..150 {
             let t = step as f32 * 0.041;
-            let mut cube = placed(1.0, (80, 24));
+            let mut cube = filled(1.0, (80, 24));
             frame(&mut cube, (t, t * 1.4, t * 0.7));
 
             let pairs = cube.depth_and_luminance();
@@ -2057,10 +2101,15 @@ mod tests {
     /// raised dots at 200x50, all of them back-face line. A filled face is
     /// thousands, because the whole area carries dots at the near face's
     /// density.
+    ///
+    /// `filled = true` is asked for rather than inherited, because the default is
+    /// now the wireframe and this test is about the option rather than about the
+    /// default. `the_default_is_the_wireframe_rather_than_the_filled_cube` is the
+    /// one that measures which of the two a user actually gets.
     #[test]
     fn a_face_on_rotation_fills_the_near_face() {
         let size = (200u16, 50u16);
-        let mut cube = placed(1.0, size);
+        let mut cube = filled(1.0, size);
         let diff = frame(&mut cube, (0.0, 0.0, 0.0));
         let drawn = dot_patterns(&diff);
 
@@ -2359,6 +2408,14 @@ mod tests {
     ///
     /// `as i32` on a `NaN` is 0, so a `NaN` that reaches the projection does
     /// not error -- it quietly stacks every vertex into the top-left cell.
+    ///
+    /// The threshold was 100 and had been measured against the *filled* cube,
+    /// which draws thousands of cells at this size. The default is the
+    /// wireframe now, and a wireframe cube at 80x24 is 92 cells: twelve edges
+    /// plus seven corner markers. 40 is the number that still separates "a cube
+    /// is on the screen" from the two failures worth catching here, which are a
+    /// blank screen (0 cells) and the `NaN` collapse (a handful, because all
+    /// eight vertices land in one cell and the twelve edges become twelve points).
 
     #[test]
     fn a_degenerate_option_falls_back_rather_than_drawing_nothing() {
@@ -2382,7 +2439,7 @@ mod tests {
                 let diff = frame(&mut cube, GENERIC);
 
                 assert!(
-                    diff.len() > 100,
+                    diff.len() > 40,
                     "{field} = {bad} drew only {} cells, so the cube is not there",
                     diff.len()
                 );
@@ -2491,6 +2548,12 @@ mod tests {
 
     /// The rotation defaults are a contract with the rest of the crate, so this
     /// pins them from inside as well as from `tests/runtime_and_ascii.rs`.
+    ///
+    /// `filled` is asserted *false* rather than being left out, which is a real
+    /// change rather than an omission. It was `true` from the day the fill was
+    /// added and the note on [`CubeOptions::filled`] says why it no longer is;
+    /// dropping the line instead would have quietly stopped asserting the field
+    /// at all, which is the failure mode the rest of this suite exists to catch.
     #[test]
     fn the_rotation_defaults_are_unchanged() {
         let options = CubeOptions::default();
@@ -2499,8 +2562,83 @@ mod tests {
         assert_eq!(options.rotation_speed_z, 0.18);
         assert_eq!(options.distance, DEFAULT_DISTANCE);
         assert!(options.use_braille);
-        assert!(options.filled);
+        assert!(
+            !options.filled,
+            "the faces are filled by default again, which is the look that was \
+             asked to be taken off by default"
+        );
         assert!(options.vertex_markers);
+    }
+
+    /// The default look is the wireframe, and that is asserted on what comes out
+    /// of the renderer rather than on the boolean.
+    ///
+    /// This is the user's own report, made into a measurement: the filled cube
+    /// "does not look as good" and "the previous one gave a better feeling when
+    /// only the edges were visible". The boolean is the easy half; the half that
+    /// can rot is the renderer quietly filling faces anyway -- a face fill that
+    /// ignored the option, or a default that was flipped back by a later edit.
+    /// Both would leave `options.filled` correct and the picture wrong.
+    ///
+    /// Measured as dots *inside* the near face at a face-on rotation, because at
+    /// any other rotation the interior of the silhouette is partly outside the
+    /// far face's outline and the two populations overlap. At that rotation the
+    /// near face's square is the whole silhouette, so every dot in the middle of
+    /// it is face fill and nothing else can be: 240 dots for the wireframe, and
+    /// thousands once the fill is on.
+    #[test]
+    fn the_default_is_the_wireframe_rather_than_the_filled_cube() {
+        assert!(
+            !CubeOptions::default().filled,
+            "the default still fills faces"
+        );
+
+        let size = (200u16, 50u16);
+        let interior = |filled: bool| {
+            let mut cube = Cube::new(
+                CubeOptions {
+                    filled,
+                    ..Default::default()
+                },
+                size,
+            );
+            let diff = frame(&mut cube, (0.0, 0.0, 0.0));
+            let drawn = dot_patterns(&diff);
+
+            // The near face is z = -cube_size and the projection draws the
+            // smaller z larger, so its square is the silhouette.
+            let corner = cube.project_vertex(cube.vertices[0]);
+            let half_x = (size.0 as f32 / 2.0 - corner.x).abs();
+            let half_y = (size.1 as f32 / 2.0 - corner.y).abs();
+
+            let mut dots = 0usize;
+            for ((x, y), bits) in &drawn {
+                let dx = (*x as f32 + 0.5 - size.0 as f32 / 2.0).abs();
+                let dy = (*y as f32 + 0.5 - size.1 as f32 / 2.0).abs();
+                if dx < half_x - 1.5 && dy < half_y - 1.5 {
+                    dots += bits.count_ones() as usize;
+                }
+            }
+            dots
+        };
+
+        let default_dots = interior(false);
+        let filled_dots = interior(true);
+
+        // The fill is still a real look, and it is still reachable, so the two
+        // have to be measurably different or this test would pass against a
+        // `filled` that does nothing at all.
+        assert!(
+            filled_dots > default_dots * 10,
+            "filling the faces changed the interior from {default_dots} dots to \
+             {filled_dots}, so the option is not reaching the renderer"
+        );
+        assert!(
+            default_dots < filled_dots / 10,
+            "the *default* frame has {default_dots} dots inside the near face, \
+             against {filled_dots} with `filled = true`, so the default is \
+             drawing the filled cube"
+        );
     }
 
     /// The wireframe alone has to still be a wireframe, since `filled` is a

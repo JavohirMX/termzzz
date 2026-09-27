@@ -21,6 +21,31 @@ use std::time::Duration;
 /// A map was never the right shape here. The labels were never looked up -- the
 /// map existed to be iterated -- and four static sets do not need one.
 ///
+/// ## Do not "tidy" this into ASCII
+///
+/// Asked why the rain was mostly Japanese, the user answered: *"most of the
+/// characters are Japanese, which is why we can balance out and create good
+/// diversity."*
+///
+/// That is the whole reason for the katakana block, and it is a count rather
+/// than a taste for Japanese scripts. A drop is a column of characters falling
+/// together, and the effect is legible because the character at the head of a
+/// drop and the ones below it are visibly *different characters* rather than
+/// the same one repeated. That needs a pool far larger than one glyph class can
+/// supply: on a pool of ten ASCII glyphs a twelve-character column has about a
+/// one-in-ten chance of drawing the same character twice, and the eye then reads
+/// the drop as a solid line instead of as a trail. The halfwidth katakana are 32
+/// distinct single-column shapes and they are the largest group here for exactly
+/// that reason. Measured, they are 32 of the pool's 54 entries.
+///
+/// The other three sets are not filler. Digits and punctuation give the
+/// occasional drop a hard, machine-drawn silhouette against the katakana's
+/// strokes, and the Latin-1 set keeps a few full-height marks in the mix so a
+/// column is not uniformly short. The balance is in the proportion.
+///
+/// `the_katakana_are_the_bulk_of_the_pool` is what stops a well-meaning
+/// replacement with ASCII from quietly undoing this, since a comment cannot.
+///
 /// Wide characters are deliberately absent. `:` and `・` and `日` were all tried
 /// and removed: they occupy two columns in most terminals, which shears the grid.
 /// The katakana are halfwidth (East_Asian_Width = Halfwidth), so they are one
@@ -282,6 +307,7 @@ impl RainDrop {
 mod tests {
     use super::{super::digital_rain::DigitalRainOptions, *};
     use crate::common::seeded_rng;
+    use std::ops::RangeInclusive;
 
     /// The character pool has to be assembled in a declared order.
     ///
@@ -335,6 +361,70 @@ mod tests {
                     glyph as u32
                 );
             }
+        }
+    }
+
+    /// The katakana are most of the pool, and that is the reason they are there.
+    ///
+    /// A comment cannot stop somebody tidying a character set into ASCII, so this
+    /// is what does. The user's answer to "why is the rain mostly Japanese?" was
+    /// that it is what lets the characters "balance out and create good
+    /// diversity" -- a claim about *count*, and so a test about count.
+    ///
+    /// Counted **by range, over the live pool**, rather than by copying the
+    /// katakana string out of `CHARACTER_SETS` and asking whether the copy is in
+    /// the pool. A copy measures the copy: it is satisfied by a pool that has
+    /// been trimmed to nothing, which is the exact edit this exists to catch. The
+    /// range is the concrete definition of "halfwidth katakana" and cannot drift
+    /// away from what is drawn.
+    ///
+    /// Two halves to it, because either alone is satisfiable by accident:
+    ///
+    /// - The kana are a **majority** of the pool. A pool that is mostly digits and
+    ///   punctuation with a token handful of kana would pass a "some kana exist"
+    ///   test and still have lost the balance, because the balance is in the
+    ///   proportion rather than in any one set being present.
+    /// - The pool is **large enough for a drop to read as a trail**, which is the
+    ///   property the diversity buys. `DIGITS.len() * 2` is the floor: a drop
+    ///   body is a dozen or so characters, and a pool barely longer than a drop
+    ///   repeats inside every column, which the eye reads as vertical scratches
+    ///   rather than as falling text.
+    #[test]
+    fn the_katakana_are_the_bulk_of_the_pool() {
+        /// The halfwidth katakana block, U+FF61 to U+FF9F: one column each, so
+        /// safe in a cell-indexed grid. 64 code points, of which the kana and
+        /// the small forms are what this pool draws.
+        const HALFWIDTH_KANA: RangeInclusive<char> = '\u{FF61}'..='\u{FF9F}';
+        /// The fullwidth block, U+30A0 to U+30FF. Two columns each, so one of
+        /// these shears every column to its right. This is the accident the test
+        /// is watching for: the temptation when reaching for more Japanese is to
+        /// reach for `ア` rather than `ｱ`.
+        const FULLWIDTH_KANA: RangeInclusive<char> = '\u{30A0}'..='\u{30FF}';
+        const DIGITS: &str = "012345789";
+
+        let total = CHARACTERS.len();
+        let kana = CHARACTERS
+            .iter()
+            .filter(|glyph| HALFWIDTH_KANA.contains(*glyph))
+            .count();
+        assert!(
+            kana * 2 > total,
+            "the pool holds {kana} halfwidth kana of {total} characters, which is \
+             not a majority, so the balance the user described is gone"
+        );
+        assert!(
+            total >= DIGITS.len() * 2,
+            "the whole pool is only {total} characters, which is barely longer \
+             than a drop, so the columns repeat inside themselves and the rain \
+             reads as scratches"
+        );
+        for glyph in CHARACTERS.iter() {
+            assert!(
+                !FULLWIDTH_KANA.contains(glyph),
+                "{glyph:?} (U+{:04X}) is a fullwidth kana and takes two columns, \
+                 which shears the grid",
+                *glyph as u32
+            );
         }
     }
 

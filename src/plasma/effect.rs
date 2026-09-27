@@ -59,18 +59,72 @@ const PALETTE_MIN_VALUE: f64 = 0.40;
 /// which is what makes the wrap seamless.
 const PALETTE_LEN: usize = 256;
 
-/// The glyph ramp the field is drawn as, defaulting to the shade blocks.
+/// The glyph ramp the field is drawn as.
 ///
-/// Blocks rather than [`glyph_ramp::presets::SHADE`], because the glyph is
-/// carrying a *value* here and SHADE is documented as not monotonic in ink:
-/// `=` is heavier than `+`, and `+` is heavier than `*`, so three consecutive
-/// steps of it read backwards and half the signal is noise added to a
-/// colour that already carries the same value. `░▒▓█` are *defined* by
-/// Unicode as quarter, half, three-quarter and full coverage, so the ordering
-/// holds by the standard rather than by taste, and it holds at any cell
-/// aspect ratio -- a `:` reads as a horizontal smear in a wide cell and a
-/// vertical dotted line in a tall one, while a shade block does not care.
-const DEFAULT_GLYPHS: &str = glyph_ramp::presets::BLOCKS;
+/// ASCII, and not the shade blocks, because the user asked for it: the blocks
+/// "are unnecessary; maybe ASCII characters would be better". The blocks are
+/// also a portability hazard -- `░▒▓█` are one fixed block in one fixed range, and
+/// a terminal whose font does not cover them is a screensaver that draws a
+/// field of replacement characters.
+///
+/// # What is given up
+///
+/// This *was* [`glyph_ramp::presets::BLOCKS`], and it was not a careless
+/// choice. `░▒▓█` are defined by Unicode as quarter, half, three-quarter and
+/// full coverage of the cell box, so their order is guaranteed by the standard
+/// rather than by taste, and it holds at any cell aspect ratio. ASCII has
+/// neither property, and there is no ASCII set that has them: no amount of
+/// choosing makes `:` reliably lighter than `-`, and every font is free to
+/// disagree. The ordering below is therefore an *estimate* of ink coverage, and
+/// the estimate is written out as a table in
+/// `the_default_ramp_is_ordered_by_estimated_ink_coverage` so it can be argued
+/// with rather than taken on trust.
+///
+/// # Why not `presets::SHADE`
+///
+/// `" .:-=+*#%@"` is the conventional answer, and it was rejected on the very
+/// property the blocks were chosen for. Under the same ink table it contains
+/// two outright inversions -- `:` before `-`, and `+` before `*` -- so a rising
+/// value makes the field *lighter* at those two steps, and the rest of the ramp
+/// is noise. The crate's own note on `SHADE` names `=` and `+` and `+` and `*`;
+/// this ramp's table puts `=` and `+` within a rounding of each other, so the
+/// one it is confident about is `+` and `*`.
+///
+/// # Why this ordering
+///
+/// Ten steps, the same count `SHADE` has, so the value resolution is unchanged.
+/// Ordered lightest-first by estimated coverage, and shaped for this effect
+/// specifically:
+///
+/// - The heavy end is the tail. A smooth field spends most of its *area* near
+///   the middle of its value range, so a ramp that is already heavy at its
+///   midpoint makes the majority of the screen the darkest-ink thing on it.
+///   Every glyph below `#` is under about a third of the cell.
+///
+/// - The mid-range glyphs differ in *shape* as well as in weight. `SHADE`'s
+///   middle is `-`, `=`, `+`, `*`: four variations on a straight stroke, so a
+///   whole region of the field is one repeated form and the value it carries is
+///   hard to read. `-`, `:`, `;`, `+`, `X` are five different silhouettes.
+///
+/// - The step sizes are roughly even, so one ramp step is one visible step.
+///   The gaps here are 5, 2, 4, 3, 2, 5, 6, 6 and 13 points, and the last is
+///   the price: `@` is a ring, an inner bowl and a tail, and there is nothing
+///   between `#` and it that a proportional ramp can use without stepping on
+///   `%`.
+///
+/// # The pairs the estimate cannot separate
+///
+/// Three, and they are named in the test rather than left to be rediscovered:
+/// `.-`, `:;` and `;+` are all within three percentage points of coverage, which
+/// is the point at which the table is measuring the font rather than the glyph.
+/// Their order is a legibility decision. `-` is the single most widely
+/// supported character in the repertoire; `:` is the most widely recognised
+/// "slightly more than that". `.` is a dot, and a dot is the lightest mark a
+/// font can draw. The pairs that are *not* ties and that this ordering gets
+/// right in a way `SHADE` does not: `-` before `:` (one mark against two) and
+/// `+` before `X` (a bar reaching the cell in both axes against two diagonals
+/// that cut across it, so the diagonals are longer but the total is close).
+const DEFAULT_GLYPHS: &str = " .-:;+X#%@";
 
 /// Builds the glyph ramp, never empty and never a character that could shear a
 /// cell-indexed grid.
@@ -556,6 +610,23 @@ mod tests {
     /// flat value and on the other it is riding the field, so everything on the
     /// clipped side animates only as the line sweeps past it. Both ends matter,
     /// not only the low one.
+    ///
+    /// The completeness clause at the end -- every step of the ramp reached, not
+    /// just the two ends -- is a statement about how finely the ramp divides the
+    /// field's range, and it only holds if the sweep covers the field's *whole*
+    /// range of values. It used to sweep 12 frames at 0.37, which is 4.4 units
+    /// of `plasma.time` against a period of 8*pi = 25.1, so 18% of a cycle --
+    /// enough for a five-step ramp, whose top band is a fifth of the range wide,
+    /// and not enough for a finer one, whose top band is narrower than the part
+    /// of the cycle the sweep looked at. Measured over a full cycle the field
+    /// spans 0.0006 to 0.9974; measured over the old 18% it spans to 0.913, and
+    /// a ten-step ramp's ninth step is never reached.
+    ///
+    /// So the sweep is now a whole cycle at a finer step, which examines four
+    /// times as much of the field as before. That makes the clause *harder* to
+    /// satisfy rather than easier, and it is the clause that was wrong about the
+    /// world: the field does reach its top, it just does not get there inside an
+    /// eighth of a cycle.
     #[test]
     fn the_rendered_value_is_not_pinned_to_either_end_of_the_ramp() {
         let size = (200u16, 50u16);
@@ -563,16 +634,22 @@ mod tests {
         let ramp = plasma.ramp.clone();
         let steps = ramp.len();
 
-        // Sampled over several frames rather than one, because a field this
-        // size is not in the same place twice and a single frame could sit on
-        // one side of a rail by luck.
+        // Sampled over a whole cycle of the field rather than one, because a
+        // field this size is not in the same place twice and a single frame --
+        // or a fraction of a cycle -- could sit on one side of a rail by luck.
+        // The slowest of the four time terms is the fourth, through `sin(now/4)`,
+        // which has a period of `8 * pi` in `plasma.time`. Fifty seconds of wall
+        // clock at the default `time_scale` of 0.5.
+        const CYCLE: f64 = 8.0 * std::f64::consts::PI;
+        const FRAMES: u64 = 48;
+
         let mut at_bottom = 0usize;
         let mut at_top = 0usize;
         let mut total = 0usize;
         let mut used: HashSet<usize> = HashSet::new();
 
-        for frame in 0..12u64 {
-            plasma.time = frame as f64 * 0.37;
+        for frame in 0..FRAMES {
+            plasma.time = CYCLE * frame as f64 / FRAMES as f64;
             for (x, y, cell) in plasma.get_diff() {
                 let value = value_at(size, x, y, plasma.time);
                 let index = ramp.index_for(value as f32);
@@ -612,10 +689,24 @@ mod tests {
             top * 100.0,
             steps - 1
         );
+        let mut vmin = 1.0f64;
+        let mut vmax = 0.0f64;
+        for step in 0..400 {
+            let now = step as f64 * CYCLE / 400.0;
+            for y in 0..size.1 as usize {
+                for x in 0..size.0 as usize {
+                    let v = value_at(size, x, y, now);
+                    vmin = vmin.min(v);
+                    vmax = vmax.max(v);
+                }
+            }
+        }
         assert_eq!(
             used.len(),
             steps,
-            "only {} of {steps} ramp steps were reached",
+            "only {} of {steps} ramp steps were reached; the field spans \
+             {vmin:.4} to {vmax:.4} over a cycle, so the ramp divides more than \
+             the field uses",
             used.len()
         );
     }
@@ -743,12 +834,12 @@ mod tests {
     }
 
     /// A ramp a user's config has emptied out has to degrade to the documented
-    /// default rather than to SHADE.
+    /// default rather than to `GlyphRamp`'s own fallback.
     ///
-    /// `GlyphRamp` never returns an empty ramp, but its own fallback is ASCII
-    /// SHADE, which is documented as *not* monotonic in ink. Falling back to it
-    /// would put the wrong default back exactly when the configured one has
-    /// failed, which is when it matters most.
+    /// `GlyphRamp` never returns an empty ramp, but its fallback is ASCII
+    /// `SHADE`, which is documented as *not* monotonic in ink. Falling back to
+    /// it would put a different -- and worse -- default back exactly when the
+    /// configured one has failed, which is when it matters most.
     #[test]
     fn an_unusable_glyph_config_falls_back_to_the_default_ramp() {
         for configured in ["", "\u{7}\u{1}", "\u{4E2D}"] {
@@ -760,10 +851,22 @@ mod tests {
             );
         }
 
-        // And the default is the one whose ink ordering is guaranteed by the
-        // standard rather than chosen by taste, which is the whole reason it is
-        // the default here.
-        assert_eq!(DEFAULT_GLYPHS, glyph_ramp::presets::BLOCKS);
+        // The fallback is specifically *not* `GlyphRamp`'s, which is SHADE, and
+        // specifically not the block elements either. Both are argued about in
+        // `the_default_ramp_is_ordered_by_estimated_ink_coverage` and
+        // `the_default_ramp_is_ascii_and_contains_no_block_elements`; pinning
+        // it here is what stops this test from passing against whichever ramp
+        // happens to be the default.
+        assert_ne!(
+            DEFAULT_GLYPHS,
+            glyph_ramp::presets::SHADE,
+            "the default has become SHADE, which is documented as non-monotonic"
+        );
+        assert_ne!(
+            DEFAULT_GLYPHS,
+            glyph_ramp::presets::BLOCKS,
+            "the default has become the block elements again"
+        );
     }
 
     /// A configured ramp is the user's decision, used in the order given.
@@ -791,6 +894,193 @@ mod tests {
         assert!(
             drawn.len() >= 4,
             "the configured ramp was barely used: {drawn:?}"
+        );
+    }
+
+    /// The default ramp is ASCII, and the block elements are out.
+    ///
+    /// The user's report, unedited: plasma "uses this kind of locks [blocks].
+    /// Full locks are unnecessary; maybe ASCII characters would be better."
+    ///
+    /// Block elements were the default here for a good reason -- they are the one
+    /// ramp whose ordering Unicode defines -- so replacing them is a real trade
+    /// and the note on [`DEFAULT_GLYPHS`] is where the cost is written down.
+    /// What is *not* a trade is the repertoire: `░▒▓█` is one fixed block in one
+    /// fixed range, and a terminal whose font does not cover it gets a field of
+    /// replacement characters.
+    #[test]
+    fn the_default_ramp_is_ascii_and_contains_no_block_elements() {
+        let configured = PlasmaOptions::default().glyphs;
+
+        for glyph in configured.chars() {
+            assert!(
+                glyph.is_ascii(),
+                "the default ramp contains {glyph:?} (U+{:04X}); the user asked \
+                 for ASCII characters",
+                glyph as u32
+            );
+            assert!(
+                !('\u{2580}'..='\u{259F}').contains(&glyph),
+                "the default ramp contains the block element {glyph:?} \
+                 (U+{:04X}), which is what was asked to be taken out",
+                glyph as u32
+            );
+        }
+
+        // And the effect really draws from it, rather than filtering it away on
+        // the way in -- a ramp that was rejected here and silently replaced by
+        // `GlyphRamp`'s own fallback would pass the check above and lose the
+        // ink ordering the ordering test depends on.
+        let mut plasma = Plasma::new(PlasmaOptions::default(), (120, 40));
+        for glyph in plasma.ramp.glyphs() {
+            assert!(
+                glyph.is_ascii() && !('\u{2580}'..='\u{259F}').contains(glyph),
+                "the ramp the effect draws from is {glyph:?} (U+{:04X})",
+                *glyph as u32
+            );
+        }
+        let drawn: HashSet<char> = plasma
+            .get_diff()
+            .iter()
+            .map(|(_, _, cell)| cell.symbol)
+            .collect();
+        assert!(
+            drawn.len() >= 4,
+            "the ASCII default ramp was barely used: {drawn:?}"
+        );
+    }
+
+    /// The default ramp is ordered by how much ink each glyph puts down.
+    ///
+    /// ASCII cannot be ink-monotonic, which is the entire reason
+    /// [`glyph_ramp::presets::BLOCKS`] exists. So what is asserted here is not
+    /// monotonicity but *non-decreasing under a stated estimate*, with the
+    /// estimate written out instead of being asserted to be true, and with the
+    /// pairs the estimate cannot separate named and pinned.
+    ///
+    /// The estimates are ink coverage as a percentage of the cell box, in a
+    /// font of ordinary weight, ranked by how many strokes there are and how
+    /// much of the cell they reach. They are hand estimates and they are wrong
+    /// at the margins -- a monospace font is free to draw `:` heavier than `-`
+    /// or lighter, and plenty do -- so this is an oracle for the *ramp*, not
+    /// for the font. A reader who disagrees with one number changes one number
+    /// here and sees what it does to the argument, which is the point of
+    /// writing it down.
+    #[test]
+    fn the_default_ramp_is_ordered_by_estimated_ink_coverage() {
+        /// Ink coverage as a percentage of the cell box, and why.
+        ///
+        /// Ranked by how many strokes the glyph is drawn with and how much of
+        /// the cell those strokes reach, which is what the number stands in
+        /// for. Deliberately not derived from any one font: the point is the
+        /// *order*, and a single font's real coverage would be an argument
+        /// about that font.
+        const INK_BY_COVERAGE: &[(char, f32)] = &[
+            (' ', 0.0),  // nothing
+            ('.', 5.0),  // one small square at the baseline
+            ('-', 7.0),  // one thin bar, the full cell width
+            (':', 11.0), // two dots stacked
+            ('=', 12.0), // two thin bars, the full cell width each
+            (';', 14.0), // a dot and a comma, so a dot plus a tail
+            ('*', 15.0), // an asterisk: several short strokes, none reaching
+            ('+', 16.0), // one full-width bar and one full-height bar
+            ('X', 21.0), // two full-cell diagonals, longer strokes than `+`
+            ('#', 27.0), // four strokes, two of them full height
+            ('%', 33.0), // two rings and a slash
+            ('@', 46.0), // a ring, an inner bowl and a tail
+        ];
+
+        let ink = |glyph: char| -> f32 {
+            match INK_BY_COVERAGE.iter().find(|(c, _)| *c == glyph) {
+                Some((_, coverage)) => *coverage,
+                None => panic!(
+                    "{glyph:?} (U+{:04X}) is not in the ink table, so the ramp has \
+                     grown a character whose weight has not been argued about. Add \
+                     it, with a reason.",
+                    glyph as u32
+                ),
+            }
+        };
+
+        // The oracle has to be able to say *no*, or it is not an oracle.
+        //
+        // `SHADE` is the conventional ASCII ramp and this crate documents it as
+        // non-monotonic, listing `=`/`+` and `+`/`*`. This table reproduces
+        // `+`/`*` and not `=`/`+`, and that disagreement is itself worth
+        // recording: `=` is two thin bars and `+` is one thin bar plus one
+        // full-height bar, which is close enough to a rounding that calling `=`
+        // the heavier of the two is a statement about a particular font. What
+        // every stroke-count model agrees on is the third pair, which the
+        // crate's own note does not list: `:` is two dots and `-` is one bar.
+        let shade_inversions: Vec<String> = glyph_ramp::presets::SHADE
+            .chars()
+            .collect::<Vec<char>>()
+            .windows(2)
+            .filter(|pair| ink(pair[1]) < ink(pair[0]))
+            .map(|pair| format!("{}{}", pair[0], pair[1]))
+            .collect();
+        assert_eq!(
+            shade_inversions,
+            [":-", "+*"],
+            "the ink table no longer finds the inversions it is supposed to find \
+             in SHADE, so it cannot be trusted to clear the default ramp"
+        );
+
+        // The ramp actually in use.
+        let ramp = glyph_ramp(&PlasmaOptions::default().glyphs);
+        let glyphs = ramp.glyphs();
+        assert!(
+            glyphs.len() >= 8,
+            "the default ramp has {} steps, too few to carry a smooth value \
+             across a whole screen",
+            glyphs.len()
+        );
+        for pair in glyphs.windows(2) {
+            assert!(
+                ink(pair[1]) >= ink(pair[0]),
+                "ramp steps {}{} run backwards -- {}% then {}% -- so a rising \
+                 value makes the field lighter there",
+                pair[0],
+                pair[1],
+                ink(pair[0]),
+                ink(pair[1])
+            );
+        }
+
+        // And the pairs the estimate genuinely cannot separate. Three
+        // percentage points of cell coverage is a shade over half a stroke
+        // width; below it the table is measuring the font rather than the
+        // glyph. These are ties, not inversions -- the ramp may put them in
+        // either order, and the order is a legibility decision:
+        //
+        // - `.-` -- a period and a hyphen, one dot and one bar. A dot is the
+        //   lightest mark a font can draw and a bar is one of the heaviest
+        //   single-stroke marks, so this gap is the smallest in the ramp
+        //   because the table is least sure of it, not because they are close.
+        // - `:;` -- a colon and a semicolon differ by a tail hanging off the
+        //   lower dot. A tail is a fraction of a dot.
+        // - `;+` -- a semicolon against a plus sign. Both are two marks, and a
+        //   plus reaches the cell in both axes.
+        //
+        // Asserted as an exact set, so a glyph moved across one of these
+        // boundaries -- or a new tie quietly created -- has to be argued for
+        // rather than slipping past.
+        const TIE_RESOLUTION: f32 = 3.0;
+        const EXPECTED_TIES: &[&str] = &[".-", ":;", ";+"];
+        let mut measured: Vec<String> = glyphs
+            .windows(2)
+            .filter(|pair| (ink(pair[1]) - ink(pair[0])).abs() <= TIE_RESOLUTION)
+            .map(|pair| format!("{}{}", pair[0], pair[1]))
+            .collect();
+        measured.sort();
+        let mut named: Vec<String> =
+            EXPECTED_TIES.iter().map(|t| t.to_string()).collect();
+        named.sort();
+        assert_eq!(
+            measured, named,
+            "the set of adjacent ramp pairs within the ink table's resolution \
+             has changed, so either a glyph crossed a boundary or a new tie \
+             appeared; both need saying out loud"
         );
     }
 

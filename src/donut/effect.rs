@@ -2,10 +2,9 @@ use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
 use crate::render::glyph_ramp::GlyphRamp;
-use crate::render::palette::Palette;
+use crate::render::palette::{Palette, presets as palette_presets};
 use crossterm::style;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,6 +18,16 @@ pub struct DonutOptions {
     pub k1: f32,
     pub k1_coeff: f32,
     pub luminance_chars: Vec<char>,
+    /// Which ramp to colour the torus with.
+    ///
+    /// A name rather than a list of colours, because an inline list in TOML is
+    /// unpleasant to write and the useful ramps are shared with the other
+    /// effects. See [`crate::render::palette::presets`], and [`donut_colors`] for
+    /// how a named ramp becomes *this* effect's ramp -- it is not the named ramp
+    /// verbatim, because its two darkest stops are too dark to use on a tinted
+    /// terminal profile. An unknown name falls back to `magma` rather than
+    /// failing: a typo in a config file should not stop the program.
+    pub palette: String,
 }
 
 impl Default for DonutOptions {
@@ -44,9 +53,8 @@ impl Default for DonutOptions {
             distance: 5.5,
             k1: 25.0,
             k1_coeff: 1.0,
-            luminance_chars: vec![
-                '.', ',', '-', '~', ':', ';', '=', '!', '*', '#', '$', '@',
-            ],
+            luminance_chars: DEFAULT_LUMINANCE_CHARS.to_vec(),
+            palette: String::from(DEFAULT_PALETTE),
         }
     }
 }
@@ -87,19 +95,47 @@ fn shade_ramp(configured: &[char]) -> GlyphRamp {
     })
 }
 
-/// The bottom of the colour ramp, which is magma's first stop with the floor
-/// lifted off black.
+/// The named ramp the effect uses when nothing else is asked for.
+const DEFAULT_PALETTE: &str = "magma";
+
+/// The bottom of the colour ramp, and the darkest colour the donut ever draws.
 ///
-/// The ramp runs dark to light, and its dark end is the glyph on the dimmest
-/// part of the torus -- a large fraction of the screen. Magma starts at
-/// `rgb(0, 0, 4)`, which on a dark terminal is indistinguishable from a cell
-/// that was never drawn, so the shading would read as a hole in the torus
-/// rather than as its shadow. This is still the darkest stop in the set; it
-/// just has enough ink to be seen.
+/// The user: "The donut's new colors are good, but I would change the dark
+/// colors because my terminal background is grayish blue."
+///
+/// It used to be `rgb(20, 16, 34)` -- magma's first stop with the floor lifted
+/// off black -- at a Rec. 601 luminance of 19.2 against a background at 68.7.
+/// That is the complaint, and it is measurable rather than a matter of taste:
+/// converted to CIE L*a*b* and compared with `rgb(60, 70, 85)`, the old floor is
+/// a **Delta-E of 24.6**, the *next* stop of the same ramp is 59.2, and the
+/// twelve expanded shades ran 24.6, 26.8, 37.0, 49.9 ... So the first two
+/// shades were a different kind of thing from the other ten, and both of them
+/// were dark enough to read as a hole punched in the background rather than as
+/// the shadowed side of an object. It is the darkest colour in the effect and
+/// the whole torus was sitting on top of it.
+///
+/// `rgb(72, 24, 146)` measures a **Delta-E of 67.8** from the same background,
+/// which is 2.8x the old floor and clears the contrast threshold with 50%
+/// headroom, and the whole twelve-shade ramp now bottoms out at 55.1 rather than
+/// 24.6. It is a violet rather than a neutral dark, which is the other half of
+/// the fix: the old floor had a chroma of 13, so it read as a shadow, and a
+/// shadow on a tinted background reads as an absence. This has a chroma of 75.
+///
+/// Lifted rather than merely saturated, so the dark end of the ring is now a
+/// colour that is *present* on a tinted profile. The cost is real and worth
+/// naming: a torus on a black background is now a mid-tone mass where it used to
+/// have a deep shadow, because the ramp's usable range starts at 52 rather than
+/// at 0. `[global] background` pins the terminal's own background if someone
+/// wants the old relationship instead.
+///
+/// Pinned by `the_dark_end_of_the_ramp_is_visible_on_a_tinted_background`, and
+/// the two other ramp invariants it is not allowed to break are
+/// `the_ramp_runs_from_dark_to_light` and
+/// `no_two_adjacent_ramp_entries_are_indistinguishable`.
 const RAMP_FLOOR: style::Color = style::Color::Rgb {
-    r: 20,
-    g: 16,
-    b: 34,
+    r: 72,
+    g: 24,
+    b: 146,
 };
 
 /// How many shades the brightness term is divided into.
@@ -119,19 +155,45 @@ const SHADES: usize = 12;
 /// brightness range stepped from taupe to sage to gold. Two adjacent pairs were
 /// also within 0.011 of luminance of each other, so a quarter of the ramp was
 /// spent on steps the eye cannot resolve, and that is exactly where the hue
-/// flipped. Expanded to twelve, magma's ascending half has a worst adjacent
-/// step of 0.040 in the same measure.
+/// flipped.
+///
+/// ## Why it is not the named ramp verbatim
+///
+/// Every preset starts with two stops that are too dark to draw on a terminal
+/// with a tinted profile: `magma` at `rgb(0,0,4)` and `rgb(81,18,124)`, `ocean`
+/// at `rgb(0,0,20)` and `rgb(0,40,120)`, and so on. They are replaced by
+/// [`RAMP_FLOOR`], and the named ramp's *third through fifth* stops follow it.
+///
+/// Dropping two rather than one is not a preference, it is forced by
+/// `no_two_adjacent_ramp_entries_are_indistinguishable`: the ramp is expanded to
+/// twelve colours across however many stops it is given, so each expanded step is
+/// one stop's interval divided by eleven, and a floor at luma 52 followed by
+/// `magma[1]` at 48.9 would put two of the twelve shades 5.8 apart out of 255 --
+/// a quarter of what that test calls invisible. Starting the named ramp at its
+/// third stop keeps the smallest interval at 48.5, so the worst expanded gap is
+/// 0.052 rather than 0.023.
+///
+/// The top of the ramp is unchanged, which is the point: the user liked the new
+/// colours, and this is a change to the dark end only.
 ///
 /// Built through [`Palette`] rather than written out, so the ramp stays the
-/// shared one and this file does not carry a second copy of it.
-static COLORS: LazyLock<[style::Color; SHADES]> = LazyLock::new(|| {
-    let mut stops = vec![RAMP_FLOOR];
-    stops.extend_from_slice(&crate::render::palette::presets::MAGMA[1..5]);
-    Palette::new(stops)
-        .expand(SHADES)
-        .try_into()
-        .expect("Palette::expand returns exactly the count it was asked for")
-});
+/// shared one and this file does not carry a second copy of it. Twelve colour
+/// lerps a frame, which is not a cost worth avoiding.
+fn donut_colors(name: &str) -> Vec<style::Color> {
+    let named = palette_presets::by_name(name).unwrap_or(palette_presets::MAGMA);
+    let mut stops = Vec::with_capacity(4);
+    stops.push(RAMP_FLOOR);
+    stops.extend_from_slice(&named[2..named.len().min(5)]);
+    // A two-stop ramp has no third stop, so the slice comes back empty and the
+    // torus would come out one flat colour -- which is not what `contrast` is
+    // for, since its own note calls it "a pure boundary map with no interior
+    // shading" rather than a single colour. Its top stop is a better second
+    // stop than nothing, and a floor-to-white ramp is a real two-tone donut.
+    if stops.len() < 2 {
+        stops.extend_from_slice(&named[1..]);
+    }
+    Palette::new(stops).expand(SHADES)
+}
 
 /// The largest the brightness term gets.
 ///
@@ -344,7 +406,7 @@ impl Donut {
         let inner_radius = self.options.inner_radius;
         let distance = self.options.distance;
         let k1 = self.options.k1;
-        let colors = &*COLORS;
+        let colors = donut_colors(&self.options.palette);
         let half_width = width as f32 / 2.0;
         let half_height = height as f32 / 2.0;
         let ramp = shade_ramp(&self.options.luminance_chars);
@@ -476,6 +538,167 @@ mod tests {
                     / 255.0
             }
             _ => 1.0,
+        }
+    }
+
+    // --- perceptual distance ---------------------------------------------
+    //
+    // CIE L*a*b* under a D65 white point, and the plain Euclidean distance
+    // between two points in it (Delta-E 1976).
+    //
+    // Implemented here rather than pulled in, because it is thirty lines and
+    // because the *constants* are the argument: a reader who wants to know why
+    // the comparison is in Lab at all can see that the only inputs are the sRGB
+    // transfer function and the D65 primaries, neither of which is a choice this
+    // crate made. Rec. 601 luma, which the tests above use, cannot express the
+    // claim being made: the old floor and a greyish-blue background are 49 luma
+    // apart, which sounds like plenty, and the viewer still cannot tell the
+    // effect's shadow from the background -- because luma is blind to chroma,
+    // and the old floor's chroma was 13 out of a possible 128.
+
+    fn srgb_to_linear(channel: u8) -> f64 {
+        let c = f64::from(channel) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn lab(color: &style::Color) -> (f64, f64, f64) {
+        let (r, g, b) = match color {
+            style::Color::Rgb { r, g, b } => (*r, *g, *b),
+            other => panic!("{other:?} has no Lab coordinates"),
+        };
+        let (r, g, b) = (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
+        let x = 0.4124 * r + 0.3576 * g + 0.1805 * b;
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let z = 0.0193 * r + 0.1192 * g + 0.9505 * b;
+        let f = |t: f64| {
+            if t > 0.008_856 {
+                t.cbrt()
+            } else {
+                7.787 * t + 16.0 / 116.0
+            }
+        };
+        let (fx, fy, fz) = (f(x / 0.950_47), f(y), f(z / 1.088_83));
+        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    }
+
+    /// Delta-E 1976 between two colours.
+    fn delta_e(a: &style::Color, b: &style::Color) -> f64 {
+        let (l1, a1, b1) = lab(a);
+        let (l2, a2, b2) = lab(b);
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+    }
+
+    /// The user: "I would change the dark colors because my terminal background
+    /// is grayish blue."
+    ///
+    /// `rgb(60, 70, 85)` is the profile: a dark desaturated slate, the
+    /// background of every widely-used dark editor theme, and close enough to
+    /// "my terminal background is grayish blue" that the two are the same
+    /// sentence.
+    const TINTED_BACKGROUND: style::Color = style::Color::Rgb {
+        r: 60,
+        g: 70,
+        b: 85,
+    };
+
+    /// The minimum perceptual distance from that background, in Delta-E 1976.
+    ///
+    /// **Not** a standard, and this comment says so because a bare number in a
+    /// test invites a reader to assume one. Delta-E of about 2.3 is the
+    /// conventional just-noticeable difference between two adjacent patches; this
+    /// asks for twenty times that, and the reason is not that patches are hard to
+    /// tell apart one at a time -- it is that the two colours being compared are
+    /// *the same region of the screen under two different conditions*. A cell the
+    /// effect has not drawn and a cell it has drawn dark have to be
+    /// distinguishable, because the first is the background and the second is the
+    /// effect, and a viewer has to be able to say which is which.
+    ///
+    /// 45 sits between the two measured values with room on each side: the old
+    /// floor scored 24.6 and failed, the new one scores 67.8 and passes with a
+    /// third to spare. The interesting part is not the threshold but the gap it
+    /// exposed -- at 24.6 the darkest stop was less than half as far from the
+    /// background as the ramp's own second stop was, which is what "the dark end
+    /// is a different kind of thing from the rest" means in a number.
+    const CONTRAST_FLOOR: f64 = 45.0;
+
+    /// The darkest colour the donut draws has to be visible against a terminal
+    /// that is not black.
+    ///
+    /// This is the measured form of the complaint, and the measurement is the
+    /// point: the old floor was `rgb(20, 16, 34)`, a Delta-E of **24.6** from
+    /// `TINTED_BACKGROUND`, at a lightness of L* 5.7 and a chroma of 13. The
+    /// second stop of the same ramp was 59.2. So the first two of the twelve
+    /// shades were less than half as distinguishable from the background as the
+    /// third, which is what "the dark end of the ring reads as a hole" means in
+    /// a number -- it is a hole because a viewer cannot tell it from the
+    /// background, not because it is black.
+    ///
+    /// The current floor is `rgb(72, 24, 146)`: Delta-E **67.8**, L* 24.0,
+    /// chroma 75. See [`RAMP_FLOOR`] and `CONTRAST_FLOOR` below.
+    ///
+    /// Asserted on the *default* ramp's darkest stop, which is [`RAMP_FLOOR`]
+    /// for every named palette -- so the claim is about this effect's floor
+    /// rather than about whichever preset happens to be configured, and a
+    /// palette a user picked for its own reasons cannot fail it. The companion
+    /// check on the ramp as a whole is at the end of this test.
+    #[test]
+    fn the_dark_end_of_the_ramp_is_visible_on_a_tinted_background() {
+        let ramp = donut_colors(&DonutOptions::default().palette);
+        assert_eq!(ramp.len(), SHADES);
+
+        let floor = ramp[0];
+        assert_eq!(
+            floor, RAMP_FLOOR,
+            "the ramp no longer starts at RAMP_FLOOR, so this test is measuring \
+             something other than the constant it is about"
+        );
+
+        let distance = delta_e(&floor, &TINTED_BACKGROUND);
+        assert!(
+            distance >= CONTRAST_FLOOR,
+            "the darkest colour the donut draws is {floor:?}, a Delta-E of \
+             {distance:.1} from a {TINTED_BACKGROUND:?} background, against a \
+             floor of {CONTRAST_FLOOR}. Below it, the shadowed side of the torus \
+             is not distinguishable from a cell the effect never drew, and reads \
+             as a hole rather than as colour."
+        );
+
+        // The whole ramp, not just its bottom. The two shades either side of the
+        // floor are interpolated, and it would be no use passing at the floor if
+        // one of them fell back through the background. Measured 55.1 at the
+        // worst point on the default ramp.
+        let worst = ramp
+            .iter()
+            .map(|color| delta_e(color, &TINTED_BACKGROUND))
+            .fold(f64::MAX, f64::min);
+        assert!(
+            worst >= CONTRAST_FLOOR,
+            "somewhere in the ramp there is a colour only {worst:.1} from the \
+             background, so part of the torus disappears into it: {ramp:?}"
+        );
+    }
+
+    /// Every named ramp's dark end is this effect's floor, so the contrast
+    /// property holds whichever palette is configured.
+    ///
+    /// Without this, `palette = "ocean"` would be a way to undo the fix, and the
+    /// knob and the floor would be two features that can cancel each other out
+    /// without either of them noticing.
+    #[test]
+    fn the_tinted_background_property_survives_every_palette() {
+        for name in Palette::preset_names() {
+            let ramp = donut_colors(name);
+            let distance = delta_e(&ramp[0], &TINTED_BACKGROUND);
+            assert!(
+                distance >= CONTRAST_FLOOR,
+                "palette {name:?} bottoms out at {ramp:?}, only {distance:.1} \
+                 from a {TINTED_BACKGROUND:?} background, so asking for that \
+                 palette undoes the lifted floor"
+            );
         }
     }
 
@@ -612,9 +835,17 @@ mod tests {
     /// is lighter at its low indices than at its high ones puts near-white on
     /// the `.` and `,` that cover most of the torus and leaves the highlights
     /// dark. That is what the user was seeing as a white broken doughnut.
+    ///
+    /// On the default palette. `depth` is deliberately exempt: it is a *cycling*
+    /// ramp whose last stop is near-black on purpose, so using it here gives a
+    /// non-monotonic brightness ramp. That is a legitimate way to ask for bands
+    /// rather than shading and it is the user's own choice -- but the default
+    /// has no such excuse.
     #[test]
     fn the_ramp_runs_from_dark_to_light() {
-        for (index, pair) in COLORS.windows(2).enumerate() {
+        let colors = donut_colors(&DonutOptions::default().palette);
+        assert_eq!(colors.len(), SHADES);
+        for (index, pair) in colors.windows(2).enumerate() {
             let (dim, bright) = (brightness(&pair[0]), brightness(&pair[1]));
             assert!(
                 dim <= bright,
@@ -624,7 +855,7 @@ mod tests {
             );
         }
         assert!(
-            brightness(&COLORS[0]) < brightness(&COLORS[SHADES - 1]),
+            brightness(&colors[0]) < brightness(&colors[SHADES - 1]),
             "the ramp does not span a range of brightness at all"
         );
     }
@@ -928,10 +1159,18 @@ mod tests {
     /// step is not doing any work. The ramp this replaced had two adjacent
     /// pairs within 0.011 of each other, a quarter of the ramp spent on
     /// invisible steps, and that is precisely where its hue flipped from taupe
-    /// to sage to gold. The twelve here step by at least 0.040.
+    /// to sage to gold.
+    ///
+    /// This is also what constrains how far [`RAMP_FLOOR`] can be lifted. The
+    /// ramp is expanded to twelve colours across its stops, so each expanded step
+    /// is one stop interval divided by eleven: a floor at luma 52 followed by
+    /// `magma[1]` at 48.9 would give two of the twelve a gap of 0.023, and the
+    /// tinted-background fix would have to start the named ramp at its *third*
+    /// stop for the gap to survive. That is why [`donut_colors`] slices from
+    /// index 2.
     #[test]
     fn no_two_adjacent_ramp_entries_are_indistinguishable() {
-        let colors = &*COLORS;
+        let colors = donut_colors(&DonutOptions::default().palette);
         for (index, pair) in colors.windows(2).enumerate() {
             let gap = brightness(&pair[1]) - brightness(&pair[0]);
             assert!(
@@ -941,6 +1180,106 @@ mod tests {
                 index + 1
             );
         }
+    }
+
+    /// Every named ramp has to work, and an unknown name has to fall back rather
+    /// than take the program down at startup.
+    ///
+    /// A palette name comes from a config file, so an unrecognised one is a typo
+    /// rather than a bug, and the effect should still run. The mandelbrot has the
+    /// identical knob and the identical test; the pattern is copied rather than
+    /// reinvented, deliberately.
+    #[test]
+    fn any_named_palette_renders_and_an_unknown_one_falls_back() {
+        for name in Palette::preset_names() {
+            let mut donut = Donut::new(
+                DonutOptions {
+                    palette: name.to_string(),
+                    ..Default::default()
+                },
+                (40, 20),
+            );
+            donut.update_size(40, 20);
+            let diff = donut.get_diff();
+            assert!(!diff.is_empty(), "palette {name:?} drew nothing at all");
+            let distinct: std::collections::HashSet<style::Color> =
+                diff.iter().map(|(_, _, cell)| cell.color).collect();
+            // No carve-outs. `contrast` is two stops, and `donut_colors` has to
+            // find a second one somewhere or the torus comes out one flat
+            // colour, which is a different thing from what that ramp is for.
+            assert!(
+                distinct.len() >= 2,
+                "palette {name:?} drew {} distinct colours, so it is not being \
+                 used at all",
+                distinct.len()
+            );
+            for (x, y, _) in &diff {
+                assert!(
+                    *x < 40 && *y < 20,
+                    "palette {name:?} drew outside the canvas at ({x}, {y})"
+                );
+            }
+        }
+
+        // An unknown name has to be byte-for-byte the default, which is stronger
+        // than "it drew something": a fallback that quietly picked the first
+        // preset on the list would also draw, and would surprise whoever typed it.
+        assert_eq!(
+            donut_colors("nonesuch"),
+            donut_colors(DEFAULT_PALETTE),
+            "an unknown palette name did not fall back to the default ramp"
+        );
+    }
+
+    /// The knob has to survive a trip through a config file, and a real named
+    /// ramp has to change what comes out.
+    ///
+    /// `--print-config` writes every key to disk, so a generated config is pinned
+    /// to whatever the defaults were the day it was generated and a new knob
+    /// arrives as "a key the user's file does not have". That is the normal case.
+    #[test]
+    fn the_palette_knob_round_trips_through_toml_and_changes_the_output() {
+        let options: DonutOptions =
+            toml::from_str("palette = \"ocean\"\n").expect("a lone key parses");
+        assert_eq!(options.palette, "ocean", "the key was not read back");
+        assert_eq!(
+            options.rotation_speed_a,
+            DonutOptions::default().rotation_speed_a,
+            "one key in the section silently reset the others"
+        );
+        let serialised = toml::to_string(&options).expect("the section serialises");
+        assert!(
+            serialised.contains("palette"),
+            "the key is missing from the serialised form, so --print-config would \
+             never write it: {serialised}"
+        );
+
+        // And it is used: two names, two different sets of colours on screen.
+        let frame = |palette: &str| {
+            let mut donut = Donut::new(
+                DonutOptions {
+                    palette: palette.to_string(),
+                    ..Default::default()
+                },
+                (40, 20),
+            );
+            donut.update_size(40, 20);
+            donut
+                .get_diff()
+                .into_iter()
+                .map(|(_, _, cell)| cell.color)
+                .collect::<std::collections::HashSet<style::Color>>()
+        };
+        let magma = frame(DEFAULT_PALETTE);
+        let ocean = frame("ocean");
+        assert!(
+            !magma.is_empty() && !ocean.is_empty(),
+            "a frame drew no colours"
+        );
+        assert_ne!(
+            magma, ocean,
+            "palette = \"ocean\" drew exactly the same colours as the default"
+        );
     }
 
     /// End to end: a dim glyph is painted a dimmer colour than a bright one.
