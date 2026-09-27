@@ -191,20 +191,31 @@ const RECOLOR_EVERY_N_BOUNCES: u32 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorChange {
-    /// Every third wall hit. The default, and the same idea as
-    /// [`ColorChange::Bounce`] without the strobe.
+    /// Every third wall hit: the same idea as [`ColorChange::Bounce`] without
+    /// changing colour on every single one.
     ///
-    /// A colour change still *marks a bounce*, which is the whole reason to
-    /// recolour at all: it is the thing the eye tracks between bounces. It just
-    /// does not happen on every single one.
-    #[default]
+    /// It was the default once, on the theory that a recolour of a solid 30x7
+    /// slab is a large simultaneous change and therefore a strobe. That was the
+    /// wrong diagnosis. The flicker is the *speed*, not the colour: the logo is
+    /// a braille bitmap, so it is already snapped to whole dots, and at 18 cells
+    /// a second that is a one-dot step on most frames -- and a one-dot shift
+    /// rewrites nearly every glyph in a dense letterform, because a braille glyph
+    /// *is* its bit pattern. Halving the speed removed the shimmer, and with wall
+    /// hits eight seconds apart rather than one and a half, recolouring on every
+    /// one of them stopped being a strobe too.
+    ///
+    /// Kept for anyone who wants fewer colour changes than bounces. The
+    /// serialised name is unchanged, so a config saying `"steady"` still means
+    /// what it meant.
     Steady,
-    /// On every wall hit. What the reference implementation does, kept because
-    /// it is a real look and this effect is a reference implementation.
+    /// On every wall hit. The default, and what the reference implementation
+    /// does.
     ///
-    /// Note the flicker, and note that it is worse now than it was: the wordmark
-    /// is 30 cells wide rather than 23 and carries a reflection underneath, so a
-    /// recolour is a larger simultaneous change than it used to be.
+    /// This was briefly *not* the default, on the theory that recolouring every
+    /// bounce flickered. See [`ColorChange::Steady`] for why that diagnosis was
+    /// wrong, what the real cause turned out to be, and why fixing it made this
+    /// safe to put back.
+    #[default]
     Bounce,
     /// Only when both axes reverse on the same frame, which is the easter egg the
     /// reference's README jokes about -- "it could hit the corner if you look at
@@ -252,51 +263,47 @@ impl Default for DvdOptions {
     fn default() -> Self {
         Self {
             logo: String::from(DVD_WORDMARK),
-            // 18 rather than 24, and the number is meaningless on its own: the
-            // cap is a property of the *logo*, and the logo changed.
-            //
-            // The reason it is not 30 -- which is the tempting answer, because the
-            // wordmark is 30 cells wide and "the cap should match the logo" sounds
-            // like a rule -- is that the cap is not about how fast the logo
-            // crosses the screen. It is about how many *sub-cell samples* land per
-            // frame, because that is what a staircase is made of. Braille moves in
-            // dots, so 18 cells a second is 36 horizontal samples against 60
-            // frames, and the picture changes on 503 frames of 600. 30 cells a
-            // second would be 60 samples against 60 frames, which is exactly one
-            // dot per frame and leaves no margin at all.
-            //
-            // There is a piece of arithmetic floating around this value that looks
-            // like a justification and is not one: scaling 24 by the old logo
-            // width over the new gives 18.4, and 18 is the rounded result. But
-            // `24 * 23/30` holds `cells_per_second * width` constant, and that
-            // product is not a quantity that means anything. In particular it does
-            // *not* preserve the time taken to cross one logo width: that would
-            // want 30/23 * 24, or 31 cells a second, and crossing 23 cells at 24
-            // took 0.96 seconds where crossing 30 at 18 takes 1.67. The honest
-            // summary is that 18 is slower than the old default by a quarter, the
-            // complaint was that the effect was too lively, and slower is the
-            // right direction -- not that some ratio was preserved.
-            //
-            // The ceiling is a property of the medium, not a taste, and it is
-            // worth being precise about because the reference and this cannot
-            // match.
+            // 5.0, and the number comes from the reference implementation rather
+            // than from taste.
             //
             // lemonyte's screensaver moves 50 pixels a second across a 1920-pixel
             // window, and its logo is a sixth of that window. So it crosses one
-            // logo width every 6.4 seconds. This logo is 30 cells wide, so the
-            // same feel would be 4.7 cells a second.
+            // logo width every 6.4 seconds, or at 0.156 logo-widths a second.
+            // This logo is 30 cells wide, so the same *feel* is 4.7 cells a
+            // second, which rounds to 5.
             //
-            // At 4.7 cells a second the logo's position advances 9.4 dots a
-            // second horizontally against 60 frames, so more than eight frames in
-            // ten land between dot boundaries and do not change. That is the
-            // staircase, exactly as reported. The reference has 1920 positions to
-            // choose from; this has 160 cells * 2 dots. **A terminal cannot render
-            // that feel smoothly, and the only honest trade is to be too quick
-            // rather than to stutter.**
+            // The number was 18 for a while and the justification given for it
+            // was wrong, twice over. It was derived by scaling 24 by the old logo
+            // width over the new, which holds `cells_per_second * width`
+            // constant -- a product that is not a quantity that means anything,
+            // and which in particular does not preserve the time to cross one
+            // logo width. That would want 31, not 18. The second error was more
+            // interesting: 18 was defended as "too quick rather than stuttering",
+            // on the theory that a slow logo steps visibly from dot to dot.
             //
-            // Set `speed` in the config for calmer or brisker; below about 12 the
-            // stepping returns.
-            speed: 18.0,
+            // That theory has the braille grid backwards. A step here is one dot
+            // out of the logo's 60, so it moves the picture 1.7% of its own
+            // width. The block letter this replaced stepped a whole cell out of
+            // 23 -- 4.3% -- and did so at 24 cells a second rather than 18. The
+            // braille logo is not the coarse one; at a slower rate it is three
+            // times finer than the thing that was reported as a staircase.
+            //
+            // So the stepping was never the problem, and the flicker was. It is
+            // this: a braille glyph *is* its bit pattern, so moving the logo one
+            // dot rewrites nearly every cell it passes through. At 18 cells a
+            // second that is 36 dot-steps against 60 frames -- a whole-logo
+            // repaint on three frames in five, which reads as a shimmer rather
+            // than as motion. At 5 it is 10 dot-steps, one every six frames, and
+            // the logo slides.
+            //
+            // Which is also what makes [`ColorChange::Bounce`] safe to leave on
+            // every hit: at this speed a wall hit is about eight seconds away
+            // rather than one and a half, so a colour change is an event again
+            // instead of a strobe.
+            //
+            // Set `speed` in the config for brisker. Above about 24 the shimmer
+            // comes back.
+            speed: 5.0,
             slope: 2.0,
             color_change: ColorChange::default(),
             start_in_corner: true,
@@ -902,30 +909,28 @@ mod tests {
         );
     }
 
-    /// The flicker count, and the actual answer to "it flickers".
+    /// The colour changes on every wall hit, which is what the reference does
+    /// and what was asked for.
     ///
-    /// What flickers is not the logo moving. It is the *whole* slab changing hue
-    /// at once: at 30 by 7 cells, a recolour is a large simultaneous change, and
-    /// the reference implementation does one of them on every single wall hit --
-    /// about every 1.4 seconds on an 80x24 terminal. The old default was
-    /// [`ColorChange::Bounce`], so that was roughly 0.7 changes a second.
+    /// This asserted the *opposite* for a while, and the reason it did is worth
+    /// keeping: the belief was that a recolour of a solid 30x7 slab is a large
+    /// simultaneous change and therefore a strobe. The diagnosis was wrong. The
+    /// flicker was the logo moving -- a braille glyph is its bit pattern, so a
+    /// one-dot step rewrites the whole letterform -- and at the speed this effect
+    /// ran at then, wall hits were 1.4 seconds apart. At 5 cells a second they
+    /// are about eight, and a colour change is an event again.
     ///
-    /// This measures the change rate directly, over a fixed number of bounces
-    /// rather than a fixed number of seconds, so it is a fraction and not a rate
-    /// that moves with the terminal size. It is also a count of *distinct*
-    /// changes rather than frames on which the colour differed, so a palette
-    /// cycle that wrapped back to where it started cannot flatter it.
-    ///
-    /// `RECOLOR_EVERY_N_BOUNCES` is 3, so the true value is a third. The bound
-    /// here is half, to leave room for the first and last partial group and to
-    /// state the requirement as "well below" rather than restating the constant.
+    /// So this is now a guard in the other direction: it fails if the default
+    /// drifts back to a throttled mode, because that would be quietly
+    /// reintroducing the decision this commit reversed.
     #[test]
-    fn the_colour_changes_far_less_often_than_the_logo_bounces() {
+    fn the_colour_changes_on_every_bounce() {
         let mut effect = Dvd::new(DvdOptions::default(), (80, 24));
         assert_eq!(
             effect.options.color_change,
-            ColorChange::Steady,
-            "the default has to be the quiet one for this to mean anything"
+            ColorChange::Bounce,
+            "the default has to be a recolour on every wall hit, or the logo sits \
+             at one colour for whole stretches of its run"
         );
 
         let mut seen = std::collections::BTreeSet::new();
@@ -960,11 +965,18 @@ mod tests {
             bounces >= 90,
             "only saw {bounces} wall hits, so the simulation never got going"
         );
+        // Every wall hit, and no more than every wall hit: a mode that changed
+        // colour more often than it bounced would be one the bounce counter
+        // cannot see, which is how a bug here would hide.
         assert!(
-            (changes as u32) * 2 <= bounces,
-            "{changes} colour changes over {bounces} wall hits is not 'far less \
-             often' than bouncing, and a full-slab hue change that often is the \
-             flicker"
+            changes as u32 >= bounces,
+            "{changes} colour changes over {bounces} wall hits, so some bounces \
+             did not change the colour"
+        );
+        assert!(
+            changes as u32 <= bounces * 2,
+            "{changes} colour changes over {bounces} wall hits, so the colour is \
+             changing on frames that are not bounces"
         );
         // A sanity floor as well as a ceiling. A rate of zero would satisfy the
         // bound above and is the other failure: the logo would be one colour for
@@ -1201,10 +1213,32 @@ mod tests {
             previous = (dvd.x, dvd.y);
         }
 
+        // Two bounds, and the second is the one that matters.
+        //
+        // The first says the logo is moving often enough to read as motion. At 5
+        // cells a second the origin advances 10 dots horizontally and 10
+        // vertically against 60 frames, so a frame changes the picture if either
+        // axis crosses a dot boundary -- and the measurement is 176 of 600, or
+        // 29%. It used to assert 500, which was correct at 18 cells a second and
+        // is not a property of anything.
+        //
+        // The second is the actual anti-staircase claim, and it is the one that
+        // was missing. "Changes on most frames" is a proxy for "moves smoothly",
+        // and a proxy that can be satisfied by moving a whole cell at a time on
+        // rare frames -- which is precisely the defect it was written to catch.
+        // The direct statement is that no single frame moves the logo more than
+        // a fraction of a cell. At 5 cells a second and 60 Hz that is 0.083 of a
+        // cell; a whole-cell jump would be twelve times larger, and the old
+        // block letter stepped exactly one cell at four times this rate.
         assert!(
-            changed > 500,
+            changed > 150,
             "the screen changed on only {changed} of 600 frames, so the logo is \
-             still mostly stationary with the occasional jump"
+             mostly stationary with the occasional move"
+        );
+        assert!(
+            worst_step < 0.2,
+            "the logo jumped {worst_step:.3} of a cell in one frame, which is a \
+             staircase rather than motion"
         );
         // No single frame may move the logo more than a cell and a half. A
         // bounce clamps the position to the wall, which is a snap of up to one
@@ -1232,7 +1266,14 @@ mod tests {
         let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
         let mut dots = std::collections::BTreeSet::new();
         let mut cells = std::collections::BTreeSet::new();
-        for _ in 0..60 {
+        // 480 frames rather than 60. The ratio is a ratio of two *distinct*
+        // counts over a finite window, and at 5 cells a second the vertical
+        // travels 20 cells in that time against 2.5 in one second -- so a
+        // one-second window is only ten dot boundaries, and the discreteness of
+        // two small samples dominated the ratio. Measured 3.33 over 60 frames and
+        // 3.8 over 480, both of which are the sub-cell axis working; the short
+        // window was just too short to show it.
+        for _ in 0..480 {
             dvd.update();
             dots.insert((dvd.y * DOTS_Y as f64).floor() as i64);
             cells.insert(dvd.y.floor() as i64);
@@ -1636,24 +1677,28 @@ mod tests {
         );
     }
 
-    /// The speed cap tracks the width of the logo.
+    /// The speed cap matches the reference implementation's *feel*.
     ///
-    /// The cap is a property of the logo, not a preference, and the logo changed:
-    /// 23 cells wide before, 30 now. So the cap scales by the old width over the
-    /// new, `24 * 23 / 30 = 18.4`, rounded down.
+    /// This test used to pin a scaling rule -- `24 * 23 / 30`, the old cap
+    /// against the old logo's width over the new one -- and that rule was wrong.
+    /// It holds `cells_per_second * width` constant, which is not a quantity that
+    /// means anything, and it does not preserve the time taken to cross one logo
+    /// width: that would want 31, and the test asserted 18 while claiming to
+    /// preserve it. The number it produced was roughly right for a while by
+    /// accident, which is the worst way for a derivation to be right.
     ///
-    /// The bound is a band rather than an equality so that this pins the *scaling*
-    /// and not the digit. It fails if the cap is left at 24, which is the change
-    /// most likely to happen by accident, and it also fails at the other wrong
-    /// answer of 30 -- the reflex "the logo is 30 wide now, so the cap should be
-    /// 30 too" -- which is a 30% speed-up dressed as a correction.
+    /// What the cap is actually for is *feel*, and the reference has one to copy.
+    /// lemonyte's screensaver moves 50 pixels a second across a 1920-pixel window
+    /// with a logo a sixth of that width, so it crosses one logo width every 6.4
+    /// seconds. Converting that rate to this logo's 30 cells gives 4.7 cells a
+    /// second.
     ///
-    /// Stated here because it is not the interesting claim: this does *not* hold
-    /// the time to cross one logo width fixed. That would be 31 cells a second,
-    /// not 18. See `DvdOptions::default` for what the cap is actually for and what
-    /// it costs.
+    /// Asserted as a band, because the derivation rounds and because a cap is
+    /// something a user will want to move. It fails in the direction that
+    /// matters most: back at 18 the logo is three and a half times too quick and
+    /// shimmers, which is the whole of the report this commit answers.
     #[test]
-    fn the_speed_cap_is_scaled_to_the_logo_width() {
+    fn the_speed_cap_matches_the_reference_feel() {
         let options = DvdOptions::default();
         let logo_cells = options
             .logo
@@ -1663,18 +1708,25 @@ mod tests {
             .unwrap_or(0)
             .div_ceil(DOTS_X);
 
-        // The ratio, spelled out: 24 was the cap against a 23-cell logo.
-        let scaled = 24.0 * 23.0 / logo_cells as f32;
+        // The reference, spelled out rather than quoted.
+        const REFERENCE_PX_PER_SECOND: f64 = 50.0;
+        const REFERENCE_WINDOW_PX: f64 = 1920.0;
+        const REFERENCE_LOGO_FRACTION: f64 = 6.0;
+
+        let widths_per_second = REFERENCE_PX_PER_SECOND
+            / (REFERENCE_WINDOW_PX / REFERENCE_LOGO_FRACTION);
+        let derived = widths_per_second * logo_cells as f64;
+
         assert!(
-            (options.speed - scaled).abs() < 0.5,
-            "the cap is {} and 24 against the old 23-cell logo scales to {scaled} \
-             for this {logo_cells}-cell one",
+            (f64::from(options.speed) - derived).abs() < 1.0,
+            "the cap is {} and the reference's {widths_per_second:.3} \
+             logo-widths a second over this {logo_cells}-cell logo is {derived:.1}",
             options.speed
         );
         assert!(
-            options.speed > 14.0 && options.speed < 20.0,
-            "the cap is {}, which is not the retune; 24 leaves the old logo's speed \
-             on a 30% wider slab, and 30 is a speed-up rather than a correction",
+            (4.0..=8.0).contains(&options.speed),
+            "the cap is {}, which is outside 4 to 8: at 18 the logo is three times \
+             too quick and shimmers, and above about 24 it is worse",
             options.speed
         );
     }
