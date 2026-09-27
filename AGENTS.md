@@ -167,11 +167,13 @@ shown in two. Its font risk is local rather than global: a solid interior is `�
 and stays solid, so a terminal missing `▛▜▙▟` only loses a shape's outline.
 
 Braille is one colour per cell, which is a real constraint and not a detail: an
-effect that wants per-dot colour has to keep a parallel per-cell colour array, and
-`dvd` and `solarsystem` both pair theirs with a depth buffer. Without the buffer
-the first thing drawn wins every contested cell -- `solarsystem` draws the sun
-first, so a planet crossing in front of it would vanish for the length of the
-conjunction.
+effect that wants per-dot colour has to keep a parallel per-cell colour array.
+`solarsystem` does that, and pairs it with a depth buffer -- without one, the first
+thing drawn wins every contested cell, and since it draws the sun first, a planet
+crossing in front of it would vanish for the length of the conjunction. `dvd` needs
+only the colour array: a flat single-colour silhouette has nothing to occlude, and
+the second colour `quadrant` gave it was buying nothing but a black background
+painted behind every edge cell.
 
 There is also a shared `GlyphRamp` in the same directory, and five effects draw
 their characters from it: `cube`, `donut`, `life`, `plasma` and `terrain`. (`crab`

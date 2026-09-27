@@ -84,6 +84,35 @@ only genuinely new features here.
   cells now drop out of the diff, and the render cost 3.7x because the surface
   costs one noise sample per *column* rather than per cell — 200 samples at
   400x200 against 80,000.
+- **The DVD logo is the real wordmark**, supplied as braille art and stored as a
+  60x28 dot bitmap, 30x7 cells. It carries a 3D extrusion in its lower half,
+  which is why it is 7 rows rather than 5, and it is kept as drawn. It is
+  rendered in `braille` rather than `quadrant`, which leaves `quadrant` with no
+  callers at all; it is kept, being tested and still the only sub-cell on both
+  axes in the crate, but it does not have one any more. The flat silhouette also
+  made `quadrant`'s second colour pointless, and it had been painting a black
+  background behind every edge cell to use it.
+  Recolouring moved from every wall bounce to every third, which is the most
+  likely source of the flicker: recolouring a solid 30x7 slab every 1.4 seconds
+  is a large simultaneous change. The speed cap is 18 cells a second, down from
+  24 — the cap is about how many sub-cell samples land per frame, not how fast
+  the logo crosses, and braille's 2 dots per cell make 18 into 36 samples against
+  60 frames. Note that the obvious-looking justification for 18 is wrong and is
+  recorded as such in the code: scaling 24 by the old logo width over the new
+  gives 18.4, but that product means nothing, and holding the time to cross one
+  logo width fixed would want 31, not 18. The real reason 18 is right is that it
+  is slower than before and the complaint was that the effect was too lively.
+  The frame is 596 bytes at 400x200 because cells with no raised dot are left
+  untouched rather than written as a blank braille glyph, and that is flat across
+  terminal sizes.
+- **`[plasma] glyphs` defaults to ASCII** (` .-:;+X#%@`). The block set was
+  monotonic in ink *by the Unicode standard* and no ASCII set has that property;
+  the cost is written on the constant and a test names the ties it cannot resolve
+  rather than asserting monotonicity. An existing plasma test was sweeping 18% of
+  the field's value cycle, which was enough for a 5-step ramp and not for a
+  10-step one — it claimed the value was not pinned to either end of the ramp
+  without examining enough of the ramp to know. Widened to a full cycle, so the
+  assertion got harder.
 
 ### Fixed
 #### Watching them run

@@ -255,21 +255,27 @@ impl Default for DvdOptions {
             // 18 rather than 24, and the number is meaningless on its own: the
             // cap is a property of the *logo*, and the logo changed.
             //
-            // The old default was a 23-cell block letter and 24 was tuned against
-            // it. The wordmark is 30 cells wide, so the cap scales by the old
-            // width over the new: 24 * 23/30 = 18.4, rounded down. "Make it 30
-            // because the logo is 30 wide" is the tempting wrong answer, because
-            // that is a 30% speed-up and the complaint was that this effect was
-            // already too lively.
+            // The reason it is not 30 -- which is the tempting answer, because the
+            // wordmark is 30 cells wide and "the cap should match the logo" sounds
+            // like a rule -- is that the cap is not about how fast the logo
+            // crosses the screen. It is about how many *sub-cell samples* land per
+            // frame, because that is what a staircase is made of. Braille moves in
+            // dots, so 18 cells a second is 36 horizontal samples against 60
+            // frames, and the picture changes on 503 frames of 600. 30 cells a
+            // second would be 60 samples against 60 frames, which is exactly one
+            // dot per frame and leaves no margin at all.
             //
-            // Said plainly, because the arithmetic is not free: this does *not*
-            // hold the time to cross one logo width fixed. That would be 31
-            // cells a second, not 18 -- crossing 23 cells at 24 cells/s took 0.96
-            // seconds, and crossing 30 at 18 takes 1.67. What it holds fixed is
-            // cells per second against frames, which is the quantity the
-            // staircase is actually made of: 24 cells a second is 48 horizontal
-            // samples a second against 60 frames, and 18 is 36. Both are above
-            // the 30 that "more often than every other frame" needs.
+            // There is a piece of arithmetic floating around this value that looks
+            // like a justification and is not one: scaling 24 by the old logo
+            // width over the new gives 18.4, and 18 is the rounded result. But
+            // `24 * 23/30` holds `cells_per_second * width` constant, and that
+            // product is not a quantity that means anything. In particular it does
+            // *not* preserve the time taken to cross one logo width: that would
+            // want 30/23 * 24, or 31 cells a second, and crossing 23 cells at 24
+            // took 0.96 seconds where crossing 30 at 18 takes 1.67. The honest
+            // summary is that 18 is slower than the old default by a quarter, the
+            // complaint was that the effect was too lively, and slower is the
+            // right direction -- not that some ratio was preserved.
             //
             // The ceiling is a property of the medium, not a taste, and it is
             // worth being precise about because the reference and this cannot
