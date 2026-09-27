@@ -78,8 +78,17 @@ Open engineering work, in priority order:
    win is, and that is a rewrite rather than a tweak. `life` is over the 2 ms
    budget on its `update x4` worst case only, and only because
    `step_generation` scans a `HashMap`.
-   `terrain` is *no longer* over, and by a lot: the height-field rewrite took it
-   from 1.3 ms and 554 KB to 350 µs and 17 KB, because the surface costs one
+   `plasma` is now also over, at 2.05 ms, and it is the only one of the three
+   that got there this round. Its render went from 960 µs to 1.27 ms because the
+   new glyph remap runs once per cell; a lookup table took it back to 1.09 ms.
+   What is left is the four sines per cell the effect has always evaluated, plus
+   957 µs of encoding a 476 KB frame. **That byte count is not new** — it emitted
+   466 KB before this round, because a field peaked in the middle was already
+   rewriting most of the screen every frame. Measure the old code before
+   attributing a byte count to a change.
+   `terrain` is not over, but its render did go from 350 µs to 996 µs when the
+   ground gained a body — see the note on it below. The height-field rewrite had
+   taken it from 1.3 ms and 554 KB, because the surface costs one
    noise sample per column rather than per cell and unchanged sky cells drop out
    of the diff
 2. **More effects on the sub-cell renderer.** `starfield` and `flow` want
@@ -179,8 +188,10 @@ only the colour array: a flat single-colour silhouette has nothing to occlude, a
 the second colour `quadrant` gave it was buying nothing but a black background
 painted behind every edge cell.
 
-There is also a shared `GlyphRamp` in the same directory, and five effects draw
-their characters from it: `cube`, `donut`, `life`, `plasma` and `terrain`. (`crab`
+There is also a shared `GlyphRamp` in the same directory, and four effects draw
+their characters from it: `cube`, `donut`, `plasma` and `terrain`. (`life` used
+to and no longer does — a live cell is one constant character now, so it has no
+ramp to draw from.) (`crab`
 uses only the module's character-width filter, not the ramp. This said "eight" for
 a while, which is how a count drifts when nobody checks it against `rg`.) Read its
 module doc before choosing a set: the ORDERING is the whole point, and a ramp that
@@ -236,6 +247,23 @@ function of depth barely changed from frame to frame, and a picture that changes
 *because* it was featureless, which is the same lesson as the mandelbrot's flat
 wash in the other direction. At 200x50 it is 3 KB, so this only matters on a
 screen eight times heavier than an ordinary one.
+
+Its render cost went the same way, 350 µs to 996 µs at 400x200, because the grain
+costs one noise sample per ground cell where the height field costs one per
+*column*. That is the trade the surface optimisation bought and this one spent:
+54,000 samples a frame against 200. Still inside budget, and the surface is still
+one sample per column, so the two are not alternatives — the body simply costs
+more than the surface did.
+
+**Both of those went up, and both were worth it, and the byte counts are the
+instructive half.** A cheap frame is not a good frame. But do not assume a byte
+count moved because of your change: plasma's went from 466 KB to 476 KB *this
+round* and I attributed a six-fold increase to the new glyph calibration before
+measuring the pre-round binary. The old effect was already the second-largest
+emitter in the crate, because a field peaked in the middle was already rewriting
+most of the screen every frame — the histogram being lopsided did not make the
+cells static. **`git show <commit>~1:src/<effect>/effect.rs` and measure.** It
+takes a minute and it is the difference between optimising the right thing.
 
 ## Working Practices
 
@@ -311,6 +339,16 @@ shift at which the ground matches itself, and first searched `0..=4` and reporte
 best of zero. That zero was the edge of its own range, not a fact about the
 picture: the offset is *added* to the column, so the same material is found further
 left. Check that a measured optimum is in the interior of the range you searched.
+
+A sixth kind is a **derived table with no test against its source**. `plasma`'s
+glyph remap was a binary search over its boundary table, and replacing it with a
+lookup meant building a 65,536-entry index table and a sixteen-entry segment
+table at compile time. The two existing tests on that function both still pass
+against a table quantised so coarsely that it flattens the middle of the curve —
+a flattened curve is still monotone and still reaches both ends, which is all
+they check. Deriving something at compile time does not make it a constant like
+any other; it makes it a second place the same thing is written down. Compare it
+against the code it replaced, with the tolerance being its own resolution.
 
 Two of the five also came from tests that could not see the thing they claimed to.
 The precedence between `--seed` and `--random` happens after argument parsing, so
