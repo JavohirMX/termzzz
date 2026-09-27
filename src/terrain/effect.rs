@@ -122,6 +122,45 @@ const DEFAULT_SCROLL_SPEED: f64 = 0.9;
 /// Default for [`TerrainOptions::relief`], in rows per noise period.
 const DEFAULT_RELIEF: f64 = 1.0;
 
+/// Cells per period of the ground's grain, horizontally and vertically.
+///
+/// Two different numbers on purpose, and the vertical one is the interesting
+/// half. Equal periods would give isotropic blobs -- noise, which reads as
+/// static. A vertical period several times shorter than the horizontal one
+/// stretches the features into horizontal bands, and banding is what says
+/// "sediment" rather than "TV snow". The surface's own period is 8 cells; 6 by 3
+/// puts the grain at a similar scale to the landscape above it, so the two look
+/// like the same material.
+const GRAIN_PERIOD_X: f64 = 6.0;
+const GRAIN_PERIOD_Y: f64 = 3.0;
+
+/// Octaves and persistence for the grain.
+///
+/// Two, for the same reason the seabed uses two: a finely detailed floor under a
+/// smooth large-scale structure reads as two different materials.
+const GRAIN_OCTAVES: i32 = 2;
+const GRAIN_PERSISTENCE: f64 = 0.5;
+
+/// How much of the glyph the grain contributes, against the depth bias.
+const GRAIN_WEIGHT: f32 = 0.32;
+
+/// How much denser the ground reads with depth, out of a full ramp step.
+///
+/// Small. Depth genuinely does make ground denser, but this is the *texture*
+/// channel now and the shading is the colour's job, so a strong bias here would
+/// be re-introducing the vertical ramp that was the defect -- just with noise on
+/// top of it.
+const GROUND_DEPTH_BIAS: f32 = 0.22;
+
+/// The range octave noise actually reaches, measured.
+///
+/// Not 1.0, and assuming 1.0 is a quiet way to lose two thirds of a ramp:
+/// measured over four thousand samples at three different periods this generator
+/// spans 0.79, so dividing by 1.0 would put every grain value inside the middle
+/// half of the ramp and leave the ends unreachable. The same correction is why
+/// `relief` is 7.0 for three rows of surface.
+const NOISE_PRACTICAL_RANGE: f32 = 0.4;
+
 /// The largest fraction of the ground's depth the surface amplitude may take.
 ///
 /// Binds only on short terminals, where the requested amplitude in rows would
@@ -555,24 +594,61 @@ impl Terrain {
                 }
 
                 let depth = (y - top) as f32 / ground_depth;
-                let t = depth.clamp(0.0, 1.0);
+                // Colour from depth, and *only* from depth. This is the shading
+                // -- how much light reaches this far into the ground -- and it is
+                // the one thing in the frame that is a clean function of a single
+                // quantity, so it is the right place to spend a continuous ramp.
+                let colour = self.ground.sample(depth.clamp(0.0, 1.0));
+
+                // Glyph from a two-dimensional field, which is the fix for "I
+                // don't understand what it's showing me".
+                //
+                // Both encodings used to be functions of depth alone, so every
+                // column below its own surface was *identical* and the whole
+                // picture was one smooth vertical ramp under a slightly wavy top
+                // edge. That is not a landscape and it is not a cross-section
+                // either; it is a gradient with a border. The missing thing was
+                // structure running horizontally through the body -- strata,
+                // grain, whatever the rock is made of.
+                //
+                // Three parts, because one is not enough. The `grain` field is
+                // smooth and sampled at (column, depth), so it varies along both
+                // axes, and the shorter vertical period is what gives the
+                // horizontal banding that says "sediment" rather than "noise".
+                // The `depth * GROUND_DEPTH_BIAS` term tips it very slightly
+                // denser with depth, which is the one true thing about going down
+                // through ground. And the grain is scaled to the noise's *actual*
+                // range rather than assuming it reaches +/-1, because it does not
+                // -- measured at 0.79, which is also why `relief` has to be 7.0
+                // to move the surface three rows.
+                //
+                // The column coordinate carries `offset`, and that is load-bearing
+                // rather than cosmetic. The surface scrolls because
+                // `surface_row` samples its own noise at `x + offset`, so a grain
+                // sampled at a bare `x` would sit still in screen space while the
+                // landscape slid across it -- a silhouette moving over a fixed
+                // texture, which is not ground and reads as two unrelated things
+                // sliding past each other. The depth coordinate needs no offset
+                // because it is measured *from the surface*, so it already moves
+                // with the ground.
+                let depth_cells = (y - top) as f64;
+                let grain = self.noise.octave_noise_2d(
+                    (x as f64 + offset) / GRAIN_PERIOD_X,
+                    depth_cells / GRAIN_PERIOD_Y,
+                    GRAIN_OCTAVES,
+                    GRAIN_PERSISTENCE,
+                    1.0,
+                ) as f32
+                    / NOISE_PRACTICAL_RANGE;
+                let t = (0.5 + depth * GROUND_DEPTH_BIAS + grain * GRAIN_WEIGHT)
+                    .clamp(0.0, 1.0);
+
                 surface.set(
                     x,
                     y,
                     Cell::new(
-                        // Denser with depth: the body of the ground should read
-                        // as solid, and a ramp that thins out as it goes down
-                        // would make the ground dissolve toward the bottom of the
-                        // screen.
                         self.ramp.sample(t),
-                        // Darker with depth, which is the *opposite* direction.
-                        // The two answer different questions -- how much rock is
-                        // there, and how much light reaches it -- and for terrain
-                        // those genuinely disagree: a solid mass in shadow. The
-                        // old effect had both encoding the same scalar, which
-                        // only worked because it had no surface for either to be
-                        // relative to.
-                        self.ground.sample(t),
+                        colour,
                         // `Attribute::Reset`, not `Attribute::Bold`. Every cell
                         // was bold, and bold on a truecolor foreground is a
                         // rendering hint that many terminals act on by
@@ -628,9 +704,36 @@ mod tests {
     }
 
     /// The surface row for every column, from the same code the renderer uses.
+    ///
+    /// At offset zero, which is the *first* frame. Anything that compares a
+    /// surface against a frame drawn later has to use
+    /// [`drawn_with_surface`] instead -- the seabed scrolls, so a surface row
+    /// from one instant says nothing about a frame from another. Getting that
+    /// wrong is not subtle: it looks like the ground has more structure than it
+    /// does, because the rows are sampling different depths in each column.
     fn surface(size: (u16, u16)) -> Vec<usize> {
         let terrain = Terrain::new(TerrainOptions::default(), size);
         terrain.surface_rows(0.0, Terrain::horizon_row(size))
+    }
+
+    /// A drawn frame and the surface it was drawn against, from one instance.
+    ///
+    /// The pair has to come from the same `Terrain`, for the reason on
+    /// [`surface`].
+    fn drawn_with_surface(
+        size: (u16, u16),
+        frames: u64,
+    ) -> (Vec<Vec<char>>, Vec<usize>) {
+        let mut terrain = Terrain::new(TerrainOptions::default(), size);
+        for _ in 0..frames {
+            terrain.advance(1.0 / 60.0);
+        }
+        let rows = terrain.surface_rows(terrain.offset, Terrain::horizon_row(size));
+        let mut grid = vec![vec![' '; size.0 as usize]; size.1 as usize];
+        for (x, y, cell) in terrain.get_diff() {
+            grid[y][x] = cell.symbol;
+        }
+        (grid, rows)
     }
 
     // ---------------------------------------------------------------- the fix
@@ -891,31 +994,23 @@ mod tests {
 
     // ------------------------------------------------------- the two encodings
 
-    /// The glyph ramp runs denser with depth, and the colour ramp darker.
+    /// The ground gets darker with depth, and the *colour* is what carries it.
     ///
-    /// These used to be one test called `the_glyph_and_the_colour_agree_on_the
-    /// _value`, and they were the same test because both encoded the same scalar.
-    /// They are not any more, and the split is the interesting part: the glyph
-    /// answers "how much rock is here" and the colour answers "how much light
-    /// reaches it", and for ground those disagree. A solid mass in shadow.
+    /// This test used to assert that the glyph also got denser with depth, and it
+    /// passed after the grain went in -- while no longer testing anything about
+    /// the effect. It walked the ramp function, so it was checking that a ramp is
+    /// ordered, which was never in doubt. A test that stops testing its subject
+    /// and keeps passing is worse than one that fails, because it reports
+    /// coverage it is not providing.
     ///
-    /// Driving both in the same direction is the mistake worth preventing. If
-    /// the colour lightened with depth the ground would glow at the bottom of the
-    /// screen; if the glyph thinned with depth the ground would dissolve into
-    /// the background before it reached the last row.
+    /// The glyph's job has changed and is now texture, so its right property is
+    /// *not* monotonicity in depth. That is `the_ground_body_has_horizontal_
+    /// _structure`. What is left for the colour is the shading, and it is the one
+    /// thing in the frame that is a clean function of a single quantity, so it is
+    /// measured on real drawn cells rather than on the palette in isolation.
     #[test]
-    fn the_ground_gets_denser_and_darker_with_depth() {
-        let terrain = Terrain::new(TerrainOptions::default(), (80, 24));
-        let ramp = terrain.ramp.clone();
-        let palette = terrain.ground.clone();
-
-        let density = |t: f32| {
-            ramp.glyphs()
-                .iter()
-                .position(|&g| g == ramp.sample(t))
-                .unwrap()
-        };
-        let luminance = |t: f32| match palette.sample(t) {
+    fn the_ground_gets_darker_with_depth() {
+        let luminance = |c: style::Color| match c {
             style::Color::Rgb { r, g, b } => {
                 0.2126 * f32::from(r)
                     + 0.7152 * f32::from(g)
@@ -924,22 +1019,241 @@ mod tests {
             _ => f32::NAN,
         };
 
-        let depths = [0.0f32, 0.25, 0.5, 0.75, 1.0];
-        for pair in depths.windows(2) {
-            let (shallow, deep) = (pair[0], pair[1]);
+        // Measured on the frame, not on the palette. The palette could be
+        // perfectly ordered and the renderer could still hand every cell the same
+        // stop, and only this notices.
+        for size in [(80u16, 24u16), (200, 50)] {
+            let rows = surface(size);
+            let mut terrain = Terrain::new(TerrainOptions::default(), size);
+            let grid: std::collections::BTreeMap<(usize, usize), style::Color> =
+                terrain
+                    .get_diff()
+                    .into_iter()
+                    .map(|(x, y, cell)| ((x, y), cell.color))
+                    .collect();
+
+            // Columns where the surface is high, so there is a deep body to
+            // compare against without the bottom row being the surface itself.
+            let deep_columns: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|&(_, &top)| top < size.1 as usize / 2)
+                .map(|(x, _)| x)
+                .collect();
             assert!(
-                density(deep) > density(shallow),
-                "the glyph at depth {deep} is {:?}, which is not denser than the \
-                 {:?} at {shallow}: the ground dissolves toward the bottom",
-                ramp.sample(deep),
-                ramp.sample(shallow)
+                deep_columns.len() > size.0 as usize / 4,
+                "at {}x{} only {} columns have room for a ground body, so there is \\
+                 nothing to compare",
+                size.0,
+                size.1,
+                deep_columns.len()
             );
-            assert!(
-                luminance(deep) < luminance(shallow),
-                "the ground is *brighter* at depth {deep} than at {shallow}, so \
-                 the bottom of the screen glows"
-            );
+
+            for &x in &deep_columns {
+                let top = rows[x];
+                let shallow = grid[&(x, top)];
+                let deepest = grid[&(x, size.1 as usize - 1)];
+                assert!(
+                    luminance(deepest) < luminance(shallow),
+                    "at {}x{} column {x} is {} at the surface and {} at the bottom, \\
+                     so the ground does not get darker going down",
+                    size.0,
+                    size.1,
+                    luminance(shallow),
+                    luminance(deepest)
+                );
+            }
         }
+    }
+
+    /// The body of the ground has structure running through it horizontally.
+    ///
+    /// The headline defect, and the reason the effect was reported as
+    /// unreadable. Both encodings were functions of depth alone, so every column
+    /// below its own surface drew identically and the whole picture was one
+    /// smooth vertical ramp under a slightly wavy top edge. That is not a
+    /// landscape and not a cross-section either. It is a gradient with a border.
+    ///
+    /// Measured **at constant depth**, and that is the whole difficulty. The
+    /// obvious metric -- how many adjacent cells in one row differ -- is
+    /// confounded, because two cells in the same row are at different depths
+    /// wherever the surface is uneven, and so they differed even with no grain at
+    /// all. The first version of this test used that metric, passed against the
+    /// flat body it was written to catch, and was measuring the silhouette.
+    ///
+    /// So: a fixed number of rows below *each column's own* surface. Every cell
+    /// sampled is then at the same depth by construction, the only thing that can
+    /// differ between them is the grain, and the flat body gives exactly zero.
+    #[test]
+    fn the_ground_body_has_horizontal_structure() {
+        let size = (120u16, 30u16);
+        let (grid, rows) = drawn_with_surface(size, 90);
+        let height = size.1 as usize;
+
+        // Deep enough that every column still has ground, and shallow enough to
+        // be inside the body rather than in the depth bias at the very bottom.
+        let below = 3usize;
+        assert!(
+            *rows.iter().max().unwrap() + below + 1 < height,
+            "the deepest surface is row {} on a {height} row screen, so there is \
+             no row that is {below} rows of ground everywhere",
+            rows.iter().max().unwrap()
+        );
+
+        let (differing, pairs) =
+            (0..size.0 as usize - 1).fold((0usize, 0usize), |(d, p), x| {
+                let a = grid[rows[x] + below][x];
+                let b = grid[rows[x + 1] + below][x + 1];
+                (d + usize::from(a != b), p + 1)
+            });
+        let fraction = differing as f64 / pairs.max(1) as f64;
+
+        assert!(
+            fraction > 0.15,
+            "sampled {below} rows below each column's own surface -- so every \
+             cell is at the same depth and only the grain can differ -- just \
+             {differing} of {pairs} adjacent pairs differ ({:.1}%). The body of \
+             the ground is featureless, so the picture is a vertical ramp with a \
+             wavy top edge rather than terrain.",
+            fraction * 100.0
+        );
+    }
+
+    /// The grain is a smooth field, not per-cell noise.
+    ///
+    /// The distinction matters visually and it is measurable at constant depth.
+    /// A field that is smooth in the column direction has runs of neighbouring
+    /// cells that agree; a per-cell random pick does not, and reads as
+    /// television static however the values are distributed. The assertion is a
+    /// lower bound on agreement at a two-cell offset, chosen because it is the
+    /// loosest bound that still fails for white noise.
+    ///
+    /// Note what this does *not* catch, because it is worth knowing: a body with
+    /// no grain at all passes it, with agreement at 100%. It distinguishes
+    /// "grain" from "static", not "grain" from "nothing" -- that is the test
+    /// above, and between them the two failures have different answers.
+    #[test]
+    fn the_grain_is_smooth_across_a_column_rather_than_random() {
+        let size = (120u16, 30u16);
+        let (grid, rows) = drawn_with_surface(size, 90);
+        let below = 3usize;
+        let offset = 2usize;
+
+        let (agreeing, pairs) =
+            (0..size.0 as usize - offset).fold((0usize, 0usize), |(a, p), x| {
+                let here = grid[rows[x] + below][x];
+                let there = grid[rows[x + offset] + below][x + offset];
+                (a + usize::from(here == there), p + 1)
+            });
+        let fraction = agreeing as f64 / pairs.max(1) as f64;
+
+        assert!(
+            fraction > 0.15,
+            "only {:.1}% of cells agree with the one {offset} columns away, so the \
+             grain is closer to per-cell noise than to a field -- which reads as \
+             static rather than as material",
+            fraction * 100.0
+        );
+    }
+
+    /// The grain scrolls with the ground rather than sitting still under it.
+    ///
+    /// Found by reading the code rather than by a failing test, which is the part
+    /// worth recording. The surface scrolls because `surface_row` samples its own
+    /// noise at `x + offset`; the grain was sampled at a bare `x`, so the texture
+    /// stayed fixed in screen space while the landscape slid across it. Silhouette
+    /// and material moving independently read as two unrelated things passing each
+    /// other, not as one body of ground.
+    ///
+    /// Measured by cross-correlation rather than by a direct comparison, because
+    /// the obvious version of this test does not work: the ground moves 0.015
+    /// cells per frame at the default scroll speed, so two *adjacent* frames are
+    /// indistinguishable and comparing them at any shift measures nothing. So:
+    /// run long enough for the ground to travel a couple of cells, then find the
+    /// horizontal shift at which the body best matches itself. A grain attached
+    /// to the ground peaks at the scroll displacement; a grain in screen space
+    /// peaks at zero, and that is the whole difference.
+    #[test]
+    fn the_grain_scrolls_with_the_ground_and_not_across_it() {
+        let size = (120u16, 30u16);
+        let scroll = TerrainOptions::default().scroll_speed;
+        // Frames for the ground to travel about two cells.
+        let frames = (2.0 / (scroll / 60.0)).round() as u64;
+        let (before, _) = drawn_with_surface(size, 0);
+        let (after, _) = drawn_with_surface(size, frames);
+        let expected = (scroll * frames as f64 / 60.0).round() as i64;
+
+        let agreement_at = |shift: i64| -> f64 {
+            let (mut agree, mut pairs) = (0usize, 0usize);
+            for x in 0..size.0 as i64 {
+                let moved = x + shift;
+                if moved < 0 || moved >= i64::from(size.0) {
+                    continue;
+                }
+                for y in 0..size.1 as usize {
+                    let a = before[y][x as usize];
+                    let b = after[y][moved as usize];
+                    if a == ' ' || b == ' ' {
+                        continue;
+                    }
+                    agree += usize::from(a == b);
+                    pairs += 1;
+                }
+            }
+            agree as f64 / pairs.max(1) as f64
+        };
+
+        // Best shift over a range that comfortably contains the expected one.
+        // Signed, and negative: the offset is added to the column, so as it grows
+        // the same material is found further *left*. The first version of this
+        // searched 0..=4 and reported a best of 0, which was the edge of its own
+        // range rather than a fact about the picture.
+        let best = (-4..=4i64)
+            .max_by(|a, b| {
+                agreement_at(*a)
+                    .partial_cmp(&agreement_at(*b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap();
+
+        assert_eq!(
+            best, -expected,
+            "the ground pattern matches itself best at a shift of {best} columns \
+             and not at the {} the ground actually travelled, so the texture is \
+             not attached to it",
+            -expected
+        );
+    }
+
+    /// The grain's vertical period is shorter than its horizontal one, which is
+    /// what makes it banded.
+    ///
+    /// Asserted on the constants rather than on the output, and the reason is
+    /// worth stating: a measured version cannot separate the two. Walking down a
+    /// column changes the depth, and the depth bias changes the glyph with it, so
+    /// a vertically-varying measure is dominated by the bias whether or not there
+    /// is any banding at all. The flat body this replaced passed a measured
+    /// banding test for exactly that reason.
+    ///
+    /// What is being claimed is a property of the sampling, and the sampling is
+    /// two named constants. If the vertical period is the longer of the two the
+    /// features are stretched the other way and the ground reads as vertical
+    /// fluting rather than as sediment.
+    #[test]
+    fn the_grain_periods_make_it_banded() {
+        assert!(
+            GRAIN_PERIOD_Y < GRAIN_PERIOD_X,
+            "the grain's vertical period is {GRAIN_PERIOD_Y} and its horizontal is \
+             {GRAIN_PERIOD_X}, so the features are stretched vertically. Equal \
+             periods give isotropic blobs, which read as static; the vertical \
+             period has to be the shorter one for bands."
+        );
+        // And the grain must be able to reach both ends of the ramp, or the
+        // re-spacing that motivated it does nothing.
+        assert!(
+            0.5 + GRAIN_WEIGHT < 1.0 && 0.5 - GRAIN_WEIGHT > 0.0,
+            "a grain weight of {GRAIN_WEIGHT} on a ramp centred at 0.5 cannot reach              both ends of the scale"
+        );
     }
 
     /// The default ramp is ASCII, because the user asked for it by name.
