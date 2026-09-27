@@ -13,7 +13,7 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
-use crate::render::{GlyphRamp, Palette};
+use crate::render::Palette;
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -41,71 +41,39 @@ const GLIDERS_PER_GENERATION: usize = 9;
 /// reachable.
 const MAX_AGE: u8 = 8;
 
-/// How many glyphs a live cell is drawn with, whatever its age.
+/// The character every live cell is drawn with, whatever its age.
 ///
-/// Three, and the number *is* the fix rather than a setting. The glyph used to
-/// be a continuous function of the age, which meant every live cell's character
-/// changed on every single generation -- at the old rate of eight generations a
-/// second, that is every cell on the screen changing character eight times a
-/// second, and the report was that the effect "doesn't look like a real game of
-/// life because every frame the characters change".
+/// One, and the number *is* the answer. This has been three shapes in this
+/// file's history and the character is the only part of the picture a viewer
+/// cannot help but watch. It was a random katakana per cell per generation,
+/// which made a cell that was standing still look like it was flickering; then
+/// a continuous ramp of the age, which held still but changed every live
+/// character's shape on every single generation; then three bands of three
+/// generations, which changed it two or three times in a cell's life and was
+/// still a character changing. The report each time was the same shape: it does
+/// not look like a real game of life.
 ///
-/// Three bands of three generations each, so every glyph is held for three
-/// generations whatever the cell's age, rather than one age per glyph for the
-/// ages that are common and a shared glyph for the rest. That uniformity is the
-/// part that matters: an age-quantised ramp whose bands are sized by how many
-/// cells fall in them would give the newborn band -- which is where 92% of a
-/// life soup lives -- the shortest hold of all.
+/// So the age is out of the character entirely, and it never goes back in. One
+/// constant glyph for all nine ages, and the ramp is the colour's alone -- see
+/// [`age_fraction`] for why that division is the right way round. A colour can
+/// drift a shade every generation without the picture flickering, because
+/// nothing about the *shape* of a cell changes; a character cannot, because
+/// shape is exactly what the eye tracks.
 ///
-/// See [`band_width`] for why the bands divide the range evenly rather than
-/// following [`age_fraction`].
-const AGE_BANDS: u8 = 3;
-
-/// Generations that share one glyph.
+/// `@` rather than `O`, and it is a reading of the request rather than a
+/// default. "One big circle" has two ASCII candidates and they are not
+/// equivalent: `O` is a hollow ring, so a run of live cells draws as a row of
+/// outlines with the background showing through each one, which is a lattice
+/// rather than a population. `@` is the densest round character ASCII has -- it
+/// fills its cell box -- so a run of live cells reads as a solid mass and the
+/// structures between them are the gaps. It is also single-width in every
+/// terminal ever shipped, which `O` also is and which is the one thing this
+/// choice does not have to argue.
 ///
-/// `(MAX_AGE + 1) / AGE_BANDS`: three here, and the division is the point. The
-/// ages that exist are 0 through [`MAX_AGE`] *inclusive*, so there are nine of
-/// them and nine divides into three bands of three with nothing left over --
-/// which is what keeps the dense end of the ramp reachable, since a still life
-/// has to land in the last band and the last band has to be non-empty.
-///
-/// Deliberately not derived from [`age_fraction`]. Sizing the bands by where the
-/// cells are would be the obvious thing, and it is wrong for this complaint: the
-/// curve spends almost all of its range on the first three ages, so those bands
-/// come out two, two and four generations wide, and a cell at the sparse end --
-/// which is 92% of them, and the only band most viewers will ever look at --
-/// changes its character every second generation.
-fn band_width() -> u8 {
-    (MAX_AGE + 1) / AGE_BANDS
-}
-
-/// Which of [`AGE_BANDS`] glyphs a cell of this age is drawn with.
-///
-/// Saturating rather than wrapping, like [`age_fraction`]: a cell that outlives
-/// [`MAX_AGE`] is in the last band and not back at the sparse end.
-fn age_band(age: u8) -> usize {
-    usize::from(age.min(MAX_AGE) / band_width())
-}
-
-/// How a live cell is drawn, sparse to dense, by how long it has been alive.
-///
-/// ASCII on purpose. This used to be thirty-two halfwidth katakana, U+FF8A and
-/// its neighbours: one column wide in a Latin-configured terminal and two in a
-/// CJK-configured one, so the same run of live cells came out one glyph wide in
-/// one terminal and two in the next. Deciding a character's width properly wants
-/// a width table, which this crate does not carry; ASCII is the one range that
-/// is single-width in every terminal ever shipped.
-///
-/// The ordering is by eye, and it is the ordering this crate's own glyph-ramp
-/// notes are careful about: `-` and `=` are *lighter* than `+` and `*`, so the
-/// classic ten cannot be used as a value carrier. They are left out, and what is
-/// left only ever adds strokes as it rises.
-///
-/// No space either. The classic ramp starts with one, which is right for a
-/// field being faded out and exactly wrong here, where a space is an invisible
-/// cell in the middle of a live structure.
-static AGE_GLYPHS: LazyLock<GlyphRamp> =
-    LazyLock::new(|| GlyphRamp::from_text(".:+*#%@"));
+/// Not a configurable field, deliberately. It was never one -- the ramp was a
+/// private static, not a `ConwayLifeOptions` key -- and adding one now would
+/// mean exposing exactly the knob this change exists to close.
+const LIVE_GLYPH: char = '@';
 
 /// The colours a live cell is drawn in, by how long it has been alive.
 ///
@@ -157,12 +125,19 @@ static AGE_COLOURS: LazyLock<Palette> = LazyLock::new(|| {
 ///
 /// This used to index the *glyph* ramp as well, and the note above used to be
 /// about spending all seven glyphs on the nine ages. That is no longer what
-/// happens, and pretending otherwise would be the kind of comment that outlives
-/// its code: the glyph is banded by [`age_band`] now, because a continuous ramp
-/// meant every live cell changed character on every generation. See
-/// [`glyph_for_age`]. The curve stayed, and it is now only the colour's -- which
-/// is the right division of the work, because a colour can change every
-/// generation without the picture flickering, and a character cannot.
+/// happens and pretending otherwise would be the kind of comment that outlives
+/// its code: every live cell is drawn with one character now, so the curve is
+/// only the colour's, and it is continuous rather than quantised. See
+/// [`glyph_for_age`].
+///
+/// Which is the right division of the work, and it is worth being explicit about
+/// why because it looks backwards. A colour drifting a shade every generation is
+/// something the eye reads as the cell *aging* -- the structures visibly settle,
+/// brightening as they hold -- and nothing in the picture jumps. A character
+/// changing is read as the cell being *replaced*, and at eight generations a
+/// second the whole board is replaced eight times a second. The report this
+/// change answers is that the effect did not look like a game of life, and
+/// "the age is in the colour" is what makes it look like one.
 ///
 /// Saturating rather than wrapping, so a cell that outlives [`MAX_AGE`] is at the
 /// top of the ramp and not back at the sparse end. A still life drawn entirely
@@ -174,37 +149,28 @@ fn age_fraction(age: u8) -> f32 {
 
 /// The glyph for a cell of this age.
 ///
-/// A pure function of the age, banded rather than continuous. It used to be
-/// `rng.random_range(0..32)` into a character table, redrawn for every surviving
-/// cell on every generation and depending on nothing: not the cell's age, not
-/// its neighbours, not where it is. A cell standing still was redrawn in a
-/// different character sixty times a second, so the only thing the eye could
-/// follow was characters disappearing, and the effect read as noise moving
-/// around rather than as a population with a history.
+/// The same character every time, which is the whole of what this function does
+/// and the reason it is still a function. See [`LIVE_GLYPH`] for the history:
+/// random per generation, then a continuous ramp of the age, then three bands
+/// of three, and now a constant. Three changes in one direction, each one
+/// removing a way for the character to move, and the age argument is kept only
+/// so a call site reads as "the glyph for a cell this old" and so the compiler
+/// catches a caller that would rather be passing nothing.
 ///
-/// Fixing that was not the end of it. Deriving the glyph from the age made it
-/// *stable*, which was the point, and it also made it change on every single
-/// generation -- the age of a surviving cell is its age plus one, and with a
-/// continuous ramp that is a different character, so every live cell on the
-/// screen was redrawn eight times a second and the report came back that the
-/// effect still "doesn't look like a real game of life because every frame the
-/// characters change". A second fix, not the same one twice.
-///
-/// So the age is quantised into [`AGE_BANDS`] bands first, and the bands are
-/// spread across the *whole* ramp rather than taken from its front: a settled
-/// cell is the densest glyph there is, and a still life drawn at the sparse end
-/// would be a field of births, which is the one reading that is definitely
-/// wrong. The cost is that four of the seven glyphs are now unreachable, which
-/// `a_live_cells_glyph_depends_on_how_long_it_has_been_alive` now asserts as
-/// deliberate rather than as a bug -- and the trade is worth it, because a glyph
-/// that changes is noticed and a glyph that does not is not.
-fn glyph_for_age(age: u8) -> char {
-    let band = age_band(age);
-    AGE_GLYPHS.at(band * (AGE_GLYPHS.len() - 1) / (AGE_BANDS as usize - 1))
+/// Deliberately still taking the age. A caller that could pass the age or not
+/// would pass it not, and the day someone needs a second glyph this signature
+/// is the one place that has to be revisited on purpose.
+#[inline]
+fn glyph_for_age(_age: u8) -> char {
+    LIVE_GLYPH
 }
 
-/// The colour for a cell of this age. See [`glyph_for_age`] for why this is a
-/// function of the cell rather than of the generation.
+/// The colour for a cell of this age.
+///
+/// Continuous in the age, unlike every version of the glyph before
+/// [`LIVE_GLYPH`], and it is the only thing left that carries the age. See
+/// [`age_fraction`] for the curve and [`glyph_for_age`] for why the division of
+/// the work between them is the right way round.
 fn color_for_age(age: u8) -> style::Color {
     AGE_COLOURS.sample(age_fraction(age))
 }
@@ -218,12 +184,8 @@ pub struct ConwayLifeOptions {
     /// Generations a second, and how fast the population evolves.
     ///
     /// 3.0, down from 8.0, and the other half of that is the glyph: at eight a
-    /// second every live cell's character changed on every generation, and a
-    /// generation is a third of a second now rather than an eighth. Neither half
-    /// works on its own -- banding the glyph at eight generations a second holds a
-    /// character for three and a half frames, and slowing the rate while the glyph
-    /// is continuous still redraws the whole board every third of a second. See
-    /// `glyph_for_age`.
+    /// second the whole board was redrawn eight times a second, and a generation
+    /// is a third of a second now rather than an eighth.
     ///
     /// The rate is a reading of Conway's rules, not just a clock. At eight a
     /// second a glider crosses a cell every one and a half frames, a block is over
@@ -232,11 +194,16 @@ pub struct ConwayLifeOptions {
     /// about the rate at which a person can watch a single cell and say what
     /// happened to it, which is the only thing a screensaver of Conway's rules has
     /// to offer.
+    ///
+    /// The glyph is a constant now, so the rate is no longer load-bearing for
+    /// whether a cell's *appearance* holds still -- that holds for as long as the
+    /// cell does. It is still the rate at which a structure can be watched
+    /// assembling, which is the other half of looking like a game of life.
     pub generations_per_second: f32,
     /// Seed for the initial population and the gliders seeded each generation.
     ///
     /// No longer also seeds the glyph, because the glyph is not random any more:
-    /// it is a function of a cell's age, so there is nothing for a seed to choose.
+    /// every live cell is drawn with one character. See [`LIVE_GLYPH`].
     pub seed: u64,
 }
 
@@ -646,177 +613,140 @@ mod tests {
         life
     }
 
-    /// A glyph that says how long a cell has been alive, in bands wide enough to
-    /// be read.
+    /// Every live cell is drawn with one character, and the colour is what says
+    /// how old it is.
     ///
-    /// The glyph used to be `rng.random_range(0..32)` into a table of halfwidth
-    /// katakana, redrawn for every surviving cell on every generation and
-    /// depending on nothing at all -- not the cell's age, not its neighbours,
-    /// not where it is. Nothing about a cell's appearance changed while the cell
-    /// itself was standing still, so the only thing the eye could follow was the
-    /// glyphs vanishing, which is what "just some characters moving around"
-    /// describes.
+    /// The user's own brief: "don't change the characters at all; just have one
+    /// big circle for one live cell", and the disambiguation that went with it
+    /// -- one constant round glyph for every age, with the age carried entirely
+    /// by the colour ramp.
     ///
-    /// Deriving it from the age fixed that and created the second half of the
-    /// problem: the age of a surviving cell is its age plus one, so with a ramp
-    /// indexed *continuously* in the age, every live cell on the screen changed
-    /// character on every generation. Eight times a second, and the report came
-    /// back that it still did not look like a game of life.
+    /// The name of this test used to be `a_live_cells_glyph_depends_on_how_long_
+    /// it_has_been_alive` and it asserted the exact opposite, deliberately
+    /// inverted once already. The first version of it was the honest
+    /// observation that a random-per-generation glyph was wrong, so it required
+    /// the nine ages to resolve to all seven glyphs. The second was a continuous
+    /// ramp of the age, which fixed the randomness and made every live cell
+    /// change character on every generation, so the first assertion was flipped
+    /// and it came to require *fewer* glyphs than the ramp held -- down to
+    /// `AGE_BANDS` of three. That was an improvement and it is now also the
+    /// wrong thing: three bands still means a cell's character changes two or
+    /// three times in its life, and a changing character is read as a cell being
+    /// replaced. So this is the third inversion, and it is the one that removes
+    /// the dependence rather than weakening it.
     ///
-    /// So this now asserts the banded shape, and the first half of it is the part
-    /// that was asserted before and is now deliberately inverted. It used to
-    /// require the nine ages to resolve to all seven glyphs, with the reasoning
-    /// that "some of the ramp is unreachable" is a bug. It is the *number* of
-    /// glyphs that was the bug: spending seven glyphs on nine ages means one age
-    /// per glyph, so a still life changes character every generation and four of
-    /// the seven are decoration anyway. Fewer, wider bands is the fix, and four
-    /// unreachable entries of the ramp is what the fix looks like. The
-    /// contiguity and the ordering are the properties that still matter, and they
-    /// are the ones a constant mapping, a per-generation redraw, and a shuffled
-    /// ramp all fail.
+    /// Byte-identical across every age is the assertion, and *byte*-identical
+    /// rather than "the same set" because a ramp indexed by the age with a single
+    /// entry would satisfy a weaker reading of this. The ages that exist are 0
+    /// through [`MAX_AGE`] inclusive, so the loop covers all nine rather than the
+    /// eight a `0..MAX_AGE` would have caught -- the same off-by-one
+    /// [`MAX_AGE`] exists to warn about on the colour side, and it is the
+    /// saturating end here that a still life lives at.
     ///
-    /// The lower bound on a band's width is the load-bearing half. Two
-    /// generations is not a band a viewer can hold in their head at a rate where
-    /// a generation is a third of a second, and `AGE_BANDS` is small enough that
-    /// every band is three generations or more rather than only the common ones.
+    /// Then the other half, which is the claim that actually has content: the
+    /// colour still drifts, and it is what the age is now visible *in*. Two
+    /// assertions in each direction, because each alone is satisfiable by
+    /// accident. A flat colour would pass "different ages differ" if only one
+    /// pair were checked; a per-cell random colour would pass it too, and would
+    /// also pass "same ages agree" at one age. So a newborn against a settled
+    /// cell has to be a *visible* distance apart, and two cells of the same age
+    /// have to be identical, which together pin it as a function of the age and
+    /// not of the cell.
+    ///
+    /// Read out of `fill_buffer` on a real settled population rather than from
+    /// `color_for_age` alone, so a `fill_buffer` that stopped consulting the
+    /// colour would be caught here.
     #[test]
-    fn a_live_cells_glyph_depends_on_how_long_it_has_been_alive() {
-        let mut bands: Vec<(char, u8, u8)> = Vec::new();
-        for age in 0..=MAX_AGE {
-            let glyph = glyph_for_age(age);
-            match bands.last_mut() {
-                Some((last, _, hi)) if *last == glyph => *hi = age,
-                _ => bands.push((glyph, age, age)),
-            }
-        }
-
-        // Fewer bands than the ramp has entries, and never more: that inversion
-        // is the fix, and a ramp that is fully spent again is the bug returning.
-        assert!(
-            bands.len() <= AGE_GLYPHS.len(),
-            "the ages resolve to {} distinct glyphs out of a {}-entry ramp, so the \
-             glyph is continuous again and every live cell changes character on \
-             every generation",
-            bands.len(),
-            AGE_GLYPHS.len()
+    fn every_live_cell_is_one_glyph_and_its_colour_is_its_age() {
+        // One character, for every age, and the same one for all of them.
+        let glyphs: HashSet<char> = (0..=MAX_AGE).map(glyph_for_age).collect();
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "the nine ages 0..={MAX_AGE} resolve to {glyphs:?} rather than one \
+             character, so a cell's appearance still changes as it ages"
         );
         assert_eq!(
-            bands.len(),
-            usize::from(AGE_BANDS),
-            "{AGE_BANDS} bands are declared and the ages resolve to {}, so a band \
-             is unreachable and the top of the ramp is not being drawn",
-            bands.len()
-        );
-
-        let mut expected = 0;
-        let mut previous_index = None;
-        for (index, (glyph, youngest, oldest)) in bands.iter().enumerate() {
-            assert_eq!(
-                *youngest, expected,
-                "the glyph {glyph:?} starts at age {youngest}, not {expected}, so \
-                 the ages it covers are not contiguous"
-            );
-            // At least three generations per glyph, in *every* band. 92% of a
-            // life soup is at most two generations old, so a band width that
-            // held for the long-lived cells but not for the newborns would fix
-            // the still lifes and leave the whole rest of the screen flickering.
-            assert!(
-                oldest - youngest + 1 >= 3,
-                "band {index} ({glyph:?}) covers ages {youngest} to {oldest}, which \
-                 is {} generations -- too few to read at a rate where a \
-                 generation is a fraction of a second",
-                oldest - youngest + 1
-            );
-            // Monotonic in the ramp, and the whole ramp's worth of it: first
-            // band at the sparsest entry, last band at the densest. A still life
-            // drawn at the sparse end is a field of births, which is the reading
-            // that is definitely wrong.
-            let ramp_index = AGE_GLYPHS
-                .glyphs()
-                .iter()
-                .position(|candidate| candidate == glyph)
-                .unwrap_or_else(|| panic!("{glyph:?} is not in the ramp"));
-            if let Some(previous) = previous_index {
-                assert!(
-                    ramp_index > previous,
-                    "band {index} is {glyph:?} at ramp index {ramp_index}, which \
-                     is not above the previous band's {previous}, so the glyph is \
-                     not rising with the age"
-                );
-            }
-            previous_index = Some(ramp_index);
-            expected = oldest + 1;
-        }
-        assert_eq!(expected, MAX_AGE + 1, "the bands do not cover every age");
-        assert_eq!(bands.first().map(|b| b.0), Some(AGE_GLYPHS.at(0)));
-        assert_eq!(
-            bands.last().map(|b| b.0),
-            Some(AGE_GLYPHS.at(AGE_GLYPHS.len() - 1)),
-            "the oldest band is not the densest glyph in the ramp, so a still life \
-             would be drawn as a newborn"
-        );
-
-        // And the two ends really do come out different on a live population, so
-        // the ramp is reaching the screen rather than only the table.
-        let life = draw_a_settled_population();
-        assert_ne!(
             glyph_for_age(0),
+            LIVE_GLYPH,
+            "a newborn is not drawn with the one glyph"
+        );
+        assert_eq!(
             glyph_for_age(MAX_AGE),
-            "a newborn and a settled cell are drawn with the same glyph"
+            LIVE_GLYPH,
+            "a settled cell is not drawn with the one glyph"
         );
-        let drawn: HashSet<char> = (0..=MAX_AGE).map(glyph_for_age).collect();
+
+        // On a real population, every drawn cell carries that one character.
+        let life = draw_a_settled_population();
         assert!(
-            life.cells
-                .values()
-                .all(|cell| drawn.contains(&glyph_for_age(cell.age))),
-            "a live cell was drawn with a glyph that is not in the ramp"
+            !life.cells.is_empty(),
+            "the run settled to nothing, so there is no cell to check"
         );
-    }
-
-    /// The bands divide the age range with nothing left over.
-    ///
-    /// Two things break if they do not, and neither of them is visible in the
-    /// table above. A `(MAX_AGE + 1) / AGE_BANDS` that does not divide evenly
-    /// leaves the last band shorter than the rest, or -- worse -- leaves it
-    /// empty, and an empty last band means a still life is drawn one step short
-    /// of the densest glyph in the ramp. And a band count above the ramp's length
-    /// makes `glyph_for_age` ask the ramp for an index it does not have, which it
-    /// would silently clamp, so two adjacent bands would come out the same
-    /// character and the band count would be a lie.
-    #[test]
-    fn the_bands_divide_the_age_range_and_fit_in_the_ramp() {
-        // The first two are `const _: () = assert!(..)` rather than `assert!` for
-        // the reason the crab gain has the same shape: a comparison of two
-        // constants is resolved at compile time, so an `assert!` over one is a
-        // `true` the optimiser removes, which is a warning clippy is right to
-        // raise and which cannot be read off the source. The third cannot be,
-        // because `AGE_GLYPHS` is a lazily built ramp and its length is not a
-        // constant expression.
-        const _: () = assert!((MAX_AGE + 1) % AGE_BANDS == 0);
-        const _: () = assert!(AGE_BANDS >= 2);
-
-        let bands = usize::from(AGE_BANDS);
-        assert!(
-            bands <= AGE_GLYPHS.len(),
-            "{AGE_BANDS} bands over a {}-entry ramp means at least two of them \
-             land on the same character, so the band count is a lie",
-            AGE_GLYPHS.len()
-        );
-        assert_eq!(band_width(), 3, "the bands are three generations wide");
-
-        // Every band is non-empty, and the last one is the top of the ramp.
-        for band in 0..bands {
-            let ages: Vec<u8> =
-                (0..=MAX_AGE).filter(|age| age_band(*age) == band).collect();
+        for (cell, data) in &life.cells {
+            let drawn = life.canvas.get(cell.0, cell.1);
             assert_eq!(
-                ages.len(),
-                usize::from(band_width()),
-                "band {band} covers ages {ages:?}, so the {} bands do not divide \
-                 the {} ages evenly -- the last band would come out short, or \
-                 empty, and a still life would be drawn short of the densest \
-                 glyph in the ramp",
-                AGE_BANDS,
-                MAX_AGE + 1
+                drawn.symbol, LIVE_GLYPH,
+                "the live cell at ({}, {}) is drawn {:?} rather than the one glyph",
+                cell.0, cell.1, drawn.symbol
+            );
+            assert_eq!(
+                drawn.symbol,
+                glyph_for_age(data.age),
+                "the cell at ({}, {}) is drawn {:?} but its age of {} maps to {:?}",
+                cell.0,
+                cell.1,
+                drawn.symbol,
+                data.age,
+                glyph_for_age(data.age)
+            );
+        }
+
+        // And the colour is what the age is now visible in. Different ages
+        // differ, by more than one quantisation step or the ramp is not doing a
+        // job; same ages agree exactly, or it is a per-cell value and not a
+        // function of the age.
+        assert_ne!(
+            color_for_age(0),
+            color_for_age(MAX_AGE),
+            "a newborn and a settled cell are drawn the same colour, so the age \
+             is not visible anywhere"
+        );
+        let newborn = luminance(color_for_age(0));
+        let settled = luminance(color_for_age(MAX_AGE));
+        assert!(
+            settled as i32 - newborn as i32 > 100,
+            "age 0 and age {MAX_AGE} differ by {} luminance, which is not a ramp",
+            settled as i32 - newborn as i32
+        );
+        for age in 0..=MAX_AGE {
+            assert_eq!(
+                color_for_age(age),
+                color_for_age(age),
+                "age {age} does not map to one colour"
+            );
+        }
+
+        // Both directions on a live population, which is the half a table-driven
+        // assertion cannot reach: two drawn cells of the same age are the same
+        // colour, and the population really does contain a spread of ages for
+        // the first half to be about anything.
+        let mut by_age: HashMap<u8, Vec<style::Color>> = HashMap::new();
+        for (cell, data) in &life.cells {
+            by_age
+                .entry(data.age)
+                .or_default()
+                .push(life.canvas.get(cell.0, cell.1).color);
+        }
+        assert!(
+            by_age.len() > 1,
+            "every live cell is the same age, so the colour has nothing to say"
+        );
+        for (age, colours) in &by_age {
+            assert!(
+                colours.windows(2).all(|pair| pair[0] == pair[1]),
+                "two cells of age {age} were drawn in different colours, so the \
+                 colour is not a function of the age"
             );
         }
     }
@@ -824,26 +754,36 @@ mod tests {
     /// A cell's character is held for about a second, which is the whole point
     /// of both halves of this change.
     ///
-    /// The two are one fix and neither works alone. Banding the glyph while the
-    /// simulation runs at eight generations a second holds a character for three
-    /// frames and a half, and slowing the simulation to three generations a second
-    /// while the glyph is continuous still changes every live cell's character
-    /// every third of a second. The invariant worth pinning is the product: how
-    /// long a character stays on screen.
+    /// The two are one fix and neither works alone. Holding a character while
+    /// the simulation runs at eight generations a second keeps it for three
+    /// frames and a half, and slowing the simulation while the character still
+    /// changes keeps the whole board changing every third of a second. The
+    /// invariant worth pinning is the product: how long a character stays on
+    /// screen.
     ///
     /// Stated as a duration rather than as either number on its own so that
-    /// raising the rate and narrowing the bands together cannot pass, which is
+    /// raising the rate and shortening the hold together cannot pass, which is
     /// the change that would look like an improvement to a reader of either
     /// constant alone. A third of a second is a generation; three generations is
     /// a second.
+    ///
+    /// Now that the character is constant the *character* half is unbounded --
+    /// `LIVE_GLYPH` is held for as long as the cell lives, so this measures the
+    /// rate half only, and the seconds-per-character figure is what a two-or-three
+    /// band glyph would have given. Kept in that form deliberately: it is the
+    /// number that decides whether the rate can go up again, and it is the
+    /// arithmetic a future second glyph would have to beat.
     #[test]
     fn a_character_stays_on_screen_long_enough_to_read() {
-        let seconds_per_glyph = f32::from(band_width())
-            / ConwayLifeOptions::default().generations_per_second;
+        // What a glyph that changed at a band boundary would have given.
+        const BAND_GENERATIONS: f32 = 3.0;
+        let seconds_per_glyph =
+            BAND_GENERATIONS / ConwayLifeOptions::default().generations_per_second;
         assert!(
             seconds_per_glyph >= 0.75,
-            "a character is held for {seconds_per_glyph:.2} seconds, so a cell \
-             that is not moving still flickers"
+            "a banded character is held for {seconds_per_glyph:.2} seconds, which \
+             is under the three quarters of a second a cell needs to be readable, \
+             and the rate is what has to give"
         );
         assert!(
             ConwayLifeOptions::default().generations_per_second <= 4.0,
@@ -854,29 +794,28 @@ mod tests {
         );
     }
 
-    /// A live cell that survives a generation usually keeps its character.
+    /// No live cell's character ever changes, from one generation to the next.
     ///
     /// The complaint, as a number rather than as an impression: "every frame the
     /// characters change". Measured over a settled soup, the fraction of cells
     /// that are live both before and after a generation *and* whose character
-    /// changed across it. Before the glyph was banded, that was every one of
-    /// them, every generation -- which is not a ramp reading a cell's age, it is
-    /// noise, and no rate of generation makes it watchable because the character
-    /// changes on each one.
+    /// changed across it. That was every one of them, every generation, which is
+    /// not a ramp reading a cell's age -- it is noise, and no rate of generation
+    /// makes it watchable because the character changes on each one.
     ///
-    /// With the age banded, a character only changes when a cell's age crosses a
-    /// band boundary, and at the age distribution [`MAX_AGE`] documents that is
-    /// the 14% of survivors arriving at age three and the few per cent arriving
-    /// at six. The threshold is a third rather than the measurement, so this is
-    /// about the order of magnitude and not about which cell happened to be
-    /// where.
+    /// The threshold was a third, which was about right for a glyph that changed
+    /// at band boundaries and is now wrong in the other direction. With one
+    /// character for every age the answer is not "most" or "a third" but *none*,
+    /// and asserting anything weaker would leave room for the age back in: a
+    /// banded glyph passes a third and fails zero, and zero is the only threshold
+    /// that distinguishes them. So this is now an exact count.
     ///
     /// Only *survivors*, and that is the harder half of the question rather than
     /// the easier one: a cell that dies is not a cell whose character changed, it
     /// is a cell that is gone, and counting those in would let the number be
     /// dominated by the churn at the edge of a soup.
     #[test]
-    fn most_cells_keep_their_character_from_one_generation_to_the_next() {
+    fn no_cell_changes_its_character_from_one_generation_to_the_next() {
         let options = ConwayLifeOptions {
             initial_cells: 220,
             cells_coeff: 1.0,
@@ -892,7 +831,7 @@ mod tests {
             .iter()
             .map(|(cell, data)| (*cell, glyph_for_age(data.age)))
             .collect();
-        let mut changed = 0usize;
+        let mut changed: Vec<((usize, usize), char, char)> = Vec::new();
         let mut survivors = 0usize;
         for _ in 0..100 {
             life.step_generation();
@@ -901,7 +840,7 @@ mod tests {
                 if let Some(before) = previous.get(cell) {
                     survivors += 1;
                     if before != &glyph {
-                        changed += 1;
+                        changed.push((*cell, *before, glyph));
                     }
                 }
             }
@@ -912,53 +851,64 @@ mod tests {
                 .collect();
         }
 
-        let fraction = changed as f64 / survivors.max(1) as f64;
         assert!(
-            fraction < 1.0 / 3.0,
-            "{:.0}% of the cells that survived a generation had their character \
-             changed by it, which is the effect this was meant to stop",
-            fraction * 100.0
+            survivors > 1000,
+            "only {survivors} cell-generations were compared, so this is not a \
+             measurement of a population"
+        );
+        assert!(
+            changed.is_empty(),
+            "{} of the {survivors} cells that survived a generation had their \
+             character changed by it -- the first was at ({}, {}), drawn {:?} \
+             before and {:?} after, so a cell's appearance still depends on its age",
+            changed.len(),
+            changed[0].0.0,
+            changed[0].0.1,
+            changed[0].1,
+            changed[0].2
         );
     }
 
-    /// A cell's character is held for several generations *before* the ramp runs
-    /// out -- which is the only version of that claim banding actually buys.
+    /// A long-lived cell's *colour* keeps changing, every generation, all the way
+    /// up -- which is the half of the age ramp that survived this change.
     ///
-    /// The subtlety, and the reason this test exists in this shape. A ramp that
-    /// saturates at the top already holds a character indefinitely for anything
-    /// older than [`MAX_AGE`], so "some cell holds its character for a long time"
-    /// is true of the *unbanded* code and proves nothing: measured against the
-    /// old continuous ramp, the longest run in a settled soup is over thirty
-    /// generations, entirely made of cells sitting at the top of the ramp doing
-    /// nothing. A test written that way passes against the bug it is meant to
-    /// catch.
+    /// This test used to be about how long a cell holds its *character*, and it
+    /// is worth saying why it cannot be about that any more, because it is the
+    /// clearest example in this file of a test that stopped seeing its own
+    /// subject. It measured the youngest age at which any cell held one
+    /// character for three generations. With one character for every age that
+    /// number is 2 -- a cell born at age 0 is first seen holding it once, and
+    /// reaches three at age 2 -- and so it was 2 *before* this change as well,
+    /// because the banded glyph also held ages 0, 1 and 2 constant. The
+    /// assertion passed against the code it was written for and against the code
+    /// it was written about, and tightening it to an exact zero would have made
+    /// it a second copy of
+    /// `no_cell_changes_its_character_from_one_generation_to_the_next`.
     ///
-    /// So the claim here is about the *young* end, where nearly all of the
-    /// population is. 92% of a life soup is at most two generations old, so the
-    /// first band is the band almost every cell is ever drawn from, and if it is
-    /// not a band then the picture is still a flicker. The assertion is that
-    /// some cell holds one character across all three of its first generations --
-    /// which is precisely ages 0, 1 and 2, the first band, and a claim the
-    /// continuous ramp cannot satisfy at any age below [`MAX_AGE`], because
-    /// there each of those three ages is a different character.
+    /// What is left to assert is the part that is *supposed* to keep moving: the
+    /// colour. A cell that lives twenty generations is drawn in twenty different
+    /// colours, and a ramp banded alongside the glyph would give it three. That
+    /// is the assertion, and it discriminates in both directions -- banding the
+    /// colour fails it, and a flat colour fails it -- so unlike the version it
+    /// replaces it cannot pass against whatever it is measured next to.
     ///
-    /// The cell is identified after the fact rather than placed in advance, and
-    /// that is deliberate. A block is the obvious fixture -- the one structure
-    /// Conway's rules guarantees -- and it does not survive this simulation:
-    /// `step_generation` seeds nine gliders a generation at random positions, and
-    /// a glider landing in the five-by-five box around a block is not rejected
-    /// (only the cells it *overlaps* are), so it changes the block's neighbour
-    /// counts and the block dies. A hand-placed cell in a soup is a coin flip as
-    /// well, 44% of them being one generation old. So this runs the simulation,
-    /// follows every cell, and reports the youngest age at which any cell held a
-    /// character for three generations -- which is the number the banding is
-    /// supposed to have brought down from eight.
+    /// One cell, followed across its whole life, rather than a population
+    /// average. An average cannot see a ramp that steps: a board of mostly
+    /// newborns and a few long-lived cells has a wide spread of colours whether
+    /// or not any individual cell's colour changes. Counting the distinct
+    /// colours *one* cell passes through is the direct question, and the
+    /// threshold is three rather than two because three was the number of bands
+    /// the glyph had -- a colour ramp quantised to match would land on exactly
+    /// three.
+    ///
+    /// The cell is found after the fact rather than placed in advance, for the
+    /// same reason the old version of this test ran the simulation: a block is
+    /// the obvious fixture and does not survive here, because `step_generation`
+    /// seeds nine gliders a generation at random positions and a glider landing
+    /// near a block changes its neighbour counts and kills it.
     #[test]
-    fn a_surviving_cell_keeps_its_character_for_several_generations() {
-        const HELD: usize = 3;
-        // The first band is ages 0 through this, and a cell that has reached the
-        // top of it has been drawn with one character for `HELD` generations.
-        let first_band_top = band_width() - 1;
+    fn a_long_lived_cells_colour_keeps_drifting_every_generation() {
+        const WATCHED: u8 = 6;
 
         let options = ConwayLifeOptions {
             initial_cells: 220,
@@ -970,83 +920,98 @@ mod tests {
             life.step_generation();
         }
 
-        // How many consecutive generations each cell has been live with its
-        // character unchanged. A cell that dies drops out and its run ends with
-        // it, which is the only honest way to count a run: a run across a death
-        // is a run across two different cells.
-        let mut run: HashMap<(usize, usize), usize> =
-            life.cells.keys().map(|cell| (*cell, 1)).collect();
-        let mut previous: HashMap<(usize, usize), char> = life
+        // The oldest cell in the run, followed while it ages, so there is a life
+        // long enough to watch. Re-picked every generation rather than chosen
+        // once, because the oldest cell is usually a still life that may be
+        // killed by a glider partway through.
+        let mut best = life
             .cells
             .iter()
-            .map(|(cell, data)| (*cell, glyph_for_age(data.age)))
-            .collect();
-        // The youngest age at which a cell anywhere has completed such a run,
-        // and the longest run seen at all -- the second is reported because a
-        // run that only ever happens at the top of the ramp is the failure mode
-        // this test exists to rule out, and it is worth seeing both numbers.
-        let mut youngest = u8::MAX;
-        let mut longest = 0usize;
-        for _ in 0..120 {
+            .max_by_key(|(_, data)| data.age)
+            .map(|(cell, _)| *cell)
+            .expect("the population settled to nothing");
+        let mut longest = life.cells.get(&best).map(|data| data.age).unwrap_or(0);
+        for _ in 0..200 {
             life.step_generation();
             for (cell, data) in &life.cells {
-                let glyph = glyph_for_age(data.age);
-                let held = match previous.get(cell) {
-                    Some(before) if before == &glyph => {
-                        run.get(cell).copied().unwrap_or(1) + 1
-                    }
-                    _ => 1,
-                };
-                run.insert(*cell, held);
-                if held >= HELD {
-                    youngest = youngest.min(data.age);
+                if data.age > longest {
+                    longest = data.age;
+                    best = *cell;
                 }
-                longest = longest.max(held);
             }
-            run.retain(|cell, _| life.cells.contains_key(cell));
-            previous = life
-                .cells
-                .iter()
-                .map(|(cell, data)| (*cell, glyph_for_age(data.age)))
-                .collect();
+        }
+        assert!(
+            longest >= WATCHED,
+            "the oldest cell in the run only reached age {longest}, so there is \
+             not enough of a life here to watch a colour drift across"
+        );
+
+        // Now walk that one cell from birth, counting the colours it is drawn in.
+        // Its ages are 0..=longest inclusive -- a survivor is its own age plus
+        // one -- and a continuous ramp gives a different colour at each until the
+        // palette stops resolving, so the count is bounded by the palette rather
+        // than by the number of ages.
+        let mut colours: Vec<(u8, style::Color)> = Vec::new();
+        let mut seen: HashSet<style::Color> = HashSet::new();
+        for step in 0..=longest {
+            life.cells.insert(best, LifeCell { age: step });
+            life.fill_buffer();
+            let colour = life.canvas.get(best.0, best.1).color;
+            if seen.insert(colour) {
+                colours.push((step, colour));
+            }
         }
 
         assert!(
-            youngest <= first_band_top,
-            "the youngest age at which any cell held its character for {HELD} \
-             generations was {youngest}, so no cell holds a character before the \
-             ramp saturates at {MAX_AGE} -- 92% of a life soup never gets that far \
-             and is still being redrawn every generation. The longest run \
-             anywhere was {longest}, which is the ramp sitting still at the top"
+            colours.len() > 3,
+            "a cell that lived {longest} generations was only drawn in {} distinct \
+             colours, at ages {:?} -- the colour is stepping rather than drifting",
+            colours.len(),
+            colours.iter().map(|(age, _)| *age).collect::<Vec<u8>>()
+        );
+        // And it has to be drifting *upward* in brightness, or the extra colours
+        // are noise rather than a ramp.
+        let first = colours[0];
+        let last = *colours.last().expect("at least one colour");
+        assert!(
+            luminance(last.1) as i32 - luminance(first.1) as i32 > 100,
+            "the colour went from {:?} at age {} to {:?} at age {}, which is not a \
+             ramp towards the bright end",
+            first.1,
+            first.0,
+            last.1,
+            last.0
         );
     }
 
-    /// The colour is per-cell, not one global counter for the whole screen.
+    /// The colour is read off the *canvas*, not off the age table, so a
+    /// `fill_buffer` that stopped consulting the colour would be caught.
     ///
-    /// It used to be `255 - current_gen` with `current_gen` a global counter, so
-    /// every live cell was the same green and the entire screen pulsed together
-    /// in brightness once every 255 generations -- about 32 seconds at the rate
-    /// this effect used to run at, and 85 at the one it runs at now. Two cells
-    /// of clearly different ages have to come out clearly different, or the
-    /// colour is still a clock.
+    /// That is the whole of what is new here. The claims it makes -- the colour
+    /// is per-cell rather than a global counter, and the two ends of the age
+    /// range are far enough apart in luminance to be a ramp -- are both asserted
+    /// more strictly, and against the rendered frame rather than the table, by
+    /// `every_live_cell_is_one_glyph_and_its_colour_is_its_age`. This one is
+    /// kept as the narrower statement it has always been, on a settled
+    /// population: the colour comes from the cell's age and the ramp spans it.
     ///
-    /// The colour is also the *continuous* half of the age ramp now, and that is
-    /// deliberate rather than an oversight. The glyph is banded, because a
-    /// character that changes is noticed, and a colour that changes every
-    /// generation is not: a green that creeps a shade brighter as a structure
-    /// settles reads as the structure settling, and the banding would have taken
-    /// that away for the 92% of cells that live in the first band.
+    /// Both assertions are duplicated deliberately rather than left to the
+    /// broader test. A test that only exists inside a larger one stops being read
+    /// when the larger one is rewritten, and the broader test is on its third
+    /// rewrite in this file. Small, single-claim tests are what survive that.
     #[test]
     fn a_live_cells_colour_depends_on_its_age_rather_than_a_global_clock() {
         let life = draw_a_settled_population();
 
-        let colours: HashSet<style::Color> = life
+        // Off the canvas, not off `color_for_age`, so this is a statement about
+        // what reaches the screen.
+        let drawn: HashSet<style::Color> = life
             .cells
-            .values()
-            .map(|cell| color_for_age(cell.age))
+            .keys()
+            .map(|cell| life.canvas.get(cell.0, cell.1).color)
             .collect();
         assert!(
-            colours.len() > 1,
+            drawn.len() > 1,
             "every live cell came out the same colour, so the colour is a global \
              value rather than a per-cell one"
         );
@@ -1063,7 +1028,7 @@ mod tests {
         );
     }
 
-    /// The ramp is ASCII, so it cannot shear a cell-indexed grid.
+    /// The glyph is ASCII, so it cannot shear a cell-indexed grid.
     ///
     /// The old set was thirty-two halfwidth katakana, U+FF8A and neighbours.
     /// Halfwidth katakana occupy one column in a Latin-configured terminal and
@@ -1072,8 +1037,15 @@ mod tests {
     /// double-width is not something this crate can decide without a width
     /// table, which is the other reason the replacement is ASCII: it is the one
     /// range guaranteed single-width everywhere.
+    ///
+    /// One glyph rather than a ramp, so this is now a check on a single constant
+    /// -- and that is the point of asserting it rather than trusting it. It is a
+    /// one-line constant someone will eventually "improve", and the three
+    /// properties below are the three ways that goes wrong: a box-drawing or
+    /// block character that is ambiguous-width, a control code, and a space,
+    /// which is an invisible cell in the middle of a live structure.
     #[test]
-    fn the_glyph_ramp_is_ascii_and_free_of_control_codes() {
+    fn the_live_glyph_is_ascii_visible_and_not_a_control_code() {
         for age in 0..=MAX_AGE {
             let glyph = glyph_for_age(age);
             assert!(
@@ -1090,13 +1062,15 @@ mod tests {
                 "age {age} draws a space, so the cell it marks is invisible"
             );
         }
-        for glyph in AGE_GLYPHS.glyphs() {
-            assert!(
-                glyph.is_ascii() && !glyph.is_control() && *glyph != ' ',
-                "the ramp itself contains {glyph:?} (U+{:04X})",
-                *glyph as u32
-            );
-        }
+        // Asserted on the constant rather than only through `glyph_for_age`, so
+        // that the property is about `LIVE_GLYPH` and not about a wrapper that
+        // happens to normalise it away.
+        assert_eq!(
+            LIVE_GLYPH, '@',
+            "the one live glyph is {LIVE_GLYPH:?}; `@` is the densest round ASCII \
+             character, and `O` is a hollow ring that draws a run of live cells as \
+             a lattice rather than as a population"
+        );
     }
 
     /// No cell is drawn bold.

@@ -30,12 +30,20 @@ struct Edge {
     v2: usize,
     /// The two faces this edge is shared by.
     ///
-    /// This is the whole of the hidden-line removal. A convex solid hides an
-    /// edge exactly when *both* of its faces point away, so one boolean per
-    /// face is enough: no depth sort between edges, no z-buffer, and no false
-    /// positives from an edge that happens to be nearer than the face behind
-    /// it. The old effect drew all twelve edges unconditionally, which is why
-    /// the far face's outline showed through the near one.
+    /// An edge is the *intersection* of two face planes, so these are the two
+    /// `z` values that decide how deep it is: the nearer of the two, which is
+    /// the `max`. That is a fact about the geometry rather than about
+    /// visibility -- an edge at the near corner of a face-on cube is the front
+    /// of the cube, and one at the far corner of the back face is the back of
+    /// it, and both are the intersection of exactly the planes that put them
+    /// there.
+    ///
+    /// They used to be the whole of the hidden-line removal as well: a convex
+    /// solid hides an edge exactly when *both* of its faces point away, so one
+    /// boolean per face was enough to cull the three far edges, with no depth
+    /// sort and no z-buffer. That culling is gone -- see
+    /// [`Cube::render`] -- and the faces are kept for the depth and for the
+    /// corner markers, both of which still need them.
     faces: [usize; 2],
 }
 
@@ -165,14 +173,19 @@ pub struct CubeOptions {
     /// Fill the faces, or draw the wireframe alone.
     ///
     /// **Off by default**, and the reason is a person watching the effect rather
-    /// than a measurement. Filled, the cube is a solid whose three visible faces
-    /// are dithered fields of raised dots; the edge lines are then no longer the
-    /// brightest thing on screen, because the near face's own dither runs up to
-    /// the same densities near its own edges, and the silhouette stops being a
-    /// silhouette. The wireframe is the version that reads as a cube from across
-    /// the room, which is what a screensaver has to do. The fill is kept
-    /// because it is a real alternative look and `true` still renders it; it is
-    /// simply not what a person gets without asking.
+    /// than a measurement. Filled, the cube is a solid whose three front-facing
+    /// faces are dithered fields of raised dots; the edge lines are then no
+    /// longer the brightest thing on screen, because the near face's own dither
+    /// runs up to the same densities near its own edges, and the silhouette
+    /// stops being a silhouette. The wireframe is the version that reads as a
+    /// cube from across the room, which is what a screensaver has to do. The
+    /// fill is kept because it is a real alternative look and `true` still
+    /// renders it; it is simply not what a person gets without asking.
+    ///
+    /// The default wireframe is an X-ray one: all twelve edges, with the three
+    /// behind the solid drawn dimmer rather than culled. `true` fills the three
+    /// front-facing faces and leaves the far side's edges drawn, because the
+    /// edges are the cube's outline whether or not there is a fill behind them.
     ///
     /// Pinned by `the_default_is_the_wireframe_rather_than_the_filled_cube`.
     pub filled: bool,
@@ -295,6 +308,48 @@ const EDGE_ON_EPSILON: f32 = 1.0e-3;
 /// simply reads as noise rather than as a plane.
 const MIN_FACE_DENSITY: f32 = 0.22;
 
+/// How far past the farthest front-facing face the depth ramp reaches, as a
+/// fraction of the distance on to the farthest face of any kind.
+///
+/// The reserve the far side of the cube is drawn in. See
+/// [`Cube::face_depth_range`] for why the ramp has to reach past the visible
+/// faces at all; this is how much it reaches.
+///
+/// 0.15 is a measured choice between two things pulling opposite ways, and
+/// the curve is worth more than the number. The band cannot be too small or
+/// the far side is not visibly separate from the near one; it cannot be too
+/// large or it eats the ramp the *front* side shades itself with, and a
+/// rotating wireframe whose nine near edges are all the same white is a set
+/// of lines rather than a solid. Sweeping the 200 rotations of
+/// `a_far_edge_is_dimmer_than_the_near_ones` and measuring both, in
+/// luminance out of 255:
+///
+/// ```text
+/// band   worst-pair gap: median / 5th pct    near side's own contrast
+/// 0.10          72.9 / 34.4                            68.0
+/// 0.15          91.6 / 42.3                            49.5
+/// 0.25         112.7 / 35.4                            27.4
+/// 0.35         115.2 / 29.1                            11.9
+/// 0.50          97.7 / 24.6                             5.2
+/// ```
+///
+/// The "worst pair" is the dimmest near-side edge against the brightest
+/// far-side edge, which is the pair that would be confused first. That gap
+/// peaks in the median around 0.3 and then *falls*, because past that the
+/// band is wide enough to swallow the far side's own shading and carry it up
+/// the ramp with everything else; its 5th percentile peaks here, at 0.15.
+/// Meanwhile the near side's own depth cue halves between 0.10 and 0.25 and
+/// is nearly gone by 0.35. So 0.15 is where the tail is at its worst and the
+/// front side still has 49.5 of 255 to shade itself with.
+///
+/// The residual rotations where the gap all but closes are not a bug in the
+/// number. They are the poses where a face is within a fraction of a degree
+/// of edge-on: a turned-away face that is nearly edge-on really is at almost
+/// exactly the distance of a front-facing one that is nearly edge-on, and
+/// shading those two differently would be a lie about the geometry. The
+/// measurement is written around that rather than pretending it is not there.
+const FAR_SIDE_BAND: f32 = 0.15;
+
 /// The corner marker.
 ///
 /// Ambiguous-width but not double-width, so one cell in a Latin-configured
@@ -360,6 +415,14 @@ const FACE_RAMP: &[Color] = &[
 /// *wherever it is*. An edge on the far side of the cube is still the edge, and
 /// the cube has no cue other than this to say which lines are its own outline
 /// and which are the silhouette of a face.
+///
+/// The bottom stop is the far side's, and that is the one job it does now that
+/// nothing is culled. The ramp is indexed by depth, the depth range reaches past
+/// the front-facing faces so the far side has somewhere dimmer to go
+/// ([`FAR_SIDE_BAND`]), and this is where it lands: 115 of 255 in luminance,
+/// against 255 for an edge on the nearest face. It is not a colour that has to
+/// be dim on purpose -- it is where a far edge's depth puts it, and the test
+/// that says so measures the drawn frame rather than this array.
 const EDGE_RAMP: &[Color] = &[
     Color::Rgb {
         r: 62,
@@ -908,16 +971,36 @@ impl Cube {
         }
     }
 
-    /// The depth range the ramp is normalised against: the far and near ends
-    /// of the *visible faces' own planes*.
+    /// The depth range the ramp is normalised against: the near end of the
+    /// *visible faces' own planes*, and a far end that reaches past them.
     ///
-    /// See the note in [`render`](Self::render) for why not the vertex range.
+    /// See the note in [`render`](Self::render) for why the near end is not
+    /// the nearest vertex.
+    ///
+    /// The far end is not the farthest visible face either, and that is the
+    /// whole of what makes the X-ray work. The far side of the cube is drawn
+    /// too -- there is no hidden-line removal -- so the faces pointing away
+    /// have to land somewhere *below* everything turned towards the viewer,
+    /// or the far face's outline and the two silhouette edges belonging to the
+    /// farthest front-facing face come out at the same depth and therefore at
+    /// the same colour. Measured, with the far end pinned to the farthest
+    /// visible face, that is not a subtle wash: at *every* rotation the
+    /// brightest far-side edge and the dimmest near-side edge came out
+    /// identical to within 0.1 of 255, because the farthest visible face is at
+    /// the far end of the range by construction and a far edge clamped past it
+    /// lands on the same stop.
+    ///
+    /// So the far end is pushed out to [`FAR_SIDE_BAND`] of the way to the
+    /// farthest face of any kind, which puts every hidden edge strictly below
+    /// every visible one without a second ramp, a second palette or a boolean
+    /// per edge. The near/far cue is still one linear function of `z`; the
+    /// only thing that changed is where it stops.
     ///
     /// The degenerate case is a cube viewed exactly down one of its axes, where
-    /// one face is visible and there is no depth ordering left to express. A
-    /// zero-width range would divide by zero, so the fallback is a nominal
-    /// width of two circumradii placed so the visible plane sits at the *top* of
-    /// it, which draws that face solid and bright.
+    /// one face is visible and there is no depth ordering left to express among
+    /// the visible faces. A zero-width range would divide by zero, so the
+    /// fallback is a nominal width of two circumradii placed so the visible
+    /// plane sits at the *top* of it, which draws that face solid and bright.
     ///
     /// Top rather than middle, and that is a measured decision rather than a
     /// tidy one. Centred on the plane puts the lone face at `t = 0.5`, so it
@@ -929,25 +1012,40 @@ impl Cube {
     fn face_depth_range(&self, visible: &[bool; FACES.len()]) -> (f32, f32) {
         let mut low = f32::INFINITY;
         let mut high = f32::NEG_INFINITY;
+        // The farthest face of *any* kind, which the far end is measured out
+        // towards. It is the far side's own ceiling rather than an arbitrary
+        // width, so the band the far side gets is a fraction of the real
+        // distance there is to cover however the cube happens to be turned.
+        let mut farthest = f32::NEG_INFINITY;
         for (index, face) in FACES.iter().enumerate() {
+            let z = self.face_centroid_z(face);
+            if !z.is_finite() {
+                continue;
+            }
+            farthest = farthest.max(z);
             if !visible[index] {
                 continue;
             }
-            let z = self.face_centroid_z(face);
-            if z.is_finite() {
-                low = low.min(z);
-                high = high.max(z);
+            low = low.min(z);
+            high = high.max(z);
+        }
+
+        // A convex solid always has at least one front-facing face, so `low`
+        // and `high` are finite here; the guard below is for a `NaN` rotation
+        // from a hand-edited config, not for a real pose.
+        if low.is_finite() && high.is_finite() {
+            // `-inf` (or `NaN`, if both ends went at once) collapses to zero
+            // rather than poisoning the sum below.
+            let beyond = (farthest - high).max(0.0);
+            let far = high + FAR_SIDE_BAND * beyond;
+            if far.is_finite() && far - low > 0.0 {
+                return (low, far);
             }
         }
 
-        let span = high - low;
-        let floor = 1.0e-4 * self.effective_cube_size().max(1.0e-3);
-        if low.is_finite() && span > floor {
-            return (low, high);
-        }
-
         let near = if low.is_finite() { low } else { 0.0 };
-        let width = 2.0 * self.bounding_radius().max(1.0e-3);
+        let width =
+            (1.0 + FAR_SIDE_BAND) * 2.0 * self.bounding_radius().max(1.0e-3);
         (near, near + width)
     }
 
@@ -1283,17 +1381,20 @@ impl Cube {
         }
 
         // Which faces are turned towards the viewer, decided before anything is
-        // drawn because three later steps need it: the hidden-line rule, the
-        // depth range the ramp is normalised against, and the corner markers.
+        // drawn because two later steps need it: the range the ramp is
+        // normalised against, and the corner markers.
         //
-        // No sort. Painter's algorithm would order the visible faces by depth
-        // and let each overwrite the last, which needs the faces to be
-        // disjoint; they are, but so is a maximum on depth, and a maximum does
-        // not care what order the faces arrive in -- which matters here because
-        // the braille path cannot overwrite at all. A braille cell is one
-        // glyph, so its dots only OR together, and OR is commutative. What makes
-        // the order of drawing irrelevant is the same thing that makes the
-        // result correct: only the front-facing faces contribute.
+        // It is *not* a cull list. The far side of the cube is drawn too --
+        // the effect is an X-ray wireframe, so a cube is twelve lines and not
+        // nine, and the three lines behind the solid are dimmer rather than
+        // absent. See [`FAR_SIDE_BAND`].
+        //
+        // No sort. Painter's algorithm would order the faces by depth and let
+        // each overwrite the last, which needs the faces to be disjoint; they
+        // are, but so is a maximum on depth, and a maximum does not care what
+        // order the faces arrive in -- which matters here because the braille
+        // path cannot overwrite at all. A braille cell is one glyph, so its
+        // dots only OR together, and OR is commutative.
         let mut visible = [false; FACES.len()];
         for (index, face) in FACES.iter().enumerate() {
             visible[index] = self.face_is_front_facing(face);
@@ -1322,11 +1423,16 @@ impl Cube {
         // near 42% of the ramp and the dark end of every stop is dead on
         // screen. Over the faces' own planes, three visible faces land at 0, a
         // half and 1 -- the full ramp, at every rotation.
+        //
+        // Every face gets a depth, not only the front-facing ones, and that is
+        // what lets the far side be drawn: an edge takes the `max` over the two
+        // it is shared by, so a far edge with two turned-away faces still has
+        // a depth to be drawn at. It lands below every front-facing face
+        // because the range reaches past them -- see
+        // [`face_depth_range`](Self::face_depth_range) -- so no edge has to be
+        // told apart from any other by a flag of its own.
         let mut face_depth = [NO_DEPTH; FACES.len()];
         for (index, face) in FACES.iter().enumerate() {
-            if !visible[index] {
-                continue;
-            }
             face_depth[index] =
                 quantise(self.depth_of(self.face_centroid_z(face), range));
         }
@@ -1349,7 +1455,13 @@ impl Cube {
             }
         }
 
-        // Edges, and only the ones with a front-facing face. See [`Edge::faces`].
+        // All twelve edges, always.
+        //
+        // This is the change: the far side is drawn, not culled, and the only
+        // thing telling it apart from the near side is how deep it is. The
+        // depth is the `max` over the two faces the edge is shared by, which
+        // for a far edge is the nearer of two turned-away planes and so lands
+        // in the band [`FAR_SIDE_BAND`] reserves.
         //
         // Collected first so the loop below is free to mutate the field.
         let drawn: Vec<(Point2D, Point2D, u8)> = EDGES
@@ -1361,7 +1473,6 @@ impl Cube {
                 }
                 (edge, depth)
             })
-            .filter(|(_, depth)| *depth != NO_DEPTH)
             .map(|(edge, depth)| {
                 (self.projected[edge.v1], self.projected[edge.v2], depth)
             })
@@ -1380,18 +1491,29 @@ impl Cube {
         let width = self.field.faces.width();
         let height = self.field.faces.height();
         for index in 0..self.projected.len() {
-            // A corner is marked only if something at it was drawn. All three
-            // faces meeting at a vertex can be culled -- that is what happens
-            // to the four far corners of a cube seen face-on -- and marking a
-            // corner that is behind the solid would put four white diamonds in
-            // the middle of the near face, which is the opposite of the point
-            // of a marker.
+            // A corner is marked only if a *front-facing* face meets at it,
+            // which is a narrower question than whether anything was drawn
+            // there -- now all twelve edges are, so everything is. A cube
+            // hides one corner from any viewpoint, and the three edges at that
+            // corner are behind the solid; marking it would put a white
+            // diamond in the middle of the near face at a face-on rotation,
+            // which reads as a hole rather than as a vertex. The far corner is
+            // not lost by that: the three lines meeting at it are drawn, and
+            // they are where the X-ray read comes from.
+            //
+            // The marker is also drawn in one flat white rather than at its own
+            // depth -- see [`VERTEX_COLOUR`] -- so marking a far corner would
+            // make it the *brightest* thing on screen while the edges around it
+            // recede, which is exactly backwards.
             let mut depth = NO_DEPTH;
             for edge in EDGES.iter() {
                 if edge.v1 != index && edge.v2 != index {
                     continue;
                 }
                 for face in edge.faces {
+                    if !visible[face] {
+                        continue;
+                    }
                     depth = depth.max(face_depth[face]);
                 }
             }
@@ -1638,7 +1760,7 @@ impl Cube {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// A rotation at which all six faces are turned away from edge-on.
     ///
@@ -1765,8 +1887,93 @@ mod tests {
         )
     }
 
-    /// The corners have to carry the dots of *every visible* edge that meets
-    /// there.
+    /// The luminance each edge's own cells were drawn in, tagged with which
+    /// side of the cube the edge is on.
+    ///
+    /// Only cells no *other* edge reaches. A cell two edges both cross carries
+    /// one colour for both of them, and reading it as either edge's would be
+    /// measuring the pair rather than the edge. The three far edges all meet at
+    /// the far corner, so each of them gives up a handful of cells there and
+    /// keeps the rest; the corner markers are skipped for the same reason, being
+    /// a flat white that says nothing about the edge underneath.
+    ///
+    /// An edge is drawn at one depth and so in one colour, which is asserted
+    /// here rather than assumed: a cell whose depth is a `max` over every edge
+    /// reaching it would show up as a spread, and a spread would mean the
+    /// shading is per-cell rather than per-edge.
+    ///
+    /// Which side an edge is on comes from the *geometry* -- both the faces it
+    /// is shared by turned away, or not -- and not from anything the renderer
+    /// computed, so this is a measurement of the output rather than a
+    /// restatement of the shading code. An edge with no usable cell of its own
+    /// is dropped rather than guessed at.
+    fn edge_luminances(
+        cube: &Cube,
+        diff: &[(usize, usize, Cell)],
+    ) -> Vec<(bool, f32)> {
+        let by_cell: HashMap<(usize, usize), Cell> =
+            diff.iter().map(|(x, y, cell)| ((*x, *y), *cell)).collect();
+        let projected: Vec<Point2D> = cube
+            .vertices
+            .iter()
+            .map(|v| cube.project_vertex(*v))
+            .collect();
+        let per_edge: Vec<HashSet<(i32, i32)>> = EDGES
+            .iter()
+            .map(|edge| {
+                edge_dots(&projected, edge, cube.screen_size)
+                    .into_iter()
+                    .map(|(x, y, _)| (x, y))
+                    .collect()
+            })
+            .collect();
+        let mut reachers: HashMap<(i32, i32), usize> = HashMap::new();
+        for cells in &per_edge {
+            for cell in cells {
+                *reachers.entry(*cell).or_insert(0) += 1;
+            }
+        }
+        let front: Vec<bool> = FACES
+            .iter()
+            .map(|face| cube.face_is_front_facing(face))
+            .collect();
+
+        let mut out = Vec::new();
+        for (index, cells) in per_edge.iter().enumerate() {
+            let edge = &EDGES[index];
+            let far_side = !front[edge.faces[0]] && !front[edge.faces[1]];
+            let mut lums: Vec<f32> = Vec::new();
+            for (x, y) in cells {
+                if *x < 0 || *y < 0 || reachers[&(*x, *y)] != 1 {
+                    continue;
+                }
+                let Some(cell) = by_cell.get(&(*x as usize, *y as usize)) else {
+                    continue;
+                };
+                if cell.symbol == VERTEX_GLYPH {
+                    continue;
+                }
+                lums.push(Cube::luminance(cell.color));
+            }
+            if lums.is_empty() {
+                continue;
+            }
+            let low = lums.iter().copied().fold(f32::INFINITY, f32::min);
+            let high = lums.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(
+                low,
+                high,
+                "edge {} of EDGES was drawn across {:.1} of luminance at one \
+                 rotation, so it is not one colour",
+                index,
+                high - low
+            );
+            out.push((far_side, (low + high) * 0.5));
+        }
+        out
+    }
+
+    /// The corners have to carry the dots of *every* edge that meets there.
     ///
     /// The old renderer built a fresh dot map per edge and then `set` the whole
     /// cell, so a corner cell -- the endpoint of three edges -- was written
@@ -1778,12 +1985,12 @@ mod tests {
     /// The reference is computed here rather than read out of the field, so
     /// this is a statement about the geometry and not a tautology.
     ///
-    /// Only the *visible* incident edges. A cube hides one corner from any
-    /// viewpoint and the three edges at that corner are all behind the solid,
-    /// so a reference over all twelve would demand dots that hidden-line
-    /// removal is supposed to have suppressed -- and the two properties are
-    /// asserted separately, which is the only way neither can hide behind the
-    /// other.
+    /// All three incident edges, not only the ones a front-facing face reaches.
+    /// That used to be a filter here, and it was a filter because three of the
+    /// twelve were not drawn at all; now all twelve are, and a corner is the
+    /// union of all three of its edges whether they are in front of the solid or
+    /// behind it. Dropping the filter makes the assertion strictly harder --
+    /// a bigger union to have lost something from.
     ///
     /// `vertex_markers` and `filled` are both off, and necessarily so. The
     /// marker deliberately occupies the corner cell and the face fill adds its
@@ -1806,12 +2013,6 @@ mod tests {
             .iter()
             .map(|v| cube.project_vertex(*v))
             .collect();
-        let faces: Vec<bool> = FACES
-            .iter()
-            .map(|face| cube.face_is_front_facing(face))
-            .collect();
-        let edge_is_drawn =
-            |edge: &Edge| faces[edge.faces[0]] || faces[edge.faces[1]];
 
         let mut corners_checked = 0;
         let mut full_junctions = 0;
@@ -1820,21 +2021,19 @@ mod tests {
             let incident: Vec<&Edge> = EDGES
                 .iter()
                 .filter(|edge| edge.v1 == vertex || edge.v2 == vertex)
-                .filter(|edge| edge_is_drawn(edge))
                 .collect();
-            if incident.is_empty() {
-                continue;
-            }
             if incident.len() == 3 {
                 full_junctions += 1;
             }
-            if incident.len() < 2 {
-                // A corner where only one edge is visible has nothing to merge,
-                // so the union is that one edge and the test below would be a
-                // tautology. It happens: the two corners either side of a
-                // silhouette can each have one visible edge.
-                continue;
-            }
+            // Every corner of a cube has exactly three edges meeting at it, and
+            // all three are drawn, so there is no corner here with fewer than
+            // two edges to merge.
+            assert_eq!(
+                incident.len(),
+                3,
+                "vertex {vertex} has {} edges, which is not a cube",
+                incident.len()
+            );
 
             let mut union = 0u8;
             let mut per_edge = Vec::new();
@@ -1858,7 +2057,7 @@ mod tests {
                 .iter()
                 .any(|bits| bits.count_ones() < union.count_ones())
             {
-                // The visible edges happen to raise the same dots in this cell,
+                // The three edges happen to raise the same dots in this cell,
                 // so there is nothing here for an overwrite to lose. Happens at
                 // a silhouette corner, where two edges leave within a couple of
                 // dots of each other.
@@ -1874,23 +2073,22 @@ mod tests {
             assert_eq!(
                 got & union,
                 union,
-                "vertex {vertex} at {cell:?}: its {} visible edges raise \
-                 {union:#010b} into the cell and the cell was drawn {got:#010b}, \
-                 so {:#010b} was overwritten away",
+                "vertex {vertex} at {cell:?}: its {} edges raise {union:#010b} \
+                 into the cell and the cell was drawn {got:#010b}, so {:#010b} \
+                 was overwritten away",
                 incident.len(),
                 union & !got
             );
             corners_checked += 1;
         }
-        assert!(
-            corners_checked >= 6,
-            "only {corners_checked} visible corners were on screen, so the merge \
-             is barely tested"
+        assert_eq!(
+            full_junctions, 8,
+            "a cube has three edges at each of its eight corners"
         );
         assert!(
-            full_junctions >= 1,
-            "no visible corner had all three of its edges drawn, so the three-way \
-             junction this effect is about is never tested"
+            corners_checked >= 6,
+            "only {corners_checked} corners were on screen, so the merge \
+             is barely tested"
         );
     }
 
@@ -2102,8 +2300,18 @@ mod tests {
     /// thousands, because the whole area carries dots at the near face's
     /// density.
     ///
+    /// The number in that paragraph is no longer what the wireframe leaves there,
+    /// and it is worth knowing why. The X-ray draws the far face's outline too,
+    /// and it is inside the near one, so the interior of the silhouette now
+    /// carries the far square's four edges rather than nothing -- the same
+    /// region, and about the same 240 dots, but they are *drawn on purpose* now
+    /// rather than showing through. The threshold below is 1000 and the wireframe
+    /// is far under it, so the comparison this test exists for still holds; what
+    /// changed is the reason the default is the wireframe, which is no longer
+    /// "the fill is the ugly one" so much as "the fill buries the silhouette".
+    ///
     /// `filled = true` is asked for rather than inherited, because the default is
-    /// now the wireframe and this test is about the option rather than about the
+    /// the wireframe and this test is about the option rather than about the
     /// default. `the_default_is_the_wireframe_rather_than_the_filled_cube` is the
     /// one that measures which of the two a user actually gets.
     #[test]
@@ -2135,55 +2343,57 @@ mod tests {
         );
     }
 
-    /// The drawn edge ink is exactly the union of the *visible* edges' dots.
+    /// The drawn edge ink is exactly the union of the twelve edges' dots.
     ///
-    /// Stated as an exact equality rather than as "no hidden edge drew
-    /// anything", because the looser form is not testable. A hidden edge
-    /// projects across cells that a visible edge also crosses -- at a face-on
-    /// rotation, the edge from the near bottom-left corner to the back
-    /// bottom-left corner runs along the front face's own bottom edge -- so
-    /// those cells do carry edge ink, and the assertion would have to carve out
-    /// exceptions until it tested nothing. Equality has no exceptions: the
-    /// field must be precisely the visible edges' union, which is one assertion
-    /// covering over-drawing (the old bug) and under-drawing (the other way to
-    /// get hidden-line removal wrong) at once.
+    /// Stated as an exact equality rather than as "the far edges are there",
+    /// because the looser form is not testable. The far edges project across
+    /// cells that a near edge also crosses -- at a face-on rotation, the edge
+    /// from the near bottom-left corner to the back bottom-left corner runs
+    /// along the front face's own bottom edge -- so those cells carry edge ink
+    /// from both, and a per-cell assertion would have to carve out exceptions
+    /// until it tested nothing. Equality has no exceptions: the field must be
+    /// precisely the twelve edges' union, which is one assertion covering
+    /// over-drawing (the old bug, and now the way a leftover cull would show
+    /// up) and under-drawing (the other way to get this wrong) at once.
+    ///
+    /// All twelve, and the count is asserted rather than assumed. The three far
+    /// ones used to be culled here, which is what made this test the
+    /// hidden-line-removal test; it is now the test that the far side is drawn,
+    /// and it would catch a stray `filter` as surely as the old one caught its
+    /// absence.
     ///
     /// The reference sets come from `edge_dots`, computed here.
     #[test]
-    fn the_drawn_edge_ink_is_exactly_the_visible_edges_union() {
+    fn the_drawn_edge_ink_is_exactly_the_twelve_edges_union() {
         for rotation in [(0.0f32, 0.0f32, 0.0f32), GENERIC, (0.41, 0.9, 0.55)] {
             let mut cube = placed(1.0, (200, 50));
             frame(&mut cube, rotation);
 
-            let faces: Vec<bool> = FACES
-                .iter()
-                .map(|face| cube.face_is_front_facing(face))
-                .collect();
             let projected: Vec<Point2D> = cube
                 .vertices
                 .iter()
                 .map(|v| cube.project_vertex(*v))
                 .collect();
 
-            // What the union of the visible edges should be, per cell.
+            // What the union of the twelve edges should be, per cell.
             let mut expected: std::collections::HashMap<(usize, usize), u8> =
                 std::collections::HashMap::new();
-            let mut visible_edges = 0;
+            let mut edges_with_ink = 0;
             for edge in EDGES.iter() {
-                if !faces[edge.faces[0]] && !faces[edge.faces[1]] {
-                    continue;
-                }
-                visible_edges += 1;
+                let mut raised = false;
                 for (cx, cy, bit) in edge_dots(&projected, edge, cube.screen_size) {
                     if cx < 0 || cy < 0 {
                         continue;
                     }
+                    raised = true;
                     *expected.entry((cx as usize, cy as usize)).or_insert(0) |= bit;
                 }
+                edges_with_ink += usize::from(raised);
             }
-            assert!(
-                (4..=12).contains(&visible_edges),
-                "only {visible_edges} of the twelve edges are visible at {rotation:?}, which cannot be a cube"
+            assert_eq!(
+                edges_with_ink, 12,
+                "at {rotation:?} only {edges_with_ink} of the twelve edges put \
+                 ink on the screen, so one is not being drawn"
             );
 
             let mut inked = 0;
@@ -2193,12 +2403,12 @@ mod tests {
                     let want = expected.get(&(x, y)).copied().unwrap_or(0);
                     if got != want {
                         let what = if got & !want == 0 {
-                            "an edge that should be hidden is showing through the solid"
+                            "dots were drawn that no edge raises"
                         } else {
-                            "dots from a visible edge were lost"
+                            "dots from an edge were lost"
                         };
                         panic!(
-                            "cell ({x}, {y}) at {rotation:?} has edge pattern {got:#010b}, the visible edges put {want:#010b} there -- {what}"
+                            "cell ({x}, {y}) at {rotation:?} has edge pattern {got:#010b}, the twelve edges put {want:#010b} there -- {what}"
                         );
                     }
                     inked += usize::from(got != 0);
@@ -2211,21 +2421,36 @@ mod tests {
         }
     }
 
-    /// A face-on cube shows one face, and that face's four edges.
+    /// A face-on cube shows one face, and still draws all twelve edges.
     ///
-    /// The rotation with the most to hide: the far face is entirely behind the
-    /// near one, and the old effect drew all twelve edges unconditionally --
-    /// which is where the 240 dots in `a_face_on_rotation_fills_the_near_face`
-    /// came from. They were the *back* face's outline showing through the front
-    /// one. Hidden-line removal was not a missing refinement, it was absent.
+    /// The rotation with the most to see through: the far face is entirely
+    /// behind the near one, so eight of the twelve edges are behind the solid
+    /// and this is where hidden-line removal was doing the most work -- and
+    /// where it was most visibly wrong, since a culled far face at this pose is
+    /// a cube with nothing behind it and no way to see it is turning.
     ///
-    /// Asserted on which faces and edges the rule calls visible rather than on
-    /// pixels, so it tests the rule and not one rotation's output.
+    /// Two claims, because they are two different things and either can rot on
+    /// its own. The *rule* still says one face is front-facing here, and that
+    /// is asserted on the rule rather than on pixels, because the rule is what
+    /// the depth range and the corner markers are built on and both still need
+    /// it. The *output* then has to draw all twelve edges anyway.
+    ///
+    /// The bounds and the attribute checks are here because this is the pose
+    /// that puts the most geometry in the least room: the far square is
+    /// entirely inside the near one, so a dot written past the last row or
+    /// column is at the far corner rather than out in empty space. Neither
+    /// check is new in kind -- `both_renderers_survive_every_size` and
+    /// `no_cell_is_bold` cover them generally -- but they are pinned here
+    /// against *this* configuration, so that a change which made the far side
+    /// come out bold, or write outside the canvas, could not pass on the
+    /// strength of the other two tests.
     #[test]
-    fn a_face_on_rotation_hides_the_far_face_and_its_edges() {
-        let mut cube = placed(1.0, (200, 50));
-        frame(&mut cube, (0.0, 0.0, 0.0));
+    fn a_face_on_rotation_still_draws_all_twelve_edges() {
+        let size = (200u16, 50u16);
+        let mut cube = placed(1.0, size);
+        let diff = frame(&mut cube, (0.0, 0.0, 0.0));
 
+        // The rule, first: down one of its own axes, a cube shows one face.
         let faces: Vec<bool> = FACES
             .iter()
             .map(|face| cube.face_is_front_facing(face))
@@ -2238,11 +2463,201 @@ mod tests {
         );
         assert!(faces[0], "and it is the near one, not a far face");
 
-        let visible = EDGES
+        // Eight of the twelve are behind the solid, and all eight are drawn.
+        let far_side = EDGES
             .iter()
-            .filter(|edge| faces[edge.faces[0]] || faces[edge.faces[1]])
+            .filter(|edge| !faces[edge.faces[0]] && !faces[edge.faces[1]])
             .count();
-        assert_eq!(visible, 4, "a single visible face has four edges");
+        assert_eq!(
+            far_side, 8,
+            "a cube viewed down one of its axes has eight edges behind the near \
+             face, not {far_side}"
+        );
+
+        let projected: Vec<Point2D> = cube
+            .vertices
+            .iter()
+            .map(|v| cube.project_vertex(*v))
+            .collect();
+        let mut with_ink = 0;
+        for edge in EDGES.iter() {
+            let on_screen = edge_dots(&projected, edge, cube.screen_size)
+                .into_iter()
+                .any(|(x, y, _)| x >= 0 && y >= 0);
+            with_ink += usize::from(on_screen);
+        }
+        assert_eq!(
+            with_ink, 12,
+            "at a face-on rotation only {with_ink} of the twelve edges put ink on \
+             the screen: the far face is {far_side} of them and all of it has to \
+             be there, or the cube does not read as turning"
+        );
+
+        // Bold is a brightening hint on many terminals and this frame has more
+        // colour in it than any other, so it is the place a stray `Bold` would
+        // do the most damage.
+        assert!(!diff.is_empty(), "the face-on frame drew nothing");
+        for (x, y, cell) in &diff {
+            assert_eq!(
+                cell.attr,
+                Attribute::Reset,
+                "cell ({x}, {y}) is bold at a face-on rotation, which brightens \
+                 the depth ramp into white on many terminals"
+            );
+            assert!(
+                *x < size.0 as usize && *y < size.1 as usize,
+                "cell ({x}, {y}) is outside a {size:?} screen"
+            );
+        }
+    }
+
+    /// A far edge is dimmer than the near ones, at the same rotation.
+    ///
+    /// The user's own brief, made into a measurement: "it should be a wireframe,
+    /// like an X-ray. The other side lines should also be visible", with the far
+    /// side asked for dimmer rather than identical so the cube still reads as a
+    /// solid turning in space.
+    ///
+    /// Measured on the drawn frame, not on the depth array. `edge_luminances`
+    /// reads the colours out of the diff, one per edge, using only cells that
+    /// edge has to itself, and checks each edge's colour to be constant across
+    /// its own cells -- so this cannot be satisfied by a cube that merely varies
+    /// its brightness from cell to cell, which is the obvious way for a
+    /// brightness test to pass against the thing it is about.
+    ///
+    /// Swept over 200 rotations rather than pinned to one, because the answer is
+    /// a property of the shading and any single pose measures the pose. The
+    /// statistic is the *worst* pair at each rotation -- the dimmest near-side
+    /// edge against the brightest far-side edge, which is the pair that would
+    /// fail first if the two sides could be confused. Measured: the tightest gap
+    /// over the sweep is 4.9 (at t = 0.820), the median is 91.6, the 5th
+    /// percentile is 42.3, and the best is the edge ramp's full 140.1.
+    ///
+    /// The minimum is asserted only to be positive, and that is a geometric
+    /// fact rather than a loose threshold. It is the pose where a face is
+    /// within a fraction of a degree of edge-on, and a turned-away face that is
+    /// nearly edge-on really is at almost exactly the distance of a
+    /// front-facing one that is nearly edge-on. Shading those two differently
+    /// would be a lie about the geometry, so the number is asserted to stay
+    /// small and the *typical* separation is asserted to be large.
+    ///
+    /// The last claim is the one the brief asks for by name: one ordinary
+    /// rotation, one back edge against one front edge, by a measured amount. A
+    /// sweep statistic is easy to satisfy by accident -- a ramp that is merely
+    /// *usually* ordered still has a large median -- so the headline number is a
+    /// single comparison with the figures written down, and it cannot be
+    /// reached at all if the far side is culled, because then there is no far
+    /// edge to measure.
+    #[test]
+    fn a_far_edge_is_dimmer_than_the_near_ones() {
+        let mut gaps: Vec<(f32, (f32, f32, f32))> = Vec::new();
+        let mut measured = 0usize;
+        for step in 0..200 {
+            let t = step as f32 * 0.041;
+            let mut cube = placed(1.0, (200, 50));
+            let diff = frame(&mut cube, (t, t * 1.4, t * 0.7));
+            let sides = edge_luminances(&cube, &diff);
+            let near: Vec<f32> = sides
+                .iter()
+                .filter(|(behind, _)| !*behind)
+                .map(|(_, l)| *l)
+                .collect();
+            let far: Vec<f32> = sides
+                .iter()
+                .filter(|(behind, _)| *behind)
+                .map(|(_, l)| *l)
+                .collect();
+
+            // Both sides are present at every pose, and how the twelve split is
+            // the pose's business -- nine in front and three behind from a
+            // general viewpoint, four and eight square to the viewer. An edge
+            // on neither side would be a hole in the measurement, though.
+            assert!(
+                (4..=9).contains(&near.len()) && (3..=8).contains(&far.len()),
+                "at t = {t:.3} the sweep found {} near-side and {} far-side \
+                 edges, which is not a cube seen from outside",
+                near.len(),
+                far.len()
+            );
+            measured += near.len() + far.len();
+
+            let dimmest_near = near.iter().copied().fold(f32::INFINITY, f32::min);
+            let brightest_far =
+                far.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            gaps.push((
+                dimmest_near - brightest_far,
+                (dimmest_near, brightest_far, t),
+            ));
+        }
+
+        // Not all twelve edges are measurable at every pose, and the test says
+        // so rather than quietly measuring fewer. A rotation close to edge-on
+        // projects two edges onto the same line, and then neither has a cell of
+        // its own. 2381 of the 2400 are, and the floor is well under that: what
+        // it catches is a change that makes the exclusive cells rarer, which
+        // would hollow out the measurement without any single assertion firing.
+        assert!(
+            measured >= 2300,
+            "only {measured} of the 2400 edge measurements in the sweep found a \
+             cell to themselves, so the rest were dropped and the gaps above are \
+             over a shrinking sample"
+        );
+
+        let tightest = gaps
+            .iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .expect("the sweep produced rotations");
+        assert!(
+            tightest.0 > 0.0,
+            "at t = {:.3} the brightest far-side edge is drawn at {:.1} against \
+             the dimmest near-side edge's {:.1}, so at that pose the far side is \
+             not dimmer at all",
+            tightest.1.2,
+            tightest.1.1,
+            tightest.1.0
+        );
+
+        let mut sorted: Vec<f32> = gaps.iter().map(|(gap, _)| *gap).collect();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[sorted.len() / 2];
+        let fifth = sorted[sorted.len() * 5 / 100];
+        assert!(
+            median > 80.0,
+            "the median gap between the two sides is {median:.1} of 255, so at \
+             half of all rotations the far side is not clearly dimmer"
+        );
+        assert!(
+            fifth > 30.0,
+            "the 5th-percentile gap is {fifth:.1}, so more than one rotation in \
+             twenty puts the far side within a tenth of the way to the near side"
+        );
+
+        // And the single comparison, at one ordinary rotation, with the numbers
+        // on the record. GENERIC is the rotation the geometry tests use, chosen
+        // because it is nowhere near a special pose: three faces turned towards
+        // the viewer, well spread in depth, nine edges in front and three
+        // behind. The worst pair there is the middle face's edges at 171.8
+        // against the far side's darkest ramp stop at 114.9, and the front face's
+        // own four edges are at 255 -- so the far side is 56.9 below the dimmest
+        // front edge and 140.1 below the brightest one.
+        let mut cube = placed(1.0, (200, 50));
+        let diff = frame(&mut cube, GENERIC);
+        let sides = edge_luminances(&cube, &diff);
+        let dimmest_near = sides
+            .iter()
+            .filter(|(behind, _)| !*behind)
+            .map(|(_, l)| *l)
+            .fold(f32::INFINITY, f32::min);
+        let brightest_far = sides
+            .iter()
+            .filter(|(behind, _)| *behind)
+            .map(|(_, l)| *l)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            dimmest_near - brightest_far > 40.0,
+            "at {GENERIC:?} the far side is drawn at {brightest_far:.1} against \
+             the near side's {dimmest_near:.1}, which is not a visible difference"
+        );
     }
 
     /// The corner markers are one flat colour, and it is white.
@@ -2278,6 +2693,16 @@ mod tests {
     /// corners of a cube seen face-on project into the *middle* of the near
     /// face, so a diamond appears in the middle of a flat plane and reads as a
     /// hole rather than as a vertex.
+    ///
+    /// This is the one piece of hidden-line removal the X-ray kept, and the
+    /// reason it has to stay is not the one it was written for. It is no longer
+    /// about the *edges* -- those are all drawn, and the far corner's three lines
+    /// are exactly the X-ray read. It is about the marker, and the marker is a
+    /// flat white rather than a depth-shaded one (see [`VERTEX_COLOUR`]): mark
+    /// the far corner and it becomes the *brightest* thing on screen while the
+    /// three dim lines meeting at it recede, which reads inside out. A marker
+    /// that participated in the depth ramp would be fine either way; a flat one
+    /// cannot be.
     ///
     /// Seven of eight at a generic rotation is the right answer, not eight --
     /// a solid cube hides exactly one corner from any viewpoint, which is the
@@ -2643,6 +3068,17 @@ mod tests {
 
     /// The wireframe alone has to still be a wireframe, since `filled` is a
     /// config field and a user can turn it off.
+    ///
+    /// The dot count is the interesting half now, and its threshold is the one
+    /// number in this file that moved without being rewritten. It was 250 when
+    /// the far side was culled and nine edges were drawn; the X-ray draws twelve,
+    /// so the frame carries a third more ink. The threshold is left where it is
+    /// deliberately: it is a floor on "this is a wireframe rather than a handful
+    /// of dots", not a measurement of how many edges there are, and the count of
+    /// edges is asserted exactly where it belongs -- in
+    /// `the_drawn_edge_ink_is_exactly_the_twelve_edges_union`. Raising it here to
+    /// track the change would make this test about edge count too, and it is
+    /// about something else: that `filled = false` is honoured at all.
     #[test]
     fn the_wireframe_alone_draws_edges_and_nothing_else() {
         let options = CubeOptions {
