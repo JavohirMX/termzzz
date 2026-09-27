@@ -35,6 +35,49 @@ struct AppArgs {
     shuffle: bool,
     transition: Option<f32>,
     seed: Option<u64>,
+    random_seed: bool,
+}
+
+/// A seed for `--random`, drawn from the operating system.
+///
+/// The obvious implementation is `SystemTime::now()` as a nanosecond count, and
+/// it is the wrong one twice over. It is a *clock*, so two runs started in the
+/// same millisecond get the same picture, and on a fast machine that is not
+/// hypothetical. And it increases monotonically, so consecutive runs get
+/// *adjacent* seeds, and a field built from those looks like the same picture
+/// nudged -- the opposite of what someone asking for "something different each
+/// time" wants. `random_seeds_differ_and_are_not_merely_increasing` checks the
+/// correlation rather than only the equality, because equality is the weaker
+/// claim and a clock passes it.
+///
+/// `rand::rng` is seeded from the OS and panics if that fails, which is
+/// acceptable here and worth stating rather than shrugging at: every target this
+/// builds for has a system entropy source, it cannot fail in a way a user could
+/// act on, and a screensaver refusing to start over four random bytes would be a
+/// worse outcome than a repeated picture.
+///
+/// Deliberately *not* how the effects get their randomness. Those take a seeded
+/// generator so that `--seed` reproduces a run; this is a one-shot choice of that
+/// seed, made before any effect exists.
+fn random_seed() -> u64 {
+    use rand::RngExt;
+    rand::rng().random::<u64>()
+}
+
+/// The seed this run should use, and whether to tell the user we picked.
+///
+/// Split out from `main` so the precedence is testable without a terminal. The
+/// first version of `--random` put this inline in `main`, where the only
+/// reachable test was the argument parser -- and the parser cannot see the
+/// decision, because it happens after parsing. A test that only proves `--seed`
+/// was stored somewhere proves nothing about which one wins.
+fn resolve_seed(explicit: Option<u64>, random: bool) -> (Option<u64>, bool) {
+    match (explicit, random) {
+        (Some(seed), true) => (Some(seed), true),
+        (Some(seed), false) => (Some(seed), false),
+        (None, true) => (Some(random_seed()), false),
+        (None, false) => (None, false),
+    }
 }
 
 fn main() -> Result<(), error::TermzzzError> {
@@ -55,7 +98,16 @@ fn main() -> Result<(), error::TermzzzError> {
     let (mut config, config_status) = Config::load()?;
     // Applied before anything reads an options struct, so it reaches the single
     // effect that runs as well as every entry of a playlist.
-    if let Some(seed) = args.seed {
+    // `--seed` wins over `--random`, and says so rather than quietly ignoring one
+    // of them. An explicit seed is a request to reproduce something, and a
+    // random one next to it can only be a mistake; picking the seed silently
+    // would make `--seed 1234 --random` unreproducible while appearing to honour
+    // the seed.
+    let (chosen, seed_won) = resolve_seed(args.seed, args.random_seed);
+    if seed_won {
+        eprintln!("Note: --seed wins over --random, so this run is reproducible.");
+    }
+    if let Some(seed) = chosen {
         config.override_seed(seed);
     }
     let speed = args
@@ -208,6 +260,7 @@ where
     let mut shuffle = false;
     let mut transition = None;
     let mut seed = None;
+    let mut random_seed = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -287,6 +340,9 @@ where
             "--shuffle" => {
                 shuffle = true;
             }
+            "--random" => {
+                random_seed = true;
+            }
             "--transition" => {
                 let value = args
                     .next()
@@ -322,6 +378,7 @@ where
         shuffle,
         transition,
         seed,
+        random_seed,
     })
 }
 
@@ -348,6 +405,10 @@ fn print_help() {
     );
     println!("        --playlist <LIST>    Play effects in order, comma separated");
     println!("        --shuffle            Play the playlist in random order");
+    println!(
+        "        --random             Seed this run at random, so it looks different \
+         every time"
+    );
     println!("        --transition <SECS>  Seconds of blank wipe between effects");
     println!("        --print-config       Print default config as TOML to stdout");
     println!();
@@ -436,6 +497,92 @@ mod tests {
     }
 
     #[test]
+    /// `--random` is its own flag rather than a value for `--seed`, and the two
+    /// are separate booleans in `AppArgs` so that "neither given" and "both
+    /// given" are distinguishable. That distinction is the whole of the
+    /// interaction: `--seed 1234 --random` has to keep the 1234.
+    #[test]
+    fn random_is_separate_from_seed_and_from_playlist_shuffle() {
+        let neither = parse_args_from(["matrix".to_string()].into_iter()).unwrap();
+        assert!(!neither.random_seed, "--random defaulted to on");
+        assert_eq!(neither.seed, None);
+
+        let random = parse_args_from(["--random".to_string()].into_iter()).unwrap();
+        assert!(random.random_seed);
+        assert_eq!(random.seed, None, "--random invented a seed at parse time");
+
+        // `--shuffle` is the *playlist* order and has been for a while. A flag
+        // that reseeds every effect cannot share a name with one that reorders a
+        // list, and the collision was found by trying to add it.
+        let shuffled =
+            parse_args_from(["--shuffle".to_string()].into_iter()).unwrap();
+        assert!(shuffled.shuffle, "--shuffle stopped meaning playlist order");
+        assert!(
+            !shuffled.random_seed,
+            "--shuffle started reseeding the effects, which is a different \
+             feature with a different meaning"
+        );
+
+        let both = parse_args_from(
+            [
+                "--seed".to_string(),
+                "1234".to_string(),
+                "--random".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(both.seed, Some(1234));
+        assert!(both.random_seed);
+    }
+
+    /// Which of `--seed` and `--random` wins, which is the actual decision.
+    ///
+    /// Deliberately a test of [`resolve_seed`] rather than of the parser, because
+    /// the parser cannot see this: it happens after parsing, in `main`, where the
+    /// only reachable test would be the whole binary. So the first version of this
+    /// feature had a test proving `--random` was stored in `AppArgs` and nothing
+    /// at all proving the two seeds do not both apply.
+    #[test]
+    fn an_explicit_seed_beats_the_random_one_and_says_so() {
+        assert_eq!(resolve_seed(Some(1234), true), (Some(1234), true));
+        assert_eq!(resolve_seed(Some(1234), false), (Some(1234), false));
+        assert_eq!(resolve_seed(None, false), (None, false));
+
+        // Only `--random` reaches the OS, so the seed is present and no note is
+        // printed -- there is no conflict to report.
+        let (seed, noted) = resolve_seed(None, true);
+        assert!(seed.is_some(), "--random did not produce a seed");
+        assert!(!noted, "--random alone announced a conflict with --seed");
+    }
+
+    /// A seed drawn from the OS is a seed, not a clock.
+    ///
+    /// Two runs must not agree, and more to the point they must not be
+    /// *ordered*: `SystemTime::now()` in nanoseconds increases monotonically, so
+    /// consecutive runs get adjacent seeds and a field built from them looks
+    /// like the same picture nudged. The property that catches that is
+    /// correlation between consecutive draws, not just equality.
+    #[test]
+    fn random_seeds_differ_and_are_not_merely_increasing() {
+        let draws: Vec<u64> = (0..8).map(|_| random_seed()).collect();
+        let unique: std::collections::HashSet<u64> =
+            draws.iter().copied().collect();
+        assert!(
+            unique.len() >= 7,
+            "eight draws from the OS produced only {} distinct values: {draws:?}",
+            unique.len()
+        );
+
+        let increasing = draws.windows(2).filter(|w| w[1] > w[0]).count();
+        assert!(
+            increasing < 7,
+            "{} of 7 consecutive pairs increased, which is what a monotonically \
+             increasing clock would give: {draws:?}",
+            increasing
+        );
+    }
+
     fn seed_defaults_to_none_and_rejects_nonsense() {
         let untouched =
             parse_args_from(["matrix".to_string()].into_iter()).unwrap();
