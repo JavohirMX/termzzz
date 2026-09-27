@@ -1247,18 +1247,17 @@ mod tests {
         // is the only reason this measures the picture rather than the delta.
         let mut cells: std::collections::HashMap<(usize, usize), u32> =
             Default::default();
-        let mut on_screen =
-            |cells: &std::collections::HashMap<(usize, usize), u32>| {
-                let mut dots = std::collections::HashSet::new();
-                for (&(x, y), &bits) in cells {
-                    for (i, (dx, dy)) in DOT_POS.iter().enumerate() {
-                        if bits & (1 << i) != 0 {
-                            dots.insert((x as i64 * 2 + dx, y as i64 * 4 + dy));
-                        }
+        let on_screen = |cells: &std::collections::HashMap<(usize, usize), u32>| {
+            let mut dots = std::collections::HashSet::new();
+            for (&(x, y), &bits) in cells {
+                for (i, (dx, dy)) in DOT_POS.iter().enumerate() {
+                    if bits & (1 << i) != 0 {
+                        dots.insert((x as i64 * 2 + dx, y as i64 * 4 + dy));
                     }
                 }
-                dots
-            };
+            }
+            dots
+        };
 
         let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
         let mut previous = on_screen(&cells);
