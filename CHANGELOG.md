@@ -167,6 +167,77 @@ them.
   than against a copy of the string — a copy measures the copy, and the first
   version of this test was satisfied by a pool trimmed to 16 of 54 characters.
 
+### Fixed
+#### Second pass
+A round driven by watching the effects run rather than reading them. Four of
+these were bug reports, and two of the four turned out not to be bugs at all.
+
+- **The crabs could not go up, because there was no slope.** `ground_row`
+  returned one constant row for the whole screen and every crab's `y` was
+  clamped to it, so a crab could leave the sand only by hopping. Nothing was
+  broken; the feature had never been built, and every piece of prose in the file
+  called it a *seabed*, which is what made an absence look like a fault. The
+  seabed is a seeded height profile now, the sand is filled from it to the bottom
+  of the screen, and it scrolls at exactly the rate the crabs walk so an animal
+  stays put relative to the ground under it.
+
+  Two bugs the slope exposed, both of which had been latent behind the flat
+  ground. `update` sampled the ground and *then* moved in x, so `position.1` was
+  pinned to the profile at the crab's old column. And "airborne" was a float
+  comparison against a moving sample, so on a slope a walking crab sat a
+  hundredth of a row off its own ground depending on its direction — read as
+  "in the air", and a crab walking downhill could never turn away from a
+  neighbour. The collision response was silently dead for half the colony. It is
+  an explicit flag now: the state is known, so it is stored rather than inferred
+  from a measurement.
+- **The solar system left frames behind.** `get_diff` cleared the braille grid
+  and the two per-cell arrays but never called `canvas.clear()`. `Canvas::commit`
+  *swaps* its two surfaces rather than clearing the one it hands back, so each
+  frame was painted onto whatever the surface held two frames ago. Cells inked
+  last frame and not inked now were never written as cleared, so they survived —
+  and the diff, which compares the two surfaces, never mentioned them.
+  Frame 2's diff was still *correct*, which is why the damage took three frames
+  to appear and why a two-frame regression test passed against the bug.
+- **`[terrain]` had no body.** Both the glyph and the colour were functions of
+  depth alone, so every column below its own surface drew identically and the
+  picture was one smooth vertical ramp under a slightly wavy top edge. That is
+  not a landscape and not a cross-section either; it is a gradient with a border,
+  and it is why the effect was reported as unreadable. The glyph is now a
+  two-dimensional field sampled at (column, depth) — banded, because the vertical
+  period is the shorter of the two and that is what says sediment rather than
+  static — while the colour keeps the depth shading, which is the one thing in the
+  frame that is a clean function of a single quantity.
+- **The DVD logo flickered, and the colour was not why.** The last release moved
+  the default from recolouring on every wall hit to every third, on the theory
+  that a hue change across a solid 30x7 slab is a strobe. It is a large
+  simultaneous change; it was not the flicker. The flicker is the speed: a
+  braille glyph *is* its bit pattern, so moving the logo one dot rewrites nearly
+  every cell it passes through, and at 18 cells a second that is 36 dot-steps
+  against 60 frames — a whole-logo repaint on three frames in five. The cap is
+  now 5, taken from the reference implementation's measured pace rather than
+  from a ratio, and recolouring on every bounce is the default again because wall
+  hits are eight seconds apart instead of one and a half.
+
+  The cap was 18 because of `24 * 23/30`, which holds
+  `cells_per_second * width` constant — not a quantity that means anything, and
+  explicitly not the time to cross one logo width, which would want 31. A test
+  asserted 18 while its own comment claimed to preserve something it did not.
+
+### Changed
+- **`--random`** seeds a run from the operating system, so a launch looks
+  different every time. `--seed` wins if both are given, and says so rather than
+  quietly ignoring one: an explicit seed is a request to reproduce something, and
+  picking the random one silently would make `--seed 1234 --random`
+  unreproducible while appearing to honour the seed.
+
+  It is not `--shuffle`, which has meant "play the playlist in random order" for
+  some time. A flag that reseeds every effect cannot share a name with one that
+  reorders a list; the collision was found by trying to add it.
+- **`solarsystem` no longer rotates.** `camera_speed` defaults to zero, so the
+  viewpoint is fixed and the motion is inside the system. The option is kept
+  because the swing is what makes the projected orbits change orientation, and
+  that is the 3D cue rather than a flourish.
+
 ### Known
 - **`[plasma]` does not use the whole glyph ramp.** Measured over 200 frames at
   80x24, `+` and `;` between them cover 65% of the screen, `#` appears in 93
