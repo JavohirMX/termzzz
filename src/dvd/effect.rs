@@ -1,11 +1,77 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
-use crate::render::QuadrantMask;
-use crate::render::quadrant::SAMPLES_PER_CELL;
+use crate::render::BrailleGrid;
+use crate::render::braille::{DOTS_X, DOTS_Y};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+
+/// The DVD wordmark, as a dot bitmap: 60 dots across by 28 down, which is
+/// exactly 30 by 7 terminal cells at braille's 2x4.
+///
+/// Supplied as braille art -- thirty columns of the U+2800 block, which is
+/// precisely what braille decodes to -- and transcribed here as `#` for an inked
+/// dot and `.` for a blank, one character per dot.
+///
+/// Stored as dots rather than as the braille characters it came from, for two
+/// reasons. The renderer only ever needs the dot grid, so a bitmap needs no
+/// decoding step to read. And a literal of 1680 U+28xx codepoints is a
+/// thousand glyphs that all look alike, so a typo in it is invisible in a diff
+/// and invisible in a code review; the same art as `#` and `.` reads as a
+/// picture of the shape in the source file.
+///
+/// The lower half is not damage. It is a 3D extrusion of the wordmark -- a
+/// reflection below the baseline -- and it is most of why this reads as *the*
+/// DVD logo rather than as the three letters D, V and D. Do not tidy it away.
+///
+/// This replaced a hand-invented seven-row block letter, which was wrong in the
+/// way an approximation always is: it read as `DVD` only if you were already
+/// told that is what it was. There is no `DUD` risk here -- a real wordmark
+/// does not have that failure mode -- and there is no outline-font problem
+/// either, because at 2x4 there is no longer a choice between a slab and a
+/// hairline.
+const DVD_WORDMARK: &str = "\
+.....#######################.........#################......
+.....#######################........#####################...
+.....#######################........######################..
+....########################.......########################.
+....######.....##############.....#############.....########
+....######.......############.....######.######......#######
+...#######.......############....######.#######......#######
+...######........######.######..######..######.......#######
+...######........######.######..######.#######.......#######
+...######.......#######..############..#######.......######.
+...######......#######...###########...#######.....########.
+...######....########....##########....######.....########..
+###################.....########.....##################.....
+#################.......#######......################.......
+###############.........#######......##############.........
+############.............#####.......############...........
+...........................####.............................
+...........................###..............................
+...........................##...............................
+....................#################.......................
+.......###########################################..........
+...##################################################.......
+.###########.##..###.####....####...####.....##########.....
+###############.####.####.##.####.#####.####.############...
+#############..#####.####.##.####.######.###.###########....
+..############.#####.####....####...####....##########......
+.....###############################################........
+..............#############################.................";
+
+/// Whether a logo character leaves its dot unraised.
+///
+/// A space is, because that is what the character-grid logos this replaced
+/// used, and `.` is, because that is the alphabet the wordmark is written in.
+/// Everything else is ink, which is what keeps `logo = "DVD"` -- and any
+/// config file still carrying the old block letter, a row of `█` and spaces --
+/// drawing something rather than silently becoming 60 blank dots. See
+/// [`DvdOptions::logo`].
+fn is_blank(symbol: char) -> bool {
+    symbol == ' ' || symbol == '.'
+}
 
 /// The logo's colours, in the order it cycles through them.
 ///
@@ -22,60 +88,17 @@ use serde::{Deserialize, Serialize};
 /// frame in six. It is now the deep rose, which is 4.3:1 on white and 4.8:1 on
 /// black, and it is first because a red logo is what a DVD logo should be.
 ///
-/// The default logo: a seven-row block-letter `DVD`, twenty-three cells wide.
+/// `every_colour_reads_on_a_light_and_on_a_dark_profile` enforces the band, for
+/// every entry and not only the first, because `color_index` is randomised so
+/// any of them can be the colour a run starts on.
 ///
-/// The previous default was five rows of an *outline* font, which was wrong twice
-/// over. The middle glyph was two verticals joined at the bottom, so it was a U
-/// and the logo read `DUD`. And an outline font puts every stroke on a cell
-/// boundary, so every stroke was rendered with quadrant block glyphs -- the
-/// elements least likely to be in a font -- when plain full blocks would have done.
-///
-/// So: a real V, and strokes three cells thick where the letterform allows. The
-/// `D`s are then entirely `█` and blanks, and only the `V`'s taper touches a
-/// quadrant glyph. That is the whole reason a solid-and-hollow letterform is
-/// better here than a thin one, and it is also why the interior stays legible on a
-/// terminal missing the quadrants.
-///
-/// Modelled on the wordmark in lemonyte's `dvd-screensaver`, which is the
-/// reference for this effect: a heavy, slightly forward-slanted `DVD` on black.
-/// Seven rows is about a quarter of a 24-row terminal, against the reference's
-/// logo at a sixth of its window -- a little larger, because a terminal cell is
-/// much coarser than a pixel and a logo needs to be big to survive being made of
-/// them.
-///
-/// Multi-row logos were always supported: `logo` is parsed on `\n` and the draw
-/// nests rows. So the size is a default-value change; the smoothness is not.
-const DEFAULT_LOGO: &str = "\
-███████  ███████  ███████
-███  ██  ███  ██  ██  ██
-███  ██  ███  ██  ██  ██
-███  ██  ███  ██  ██  ██
-███  ██   █████    ██  ██
-███  ██    ███     ██  ██
-███████     █      ███████";
-
-/// Whether a logo character is transparent.
-///
-/// A space is. A full block is not: with a two-tone mask the ink is the
-/// foreground and the background shows through everywhere else, so an ink glyph
-/// lights every sample it covers.
-fn is_blank(symbol: char) -> bool {
-    symbol == ' '
-}
-
-/// The colours the logo cycles through.
-///
-/// Every entry sits at relative luminance 0.17, which is what clears 3:1 against
-/// both a white and a black background -- and a terminal profile is whichever of
-/// those the user happens to run, so that band is a requirement rather than a
-/// preference. `every_colour_reads_on_a_light_and_on_a_dark_profile` enforces it.
-///
-/// Twelve rather than six, because the logo now changes colour on *every* wall
-/// bounce rather than only at corners, so consecutive colours are seen seconds
-/// apart and need to be obviously different. Six was enough when a change was a
-/// once-a-minute event. Hues are spread roughly every thirty degrees at constant
-/// luminance, which means the perceived *brightness* never jumps even though the
-/// hue always does -- varying luminance as well would read as a flash.
+/// Twelve rather than six, because consecutive colours are seen seconds apart and
+/// need to be obviously different. Six was enough when a change was a
+/// once-a-minute event, which is what a corner-only rule amounts to. Hues are
+/// spread roughly every thirty degrees at constant luminance, which means the
+/// perceived *brightness* never jumps even though the hue always does -- varying
+/// luminance as well would read as a flash, and a flash is the complaint
+/// [`ColorChange`] is now built to avoid.
 const PALETTE: [(u8, u8, u8); 12] = [
     (224, 34, 34),
     (171, 98, 26),
@@ -96,7 +119,20 @@ const DT: f64 = 1.0 / 60.0;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DvdOptions {
-    /// Logo to bounce around the screen. Use `\n` for multi-line logos.
+    /// Logo to bounce around the screen, as a dot bitmap: one character per dot.
+    ///
+    /// Rows are separated by `\n`, `#` is an inked dot and `.` is a blank, which
+    /// is the alphabet [`DVD_WORDMARK`] is written in. The default is 60 by 28
+    /// dots, so 30 by 7 cells.
+    ///
+    /// The rule is "anything that is not blank is ink" rather than "only `#` is
+    /// ink", and that is deliberate, for the sake of every config file already
+    /// on disk. `logo = "DVD"` was a legal value under the old character-grid
+    /// format and still draws as three inked dots; a row of `█` and spaces still
+    /// draws as a row of full-height strokes. A stricter alphabet would have made
+    /// both of them a field of blanks -- and per the trap in `AGENTS.md`, a
+    /// config file *is* how a user ends up pinned to whatever the default was
+    /// when they ran `--print-config`.
     pub logo: String,
     /// Base bounce speed in cells per second, along the horizontal axis.
     pub speed: f32,
@@ -115,15 +151,19 @@ pub struct DvdOptions {
     ///
     /// Was a bool meaning "on corners", and corners are almost unreachable: a
     /// corner hit needs both axes to reverse on the same frame, and the bounce
-    /// periods are `2 * max_x / vx` and `2 * max_y / vy`. At 80x24 those are 5.7
-    /// and 3.4 seconds, and they only coincide when `57m = 17n` -- first at
-    /// m = 17, n = 57, which is 97 seconds. So the logo sat at one colour for a
-    /// minute and a half at a time, which is the same as never changing.
+    /// periods are `2 * max_x / vx` and `2 * max_y / vy`. On an 80x24 terminal
+    /// with the default 30-cell logo those are 5.6 and 3.8 seconds, so the two
+    /// only coincide after 25 and 17 of them -- about 95 seconds, and a figure
+    /// that moves with the logo's width rather than being a property of anything.
+    /// The logo sat at one colour for a minute and a half, which is the same as
+    /// never changing.
     ///
     /// lemonyte's `dvd-screensaver`, which is the reference for this effect,
-    /// recolours on *every* wall hit. That is the right answer: the colour change
-    /// becomes the thing the eye tracks between bounces, and it happens every two
-    /// or three seconds rather than never.
+    /// recolours on *every* wall hit, and that is what [`ColorChange::Bounce`]
+    /// still does. It is no longer the default: with a 30-cell wordmark and a
+    /// 3D extrusion under it, a full-slab hue change every second and a half is a
+    /// strobe rather than a logo. [`ColorChange::Steady`] is the default and is
+    /// the same idea slowed by [`RECOLOR_EVERY_N_BOUNCES`].
     pub color_change: ColorChange,
     /// Start the logo from a corner instead of the middle.
     pub start_in_corner: bool,
@@ -131,17 +171,46 @@ pub struct DvdOptions {
     pub seed: u64,
 }
 
+/// How many wall hits separate two colour changes in [`ColorChange::Steady`].
+///
+/// Three, and the complaint that set the number is "it flickers". What flickers
+/// is not the logo moving -- it is the *whole* slab changing hue at once, which
+/// at 30 by 7 cells is a lot of pixels to repaint simultaneously. On an 80x24
+/// terminal a wall hit arrives roughly every 1.4 seconds, so one hue change per
+/// hit is a change every 1.4 seconds and one per three is a change every 4.3.
+///
+/// Bounce count rather than elapsed time or distance travelled, because those two
+/// are the same thing once `speed` is fixed, and neither is stable across a
+/// resize: a distance rule is throttled by time on a small terminal and not at
+/// all on a 400x200 one, where wall hits are half a minute apart and every one
+/// of them would qualify. Counting hits is one counter, it is the same fraction
+/// of the visible event on every terminal, and it makes the behaviour a pure
+/// function of state that a test can drive without a stopwatch.
+const RECOLOR_EVERY_N_BOUNCES: u32 = 3;
+
 /// When the bouncing logo changes colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorChange {
-    /// On every wall hit. What the reference implementation does, and what makes
-    /// the logo feel alive rather than inert.
+    /// Every third wall hit. The default, and the same idea as
+    /// [`ColorChange::Bounce`] without the strobe.
+    ///
+    /// A colour change still *marks a bounce*, which is the whole reason to
+    /// recolour at all: it is the thing the eye tracks between bounces. It just
+    /// does not happen on every single one.
     #[default]
+    Steady,
+    /// On every wall hit. What the reference implementation does, kept because
+    /// it is a real look and this effect is a reference implementation.
+    ///
+    /// Note the flicker, and note that it is worse now than it was: the wordmark
+    /// is 30 cells wide rather than 23 and carries a reflection underneath, so a
+    /// recolour is a larger simultaneous change than it used to be.
     Bounce,
     /// Only when both axes reverse on the same frame, which is the easter egg the
     /// reference's README jokes about -- "it could hit the corner if you look at
-    /// it long enough". True on an 80x24 screen roughly every 97 seconds.
+    /// it long enough". On an 80x24 terminal with the default logo that is about
+    /// every 95 seconds; see [`DvdOptions::color_change`], which works out why.
     Corner,
     /// Never. One colour for the whole run.
     Never,
@@ -149,12 +218,25 @@ pub enum ColorChange {
 
 impl ColorChange {
     /// Every variant, so a test can check all of them.
-    pub const ALL: &'static [ColorChange] =
-        &[ColorChange::Bounce, ColorChange::Corner, ColorChange::Never];
+    pub const ALL: &'static [ColorChange] = &[
+        ColorChange::Steady,
+        ColorChange::Bounce,
+        ColorChange::Corner,
+        ColorChange::Never,
+    ];
 
-    /// Whether a bounce of these two axes should change the colour.
-    pub fn should_change(self, hit_x: bool, hit_y: bool) -> bool {
+    /// Whether a wall hit of these two axes should change the colour.
+    ///
+    /// `wall_hits` is the caller's own running count of wall hits since the last
+    /// recolour. [`ColorChange::Steady`] gates on it and the other three ignore
+    /// it. It is a parameter rather than a field so that the rule stays a pure
+    /// function and can be checked directly, which
+    /// `the_colour_rule_is_what_each_mode_says` does.
+    pub fn should_change(self, hit_x: bool, hit_y: bool, wall_hits: u32) -> bool {
         match self {
+            ColorChange::Steady => {
+                (hit_x || hit_y) && wall_hits >= RECOLOR_EVERY_N_BOUNCES
+            }
             ColorChange::Bounce => hit_x || hit_y,
             ColorChange::Corner => hit_x && hit_y,
             ColorChange::Never => false,
@@ -170,10 +252,25 @@ impl Default for DvdOptions {
     /// that omitted a section silently zeroed it.
     fn default() -> Self {
         Self {
-            logo: String::from(DEFAULT_LOGO),
-            // 20 rather than 9. At 9 the logo covered 0.15 cells per frame, so
-            // the drawn position changed once every seven frames: still for six
-            // frames out of seven, then a jump.
+            logo: String::from(DVD_WORDMARK),
+            // 18 rather than 24, and the number is meaningless on its own: the
+            // cap is a property of the *logo*, and the logo changed.
+            //
+            // The old default was a 23-cell block letter and 24 was tuned against
+            // it. The wordmark is 30 cells wide, so the cap scales by the old
+            // width over the new: 24 * 23/30 = 18.4, rounded down. "Make it 30
+            // because the logo is 30 wide" is the tempting wrong answer, because
+            // that is a 30% speed-up and the complaint was that this effect was
+            // already too lively.
+            //
+            // Said plainly, because the arithmetic is not free: this does *not*
+            // hold the time to cross one logo width fixed. That would be 31
+            // cells a second, not 18 -- crossing 23 cells at 24 cells/s took 0.96
+            // seconds, and crossing 30 at 18 takes 1.67. What it holds fixed is
+            // cells per second against frames, which is the quantity the
+            // staircase is actually made of: 24 cells a second is 48 horizontal
+            // samples a second against 60 frames, and 18 is 36. Both are above
+            // the 30 that "more often than every other frame" needs.
             //
             // The ceiling is a property of the medium, not a taste, and it is
             // worth being precise about because the reference and this cannot
@@ -181,22 +278,20 @@ impl Default for DvdOptions {
             //
             // lemonyte's screensaver moves 50 pixels a second across a 1920-pixel
             // window, and its logo is a sixth of that window. So it crosses one
-            // logo width every 6.4 seconds. This logo is 23 cells wide, so the
-            // same feel would be 3.6 cells a second.
+            // logo width every 6.4 seconds. This logo is 30 cells wide, so the
+            // same feel would be 4.7 cells a second.
             //
-            // At 3.6 cells a second the logo's position advances 7.2 samples a
+            // At 4.7 cells a second the logo's position advances 9.4 dots a
             // second horizontally against 60 frames, so more than eight frames in
-            // ten land between sample boundaries and do not change. That is the
+            // ten land between dot boundaries and do not change. That is the
             // staircase, exactly as reported. The reference has 1920 positions to
-            // choose from; this has 160. **A terminal cannot render that feel
-            // smoothly, and the only honest trade is to be too quick rather than
-            // to stutter.**
+            // choose from; this has 160 cells * 2 dots. **A terminal cannot render
+            // that feel smoothly, and the only honest trade is to be too quick
+            // rather than to stutter.**
             //
-            // At 24 the screen changes on about 88 frames in 100, the logo crosses
-            // in 2.4 seconds, and a wall hit -- which recolours it -- comes every
-            // two to three seconds. Set `speed` in the config for calmer or
-            // brisker; below about 12 the stepping returns.
-            speed: 24.0,
+            // Set `speed` in the config for calmer or brisker; below about 12 the
+            // stepping returns.
+            speed: 18.0,
             slope: 2.0,
             color_change: ColorChange::default(),
             start_in_corner: true,
@@ -209,14 +304,22 @@ pub struct Dvd {
     screen_size: (u16, u16),
     options: DvdOptions,
     canvas: Canvas,
-    /// The logo's occupancy at 2x2 per cell. See [`QuadrantMask`].
-    mask: QuadrantMask,
+    /// The logo's dots, encoded at 2x4 per cell. See [`BrailleGrid`].
+    ///
+    /// Sized to the *logo's* bounding box in cells, not to the screen: the draw
+    /// reads straight through from the source bitmap at a sub-cell offset, so
+    /// there is nothing here for a full-screen grid to hold. At 400x200 that is
+    /// 30 by 7 cells rather than 80000.
+    grid: BrailleGrid,
+    /// The logo source, one character per dot. See [`is_blank`].
     rows: Vec<Vec<char>>,
     x: f64,
     y: f64,
     vx: f64,
     vy: f64,
     color_index: usize,
+    /// Wall hits since the last recolour. What [`ColorChange::Steady`] counts.
+    wall_hits: u32,
     rng: EffectRng,
 }
 
@@ -242,9 +345,13 @@ impl TerminalEffect for Dvd {
     fn reset(&mut self) {
         self.canvas
             .resize(self.screen_size.0.max(1), self.screen_size.1.max(1));
-        self.mask
-            .resize(self.screen_size.0 as usize, self.screen_size.1 as usize);
         self.rows = Self::parse_logo(&self.options.logo);
+        // Sized to the logo, plus the spare cell that absorbs the sub-cell skew;
+        // see `grid_w`. The logo is what changed size when this moved to braille:
+        // 60 dots across is 30 cells and 28 dots down is 7. `resize` is a no-op
+        // when the dimensions already match, so this costs nothing on the frames
+        // where they do not.
+        self.grid.resize(self.grid_w(), self.grid_h());
 
         // Reseeded rather than merely carried over: a resize is a new screen, and
         // re-rolling the corner and colour is what makes a resize feel like a
@@ -252,7 +359,7 @@ impl TerminalEffect for Dvd {
         self.rng = seeded_rng(self.options.seed, "dvd");
 
         let logo_width = self.logo_width();
-        let logo_height = self.rows.len().max(1) as f64;
+        let logo_height = self.logo_height();
         let max_x = (self.screen_size.0 as f64 - logo_width).max(0.0);
         let max_y = (self.screen_size.1 as f64 - logo_height).max(0.0);
 
@@ -275,6 +382,11 @@ impl TerminalEffect for Dvd {
             self.vy = speed / f64::from(self.options.slope).max(0.1);
         }
         self.color_index = self.rng.random_range(0..PALETTE.len());
+        // A fresh run has not bounced yet, so the first wall hit it sees is the
+        // first of its `RECOLOR_EVERY_N_BOUNCES`. Carrying the count over a
+        // resize would make the first post-resize colour depend on how long the
+        // previous run had been going.
+        self.wall_hits = 0;
     }
 }
 
@@ -285,13 +397,15 @@ impl Dvd {
         let mut effect = Self {
             screen_size,
             canvas: Canvas::new(screen_size.0, screen_size.1),
-            mask: QuadrantMask::new(screen_size.0 as usize, screen_size.1 as usize),
+            // Replaced by `reset` below; this only has to be a valid grid.
+            grid: BrailleGrid::new(1, 1),
             rows: Vec::new(),
             x: 0.0,
             y: 0.0,
             vx: 1.0,
             vy: 1.0,
             color_index: 0,
+            wall_hits: 0,
             // Replaced by `reset` below; this only has to be a valid generator.
             rng: seeded_rng(seed, "dvd"),
             options,
@@ -300,6 +414,12 @@ impl Dvd {
         effect
     }
 
+    /// The logo source as a grid of characters, one per dot.
+    ///
+    /// Blank-only rows are dropped, as they always were, which is what lets a
+    /// wordmark be written with leading and trailing blank lines. An empty logo
+    /// falls back to a single `*`, so there is always something to draw and
+    /// `logo_dot_width` is never zero.
     fn parse_logo(logo: &str) -> Vec<Vec<char>> {
         let rows: Vec<Vec<char>> = logo
             .split('\n')
@@ -314,16 +434,77 @@ impl Dvd {
         }
     }
 
+    /// The widest row of the logo, in dots.
+    fn logo_dot_width(&self) -> usize {
+        self.rows.iter().map(Vec::len).fold(0, usize::max).max(1)
+    }
+
+    /// The logo's height, in dots.
+    fn logo_dot_height(&self) -> usize {
+        self.rows.len().max(1)
+    }
+
+    /// The logo's bounding box in cells.
+    fn logo_cells_w(&self) -> usize {
+        self.logo_dot_width().div_ceil(DOTS_X)
+    }
+
+    fn logo_cells_h(&self) -> usize {
+        self.logo_dot_height().div_ceil(DOTS_Y)
+    }
+
+    /// The grid's width in cells: the logo's box plus one.
+    ///
+    /// The spare cell is what absorbs the sub-cell skew. A braille cell's two
+    /// dots sit in *one* screen cell, so a logo whose origin is an odd number of
+    /// dots across has its last column of dots pushed into the following cell --
+    /// and without the spare column that column of ink is silently clipped, on
+    /// half the frames, only at the wall.
+    ///
+    /// It is not a fudge. `x` is clamped to `max_x`, an integer number of cells,
+    /// so at the wall the origin is always a whole number of dots and the logo
+    /// never does need the spare cell there; it needs it at the skewed positions
+    /// just short of the wall, where it lands in the last real cell. The spare
+    /// cell is blank whenever the skew is zero, and the write skips blank cells,
+    /// so it costs nothing.
+    fn grid_w(&self) -> usize {
+        self.logo_cells_w() + 1
+    }
+
+    fn grid_h(&self) -> usize {
+        self.logo_cells_h() + 1
+    }
+
+    /// The logo's width in cells: dots across, rounded *up*.    ///
+    /// This is the number the bounce has to respect, and it is the thing that
+    /// stopped being a count of characters when the logo became a bitmap. A
+    /// 60-dot row is 30 cells, not 60, and rounding up rather than down is what
+    /// keeps the logo's right-hand column on screen when `x` is at `max_x` --
+    /// `the_logo_is_never_clipped_and_never_escapes` is what would catch it the
+    /// other way.
     fn logo_width(&self) -> f64 {
+        self.logo_cells_w() as f64
+    }
+
+    /// The logo's height in cells: dots down, rounded up. Seven for the wordmark.
+    fn logo_height(&self) -> f64 {
+        self.logo_cells_h() as f64
+    }
+
+    /// Whether the logo's dot at `(dot_x, dot_y)` is inked.
+    ///
+    /// Coordinates are logo-local. Outside the source is blank, which is what
+    /// clips the logo at its own bounding box.
+    fn ink_at(&self, dot_x: usize, dot_y: usize) -> bool {
         self.rows
-            .iter()
-            .map(|row| row.len() as f64)
-            .fold(0.0, f64::max)
+            .get(dot_y)
+            .and_then(|row| row.get(dot_x))
+            .is_some_and(|symbol| !is_blank(*symbol))
     }
 
     fn step(&mut self, delta: f64) {
         let logo_width = self.logo_width();
-        let logo_height = self.rows.len().max(1) as f64;
+        let logo_height = self.logo_height();
         let max_x = (self.screen_size.0 as f64 - logo_width).max(0.0);
         let max_y = (self.screen_size.1 as f64 - logo_height).max(0.0);
 
@@ -363,15 +544,40 @@ impl Dvd {
             self.vy = 0.0;
         }
 
-        if self.options.color_change.should_change(hit_x, hit_y) {
+        // Counted on every wall hit whatever the mode, so the counter means the
+        // same thing to `Steady` as it does to a test reading it. Saturating,
+        // because `Never` never resets it: at 60 wall hits a second that is a
+        // quarter of a million years, but a debug build panics on the overflow
+        // rather than wrapping, and a screensaver is exactly the thing that
+        // nobody closes.
+        if hit_x || hit_y {
+            self.wall_hits = self.wall_hits.saturating_add(1);
+        }
+
+        if self
+            .options
+            .color_change
+            .should_change(hit_x, hit_y, self.wall_hits)
+        {
             self.color_index = (self.color_index + 1) % PALETTE.len();
+            self.wall_hits = 0;
         }
     }
 
     /// Draws the logo at its current position into the canvas.
-    /// Draws the logo at its current position into the canvas.
     ///
-    /// Drawn into a [`QuadrantMask`] rather than straight onto the canvas.
+    /// Sampled *through* a [`BrailleGrid`] rather than rasterised into one, and
+    /// that direction is the point. The logo moves at a sub-cell rate, so for
+    /// each cell of the grid and each of its eight dots the source is asked
+    /// whether *that* dot is inked, at the position the logo has actually
+    /// reached. Writing the logo into a screen-sized grid first and encoding
+    /// that grid works at whole-cell positions and nowhere else.
+    ///
+    /// The offset convention is the one the quadrant renderer used, and getting it
+    /// wrong is the classic bug here because the failure is quiet: `left` and
+    /// `top` are the *screen dot* positions of the logo's origin, and source dot
+    /// `(i, j)` lands at `origin + (i, j)`. Round the same way in both places or
+    /// the logo jitters against the position `step` reports.
     ///
     /// The old version did `self.x as usize` and `self.y as usize` at the top of
     /// its loops, which threw away every sub-cell part of the position `step` had
@@ -380,51 +586,109 @@ impl Dvd {
     /// the logo sat perfectly still for six frames out of seven and then jumped a
     /// whole cell diagonally. That is the "laggy, like stairs" report.
     ///
-    /// Half-block was tried first and is not enough. It gives 2x vertically, which
-    /// halves the steps on that axis, but the horizontal stays at one sample per
-    /// cell -- and a cell has one foreground and one background, so a vertical
-    /// split spends both and the two cannot be combined. The quadrant block
-    /// elements are the glyphs that split a cell both ways at once, and this is the
-    /// only renderer in the crate that places a shape at 2x on both axes.
+    /// Why braille, given quadrant was here first and is still in the crate.
+    /// Quadrant spends a cell's foreground *and* its background on a two-tone
+    /// split, so every edge cell pays an `ESC[48;2;r;g;b` on the wire and paints
+    /// its un-inked half solid black -- which is also why the old logo was
+    /// invisible against anything but a black terminal. The DVD wordmark is one
+    /// flat colour, because a logo is a silhouette and not a gradient, so that
+    /// second colour was buying nothing at all. Braille trades it for 2x across
+    /// and 4x down rather than 2x and 2x, and an unraised dot leaves the
+    /// terminal's own background showing through the logo's gaps.
     fn draw(&mut self) -> Vec<(usize, usize, Cell)> {
         let (r, g, b) = PALETTE[self.color_index % PALETTE.len()];
         let ink = style::Color::Rgb { r, g, b };
-        let background = style::Color::Rgb { r: 0, g: 0, b: 0 };
 
-        self.mask.clear();
-        // The mask renderer only writes cells that have ink, so the canvas has to
-        // be cleared here or the previous frame's logo stays on screen and the two
+        self.grid.clear();
+        // The grid is only as big as the logo, so the canvas still has to be
+        // cleared here or the previous frame's logo stays on screen and the two
         // smear into each other.
         self.canvas.clear();
 
-        // Both axes in field samples, so the sub-cell part of the position is
-        // drawn rather than discarded.
-        let left = (self.x * SAMPLES_PER_CELL as f64).floor().max(0.0) as usize;
-        let top = (self.y * SAMPLES_PER_CELL as f64).floor().max(0.0) as usize;
-        for (row_index, row) in self.rows.iter().enumerate() {
-            for (offset, symbol) in row.iter().enumerate() {
-                if is_blank(*symbol) {
+        // Position in dots, not cells, so the sub-cell part of the position is
+        // drawn rather than discarded. A different multiplier per axis, on
+        // purpose: braille is 2 across and 4 down, and one constant for both is
+        // how the vertical resolution gets thrown away.
+        let left = (self.x * DOTS_X as f64).floor().max(0.0) as usize;
+        let top = (self.y * DOTS_Y as f64).floor().max(0.0) as usize;
+        self.paint_at(left, top);
+
+        // The grid's origin is the logo's origin in cells. `left` is already a
+        // whole number of dots, so this is the screen cell holding the logo's
+        // first dot -- and when the origin is skewed the logo's *last* dot is one
+        // cell further on, which is what the spare cell in `grid_w` is for.
+        let left_cell = left / DOTS_X;
+        let top_cell = top / DOTS_Y;
+        for cell_y in 0..self.grid.height() {
+            let y = top_cell + cell_y;
+            if y >= self.canvas.height() {
+                break;
+            }
+            for cell_x in 0..self.grid.width() {
+                // Only cells with ink are written. A blank braille cell is a
+                // space, and painting one would cost a byte and erase whatever
+                // the terminal's background is showing there -- which is what
+                // lets `[global] background` show through the wordmark's gaps.
+                let symbol = self.grid.cell_char(cell_x, cell_y);
+                if symbol == ' ' {
                     continue;
                 }
-                for dy in 0..SAMPLES_PER_CELL {
-                    for dx in 0..SAMPLES_PER_CELL {
-                        self.mask.set(
-                            left + offset * SAMPLES_PER_CELL + dx,
-                            top + row_index * SAMPLES_PER_CELL + dy,
-                            true,
+                let x = left_cell + cell_x;
+                if x >= self.canvas.width() {
+                    continue;
+                }
+                self.canvas.set(
+                    x,
+                    y,
+                    Cell::new(symbol, ink, style::Attribute::Reset),
+                );
+            }
+        }
+        self.canvas.commit()
+    }
+
+    /// Raises the logo's dots into `self.grid`, with the logo's top-left dot at
+    /// screen dot `(left, top)`.
+    ///
+    /// The grid is indexed by *screen* cell relative to the logo's own cell, not
+    /// by the logo's dot, and the difference is the whole sub-cell offset. A
+    /// braille cell's two dots live in one screen cell, so a logo whose origin
+    /// falls on an odd dot is straddling a cell boundary: its last column of dots
+    /// belongs to the *next* screen cell. Sampling the logo with
+    /// `left + cell_x * DOTS_X + dx` instead -- which is the obvious transcription
+    /// and what this did first -- indexes the source with a screen coordinate and
+    /// therefore misses the logo entirely once `left` exceeds its width, drawing
+    /// nothing at all.
+    ///
+    /// So the source index is the grid's own dot position less the skew: `left % 2`
+    /// across and `top % 4` down, each handled as a signed offset so a negative
+    /// result is blank rather than a huge `usize`. `the_logo_is_sampled_at_its
+    /// _sub_cell_offset` is what catches getting this wrong.
+    ///
+    /// The loop runs over the grid, which is the logo's box plus one cell, and not
+    /// over the terminal: 31 by 8 cells rather than 400 by 200.
+    fn paint_at(&mut self, left: usize, top: usize) {
+        let skew_x = (left % DOTS_X) as isize;
+        let skew_y = (top % DOTS_Y) as isize;
+
+        for cell_y in 0..self.grid.height() {
+            for cell_x in 0..self.grid.width() {
+                for dy in 0..DOTS_Y {
+                    for dx in 0..DOTS_X {
+                        let dot_x = (cell_x * DOTS_X + dx) as isize - skew_x;
+                        let dot_y = (cell_y * DOTS_Y + dy) as isize - skew_y;
+                        let raised = dot_x >= 0
+                            && dot_y >= 0
+                            && self.ink_at(dot_x as usize, dot_y as usize);
+                        self.grid.set_dot(
+                            cell_x * DOTS_X + dx,
+                            cell_y * DOTS_Y + dy,
+                            raised,
                         );
                     }
                 }
             }
         }
-
-        self.mask.write_to(
-            &mut self.canvas,
-            ink,
-            background,
-            style::Attribute::Reset,
-        );
-        self.canvas.commit()
     }
 }
 
@@ -553,12 +817,21 @@ mod tests {
         assert_eq!(effect.rows, vec![vec!['*']]);
     }
 
+    /// The logo is a bitmap, so its width in cells is a rounding of its width in
+    /// dots, and the bounce has to respect the cell count.
+    ///
+    /// `options()` gives a three-*dot* logo, which is two cells across at 2 dots
+    /// to the cell -- not three. An earlier version of this assertion said
+    /// `20 - 3`, which was right when a character was a cell and is one cell too
+    /// loose now, so a test like this cannot be left asserting a number from the
+    /// old coordinate system.
     #[test]
     fn stays_within_bounds_while_bouncing() {
         let mut effect = Dvd::new(options(), (20, 8));
+        assert_eq!(effect.logo_width(), 2.0, "three dots is two cells");
         for _ in 0..600 {
             effect.step(1.0 / 60.0);
-            assert!(effect.x >= 0.0 && effect.x <= (20 - 3) as f64);
+            assert!(effect.x >= 0.0 && effect.x <= (20 - 2) as f64);
             assert!(effect.y >= 0.0 && effect.y <= (8 - 1) as f64);
         }
     }
@@ -576,20 +849,27 @@ mod tests {
         }
     }
 
-    /// Every wall hit has to change the colour.
+    /// Every wall hit has to change the colour, in [`ColorChange::Bounce`].
     ///
-    /// This is the reference implementation's behaviour and it is the difference
-    /// between a logo that feels alive and one that is inert. The previous option
-    /// was `corner_color_change`, and corners are almost unreachable: a corner
-    /// needs both axes to reverse on the same frame, and the bounce periods are
-    /// `2 * max_x / vx` and `2 * max_y / vy`. On an 80x24 screen those are 5.7
-    /// and 3.4 seconds and only coincide when `57m = 17n` -- first at m = 17,
-    /// n = 57, which is 97 seconds. So the logo sat at one colour for a minute and
-    /// a half, which is the same as never changing.
+    /// This is the reference implementation's behaviour, and it is a real look
+    /// that `Bounce` still offers. It is no longer the default -- see
+    /// `the_colour_changes_far_less_often_than_the_logo_bounces` -- so this test
+    /// pins the mode rather than the default.
     ///
-    /// This test is measured over a long enough run that the old corner-only
-    /// behaviour would have had many opportunities to fire and still fails,
-    /// because on these dimensions it needs about 97 seconds and this runs 10.
+    /// The previous option was `corner_color_change`, and corners are almost
+    /// unreachable: a corner needs both axes to reverse on the same frame, and the
+    /// bounce periods are `2 * max_x / vx` and `2 * max_y / vy`. This uses the
+    /// three-*dot* `options()` logo rather than the wordmark, so `max_x` is 78 and
+    /// `max_y` is 23 and the periods are 8.7 and 5.1 seconds -- the two only
+    /// coincide after 39 and 23 of them, which is over three minutes. So
+    /// corner-only was the same as never changing.
+    ///
+    /// The run is 1800 frames rather than 600 because a wall hit is rarer than it
+    /// used to be: the cap came down from 24 to 18 cells a second (see
+    /// `DvdOptions::default`) and a wall hit is a traversal, so ten seconds now
+    /// buys three of them rather than four. Thirty seconds buys about nine, which
+    /// clears the bound with room, and is still two orders of magnitude short of
+    /// what a corner needs -- so the test would still fail against corner-only.
     #[test]
     fn every_wall_hit_changes_the_colour() {
         let mut effect = Dvd::new(
@@ -602,7 +882,7 @@ mod tests {
         let initial = effect.color_index;
 
         let mut changes = 0usize;
-        for _ in 0..600 {
+        for _ in 0..1800 {
             effect.step(1.0 / 60.0);
             if effect.color_index != initial {
                 changes += 1;
@@ -611,11 +891,127 @@ mod tests {
 
         assert!(
             changes >= 3,
-            "the colour changed {changes} times in ten seconds of bouncing, so the \
-             logo is effectively one colour. A wall hit every two or three seconds \
-             is what makes this read as motion rather than as a still image \
-             drifting."
+            "the colour changed {changes} times in thirty seconds of bouncing, so \
+             the logo is effectively one colour. A wall hit every few seconds is \
+             what makes this read as motion rather than as a still image drifting."
         );
+    }
+
+    /// The flicker count, and the actual answer to "it flickers".
+    ///
+    /// What flickers is not the logo moving. It is the *whole* slab changing hue
+    /// at once: at 30 by 7 cells, a recolour is a large simultaneous change, and
+    /// the reference implementation does one of them on every single wall hit --
+    /// about every 1.4 seconds on an 80x24 terminal. The old default was
+    /// [`ColorChange::Bounce`], so that was roughly 0.7 changes a second.
+    ///
+    /// This measures the change rate directly, over a fixed number of bounces
+    /// rather than a fixed number of seconds, so it is a fraction and not a rate
+    /// that moves with the terminal size. It is also a count of *distinct*
+    /// changes rather than frames on which the colour differed, so a palette
+    /// cycle that wrapped back to where it started cannot flatter it.
+    ///
+    /// `RECOLOR_EVERY_N_BOUNCES` is 3, so the true value is a third. The bound
+    /// here is half, to leave room for the first and last partial group and to
+    /// state the requirement as "well below" rather than restating the constant.
+    #[test]
+    fn the_colour_changes_far_less_often_than_the_logo_bounces() {
+        let mut effect = Dvd::new(DvdOptions::default(), (80, 24));
+        assert_eq!(
+            effect.options.color_change,
+            ColorChange::Steady,
+            "the default has to be the quiet one for this to mean anything"
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut previous = effect.color_index;
+        seen.insert(previous);
+        let mut bounces = 0u32;
+        let mut changes = 0usize;
+
+        // Stop on a bounce count rather than a frame count, so the run is the
+        // same measurement whatever the speed and the screen are.
+        //
+        // A wall hit is detected by the velocity reversing, not by the position
+        // standing still. `step` clamps the position to the wall, so on the frame
+        // of a bounce the position has still moved by the overshoot -- a tenth of
+        // a cell or so -- and a "did not move" test misses every single bounce.
+        // Only the velocity is a clean signal, because `step` changes it if and
+        // only if it clamped.
+        while bounces < 90 {
+            let (vx, vy) = (effect.vx, effect.vy);
+            effect.step(1.0 / 60.0);
+            if effect.vx != vx || effect.vy != vy {
+                bounces += 1;
+            }
+            if effect.color_index != previous {
+                previous = effect.color_index;
+                changes += 1;
+                seen.insert(effect.color_index);
+            }
+        }
+
+        assert!(
+            bounces >= 90,
+            "only saw {bounces} wall hits, so the simulation never got going"
+        );
+        assert!(
+            (changes as u32) * 2 <= bounces,
+            "{changes} colour changes over {bounces} wall hits is not 'far less \
+             often' than bouncing, and a full-slab hue change that often is the \
+             flicker"
+        );
+        // A sanity floor as well as a ceiling. A rate of zero would satisfy the
+        // bound above and is the other failure: the logo would be one colour for
+        // the whole run, which is what the old corner-only rule was.
+        assert!(
+            changes >= 3,
+            "only {changes} colour changes over {bounces} wall hits, so the logo \
+             is effectively one colour"
+        );
+        assert!(
+            seen.len() > 1 && seen.len() <= PALETTE.len(),
+            "{} distinct colours seen, which is not a rotation of the palette",
+            seen.len()
+        );
+    }
+
+    /// [`ColorChange::Bounce`] has to keep changing on *every* hit, or the
+    /// contrast with [`ColorChange::Steady`] is not a contrast.
+    ///
+    /// The same simulation as above, one mode over.
+    #[test]
+    fn the_reference_mode_changes_on_every_bounce() {
+        let mut effect = Dvd::new(
+            DvdOptions {
+                color_change: ColorChange::Bounce,
+                ..DvdOptions::default()
+            },
+            (80, 24),
+        );
+        let initial = effect.color_index;
+        let mut bounces = 0u32;
+        let mut changes = 0usize;
+        let mut previous = initial;
+
+        while bounces < 90 {
+            let (vx, vy) = (effect.vx, effect.vy);
+            effect.step(1.0 / 60.0);
+            if effect.vx != vx || effect.vy != vy {
+                bounces += 1;
+            }
+            if effect.color_index != previous {
+                previous = effect.color_index;
+                changes += 1;
+            }
+        }
+
+        assert_eq!(
+            changes, bounces as usize,
+            "Bounce mode changed the colour on {changes} of {bounces} wall hits; it \
+             is meant to be every one of them"
+        );
+        assert_ne!(initial, 0, "unreachable, but keeps `initial` read");
     }
 
     /// The corner mode has to stay available, because it is the easter egg.
@@ -637,23 +1033,22 @@ mod tests {
             let initial = effect.color_index;
             let mut changes = 0usize;
             let mut bounces = 0usize;
-            let mut previous = (effect.x, effect.y);
 
             for _ in 0..20_000 {
-                let before = (effect.x, effect.y);
+                // A wall hit is a velocity reversing, not a position standing
+                // still: `step` clamps the position to the wall, so the position
+                // has still moved by the overshoot on the frame of a bounce and a
+                // "did not move" test misses them all.
+                let (vx, vy) = (effect.vx, effect.vy);
                 effect.step(1.0 / 60.0);
-                let reversed = (effect.x - before.0).abs() < 1e-9
-                    || (effect.y - before.1).abs() < 1e-9;
-                if reversed {
+                if effect.vx != vx || effect.vy != vy {
                     bounces += 1;
                 }
                 if effect.color_index != initial {
                     changes += 1;
                     effect.color_index = initial;
                 }
-                previous = (effect.x, effect.y);
             }
-            let _ = previous;
 
             assert!(
                 bounces > changes,
@@ -681,21 +1076,43 @@ mod tests {
         }
     }
 
-    /// The rule itself, for all three modes, without a simulation in the way.
+    /// The rule itself, for all four modes, without a simulation in the way.
+    ///
+    /// The third argument is the running count of wall hits since the last
+    /// recolour, and only [`ColorChange::Steady`] reads it. The `wall_hits` values
+    /// are swept from zero past the gate, so the boundary itself is pinned rather
+    /// than assumed, and the modes that ignore the counter are checked at every
+    /// one of them -- which is the whole difference between `Bounce` and `Steady`.
     #[test]
     fn the_colour_rule_is_what_each_mode_says() {
-        assert!(ColorChange::Bounce.should_change(true, false));
-        assert!(ColorChange::Bounce.should_change(false, true));
-        assert!(ColorChange::Bounce.should_change(true, true));
-        assert!(!ColorChange::Bounce.should_change(false, false));
+        for wall_hits in 0..=RECOLOR_EVERY_N_BOUNCES + 3 {
+            // The reference mode ignores the counter entirely, which is the whole
+            // difference between it and the default.
+            for (hit_x, hit_y) in [(true, false), (false, true), (true, true)] {
+                assert!(ColorChange::Bounce.should_change(hit_x, hit_y, wall_hits));
+            }
+            assert!(!ColorChange::Bounce.should_change(false, false, wall_hits));
 
-        assert!(!ColorChange::Corner.should_change(true, false));
-        assert!(!ColorChange::Corner.should_change(false, true));
-        assert!(ColorChange::Corner.should_change(true, true));
-        assert!(!ColorChange::Corner.should_change(false, false));
+            assert!(!ColorChange::Corner.should_change(true, false, wall_hits));
+            assert!(!ColorChange::Corner.should_change(false, true, wall_hits));
+            assert!(ColorChange::Corner.should_change(true, true, wall_hits));
+            assert!(!ColorChange::Corner.should_change(false, false, wall_hits));
 
-        for (hit_x, hit_y) in [(true, false), (false, true), (true, true)] {
-            assert!(!ColorChange::Never.should_change(hit_x, hit_y));
+            for (hit_x, hit_y) in [(true, false), (false, true), (true, true)] {
+                assert!(!ColorChange::Never.should_change(hit_x, hit_y, wall_hits));
+            }
+
+            // The gate: a wall hit that came too early is dropped, and a frame
+            // that was not a wall hit is dropped whatever the count says.
+            let expected = wall_hits >= RECOLOR_EVERY_N_BOUNCES;
+            for (hit_x, hit_y) in [(true, false), (false, true), (true, true)] {
+                assert_eq!(
+                    ColorChange::Steady.should_change(hit_x, hit_y, wall_hits),
+                    expected,
+                    "a wall hit at {wall_hits} wall hits since the last change"
+                );
+            }
+            assert!(!ColorChange::Steady.should_change(false, false, wall_hits));
         }
     }
 
@@ -749,11 +1166,15 @@ mod tests {
     /// glyph inside it moves every frame. A version of this test did exactly that
     /// and reported 280 of 600 while the screen was in fact changing 545 times.
     ///
-    /// The bound is 500 rather than 600 because 2x resolution caps it. At 26 cells
-    /// per second the horizontal position advances 52 samples a second and the
-    /// vertical 26, against 60 frames, so a handful of frames land between sample
-    /// boundaries and genuinely cannot show movement. Reaching every frame needs
-    /// braille's 4x, which would turn a solid block letter into a field of dots.
+    /// The bound is 500 rather than 600 because the sub-cell resolution caps it,
+    /// and it is close: at 18 cells a second the horizontal origin advances 36
+    /// dots a second and the vertical 36, against 60 frames, so a frame changes the
+    /// picture if *either* axis crosses a dot boundary. That is 0.6 of a chance
+    /// each, and 1 - 0.4 * 0.4 = 0.84 -- which is 504 of 600, and the measurement
+    /// is 503. The bound is the one number here that is genuinely tight, and it is
+    /// tight for a reason worth stating: the horizontal is still 2 dots to the cell,
+    /// because a cell has one foreground and one background and a vertical split
+    /// spends both. Only the vertical went from 2 to 4.
     #[test]
     fn the_picture_changes_on_almost_every_frame() {
         let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
@@ -796,66 +1217,394 @@ mod tests {
 
     /// The vertical position has to resolve finer than a whole cell.
     ///
-    /// Half-block was the first attempt and is not enough: it gives 2x vertically
-    /// but the horizontal stays at one sample per cell. This pins the axis that a
-    /// half-block renderer would have fixed, and the next test pins the one it
-    /// would not.
+    /// Half-block was the first attempt and gave 2x vertically; quadrant gave 2x
+    /// as well; braille gives 4x. This pins the axis, and it is the axis the
+    /// *other* renderers could not improve: horizontally everything in the crate
+    /// is 2x, because a cell has one foreground and one background and a vertical
+    /// split spends both.
     #[test]
     fn the_vertical_position_resolves_finer_than_a_cell() {
         let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
-        let mut samples = std::collections::BTreeSet::new();
+        let mut dots = std::collections::BTreeSet::new();
         let mut cells = std::collections::BTreeSet::new();
         for _ in 0..60 {
             dvd.update();
-            samples.insert((dvd.y * SAMPLES_PER_CELL as f64).floor() as i64);
+            dots.insert((dvd.y * DOTS_Y as f64).floor() as i64);
             cells.insert(dvd.y.floor() as i64);
         }
         // The ratio, not an absolute count: the absolute number moves with the
         // speed and the terminal size, and a threshold on it is a threshold on the
-        // wrong thing. Two samples per cell means the drawn positions must
-        // outnumber the cell positions by close to two to one.
-        let ratio = samples.len() as f32 / cells.len().max(1) as f32;
+        // wrong thing. Four dots per cell means the drawn positions must
+        // outnumber the cell positions by close to four to one. The bound is 3.5
+        // rather than 4 because the ratio is a ratio of two *distinct* counts over
+        // a finite window, and a bounce can make the two agree by coincidence.
+        let ratio = dots.len() as f32 / cells.len().max(1) as f32;
         assert!(
-            ratio > 1.8,
+            ratio > 3.5,
             "{} distinct drawn vertical positions against {} at whole-cell \
              resolution, a ratio of {ratio:.2}, so the sub-cell vertical motion \
              is not being drawn",
-            samples.len(),
+            dots.len(),
             cells.len()
         );
     }
 
-    /// The logo has to be big.
+    /// The wordmark literal, checked as a literal.
+    ///
+    /// 1680 characters of `#` and `.` is a shape no eye can check and no review
+    /// will read, so the dimensions are asserted instead: a mistyped row is a row
+    /// of the wrong length, and one dropped row is one row fewer. Both are
+    /// invisible in a diff and both are fatal here, because a short row silently
+    /// truncates the logo's right-hand side rather than failing.
+    #[test]
+    fn the_wordmark_is_sixty_dots_by_twenty_eight() {
+        let rows: Vec<&str> = DVD_WORDMARK.split('\n').collect();
+        assert_eq!(
+            rows.len(),
+            28,
+            "the wordmark is {} rows, not 28",
+            rows.len()
+        );
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.chars().count(),
+                60,
+                "row {index} is {} dots wide, not 60: {row:?}",
+                row.chars().count()
+            );
+        }
+        // And nothing else is in there. A stray character would be read as ink,
+        // so a stray space would put a hole in the logo and a stray letter would
+        // put a lump in it, both without a word about it.
+        let alphabet: std::collections::BTreeSet<char> =
+            DVD_WORDMARK.chars().filter(|c| *c != '\n').collect();
+        assert_eq!(
+            alphabet,
+            ['#', '.'].into_iter().collect(),
+            "the wordmark alphabet is {alphabet:?}, not `#` and `.`"
+        );
+    }
+
+    /// The wordmark has to be letters, not a slab and not nothing.
+    ///
+    /// A cheap structural guard on a literal, and the numbers are checked as a
+    /// *band* rather than as an exact count: 1004 of 1680 dots is 0.60, which is
+    /// about right for a heavy wordmark with a reflection under it -- the two
+    /// together are mostly ink, and the gaps are inside the counters of the D and
+    /// the V and between the letters. A band of 0.35 to 0.80 catches the two
+    /// failures that matter, which are a truncated row (coverage collapses) and a
+    /// transposed one (coverage stays plausible but the shape is wrong, which no
+    /// coverage test can see -- the round-trip test below is what covers that).
+    #[test]
+    fn the_wordmark_is_neither_blank_nor_a_solid_slab() {
+        let total: usize = DVD_WORDMARK.chars().filter(|c| *c != '\n').count();
+        let ink = DVD_WORDMARK.chars().filter(|c| *c == '#').count();
+        let coverage = ink as f64 / total as f64;
+
+        assert!(
+            coverage > 0.35 && coverage < 0.80,
+            "the wordmark is {:.0}% inked ({ink} of {total} dots), which is \
+             outside the band a wordmark with a reflection sits in",
+            coverage * 100.0
+        );
+        // Ink and gaps, in the other sense: no row may be entirely one or the
+        // other. The reflection rows in the middle are the sparsest, and a
+        // mistyped one of those is a whole row gone.
+        for (index, row) in DVD_WORDMARK.split('\n').enumerate() {
+            let dots = row.chars().count();
+            let inked = row.chars().filter(|c| *c == '#').count();
+            assert!(
+                inked > 0 && inked < dots,
+                "row {index} is {inked} of {dots} dots, so it is entirely blank or \
+                 entirely ink: {row:?}"
+            );
+        }
+    }
+
+    /// The logo is sampled at its sub-cell offset, not at a cell boundary.
+    ///
+    /// This is the bug the sub-cell offset invites, and it is worth writing down
+    /// because the first version of this renderer had it in the most obvious
+    /// possible form: it indexed the source with a *screen* coordinate, so
+    /// `ink_at(left + cell_x * 2 + dx, ...)` -- which reads correctly while the
+    /// logo is near the origin and then walks straight off the end of a 60-dot
+    /// row, drew *nothing at all*. A blank screen, no panic, no warning.
+    ///
+    /// A braille cell's two dots live in one screen cell, so a logo whose origin
+    /// lands on an odd dot straddles a cell boundary: dot 0 is the right-hand dot
+    /// of one cell and dot 59 the left-hand dot of the one after. The grid has to
+    /// be a whole cell bigger than the logo for that to fit, and it has to be
+    /// sampled with a signed skew rather than a saturating one, or the last column
+    /// is clipped on half the frames.
+    ///
+    /// Two assertions, and the first is the one that would have caught it:
+    ///
+    /// * the number of raised dots is the same for every skew, which says no ink
+    ///   is lost off the end and none is duplicated across the boundary, and
+    /// * the pattern at skew `s` is the pattern at skew 0 shifted by exactly `s`
+    ///   dots, which pins the convention rather than just its result.
+    #[test]
+    fn the_logo_is_sampled_at_its_sub_cell_offset() {
+        let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        let (dot_w, dot_h) = (dvd.logo_dot_width(), dvd.logo_dot_height());
+        let total_ink = (0..dot_w)
+            .flat_map(|x| (0..dot_h).map(move |y| (x, y)))
+            .filter(|(x, y)| dvd.ink_at(*x, *y))
+            .count();
+
+        dvd.grid.clear();
+        dvd.paint_at(0, 0);
+        let aligned: Vec<Vec<bool>> = (0..dot_h)
+            .map(|y| (0..dot_w).map(|x| dvd.grid.dot(x, y)).collect())
+            .collect();
+
+        // Skews are 0 or 1 across and 0 to 3 down: the grid's own granularity.
+        for skew_x in 0..DOTS_X {
+            for skew_y in 0..DOTS_Y {
+                dvd.grid.clear();
+                dvd.paint_at(skew_x, skew_y);
+
+                let raised = (0..dvd.grid.dot_width())
+                    .flat_map(|x| (0..dvd.grid.dot_height()).map(move |y| (x, y)))
+                    .filter(|(x, y)| dvd.grid.dot(*x, *y))
+                    .count();
+                assert_eq!(
+                    raised, total_ink,
+                    "at a skew of ({skew_x},{skew_y}) the grid holds {raised} raised \
+                     dots rather than the wordmark's {total_ink}, so ink has been \
+                     lost or doubled"
+                );
+
+                for (y, row) in aligned.iter().enumerate() {
+                    for (x, expected) in row.iter().enumerate() {
+                        assert_eq!(
+                            dvd.grid.dot(x + skew_x, y + skew_y),
+                            *expected,
+                            "dot ({x},{y}) moved wrong at a skew of \
+                             ({skew_x},{skew_y})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // And the spare cell and row exist for a reason: the grid is one cell
+        // bigger than the logo, and that cell has to be able to hold ink, or the
+        // skewed pattern above would have been clipped and the dot count would
+        // have come out short.
+        assert_eq!(dvd.grid.width(), dvd.logo_cells_w() + 1);
+        assert_eq!(dvd.grid.height(), dvd.logo_cells_h() + 1);
+        dvd.grid.clear();
+        dvd.paint_at(1, 1);
+        assert!(
+            dvd.grid.dot_width() > dot_w && dvd.grid.dot_height() > dot_h,
+            "the grid is {}x{} dots, which does not have room for a logo of \
+             {dot_w}x{dot_h} shifted by a dot",
+            dvd.grid.dot_width(),
+            dvd.grid.dot_height()
+        );
+    }
+
+    /// The wordmark survives the trip through the renderer.
+    ///
+    /// The art was supplied as braille, so the only way to know the transcription
+    /// is right is to encode it back and look at the result. This drives the
+    /// effect's own `paint_at` at the origin -- not a reimplementation of it, or
+    /// it would agree with a broken `paint_at` -- and then checks the encoding
+    /// against the source: the box is 30 by 7 cells, and two named dots land
+    /// where the bitmap says. The first of those is the top-left inked dot of the
+    /// left stroke of the D and the second is the blank above it, so a renderer
+    /// that shifted its origin by a cell or a row would fail on one or both.
+    #[test]
+    fn the_wordmark_round_trips_through_braille() {
+        let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        dvd.grid.clear();
+        dvd.paint_at(0, 0);
+
+        assert_eq!(dvd.logo_cells_w(), 30, "60 dots across at 2 to the cell");
+        assert_eq!(dvd.logo_cells_h(), 7, "28 dots down at 4 to the cell");
+        assert_eq!(dvd.grid.width(), 31, "the logo's 30 cells plus the spare");
+        assert_eq!(dvd.grid.height(), 8, "seven cells plus the spare");
+        assert_eq!(dvd.grid.dot_width(), 62);
+        assert_eq!(dvd.grid.dot_height(), 32);
+
+        // Named dots rather than a comparison against the source, because
+        // comparing against the source would agree with a broken `paint_at` by
+        // construction. These are what a shifted origin, a transposed one, or a
+        // row dropped from the literal all break. Row 0 of the wordmark is
+        // `.....#######################.........#################......`,
+        // row 4 opens the counters, rows 16 to 18 are the point of the V, and
+        // rows 19 to 27 are the reflection.
+        for (dot_x, dot_y, expected, what) in [
+            (0usize, 0usize, false, "the top-left corner"),
+            (5, 0, true, "the left stroke of the first D"),
+            (4, 0, false, "the blank one dot to its left"),
+            (28, 0, false, "the gap between the D and the V at the top"),
+            (37, 0, true, "the top of the second letter's left stroke"),
+            (53, 0, true, "the far end of that letter's top bar"),
+            (54, 0, false, "the blank beyond it"),
+            (59, 0, false, "the top-right corner"),
+            (10, 4, false, "inside the first D's counter"),
+            (34, 4, true, "a stem of the V"),
+            (52, 4, true, "the left stroke of the last D"),
+            (27, 16, true, "the point of the V"),
+            (26, 16, false, "just left of the point"),
+            (20, 19, true, "the top bar of the reflection"),
+            (19, 19, false, "just left of it"),
+            (30, 20, true, "the middle of the reflection"),
+            (14, 27, true, "the foot of the reflection"),
+            (13, 27, false, "just left of the foot"),
+            (43, 27, false, "just right of the foot"),
+            (0, 27, false, "the bottom-left corner"),
+        ] {
+            assert_eq!(
+                dvd.grid.dot(dot_x, dot_y),
+                expected,
+                "dot ({dot_x},{dot_y}) -- {what}"
+            );
+        }
+
+        // And every dot of the grid agrees with the source, which is what makes
+        // the named dots above a summary rather than the whole test.
+        for dot_y in 0..dvd.grid.dot_height() {
+            for dot_x in 0..dvd.grid.dot_width() {
+                assert_eq!(
+                    dvd.grid.dot(dot_x, dot_y),
+                    dvd.ink_at(dot_x, dot_y),
+                    "dot ({dot_x},{dot_y}) disagrees with the wordmark"
+                );
+            }
+        }
+
+        // And the encoding is braille, by name, for three cells whose bit patterns
+        // are worked out by hand from the bitmap above. U+28FF is all eight dots,
+        // which is the property a logo needs from a sub-cell renderer: a solid
+        // interior has to come out solid, or the letter is visibly striped. U+28EA
+        // is the right-hand column of a cell raised on all four rows plus the
+        // bottom-left dot, which is the slanted left edge of the first D. The
+        // fourth is the top-left corner, which has to be a space rather than a
+        // blank pattern -- `BrailleGrid` emits a space for an empty cell because
+        // it is one byte narrower, and that is the byte-cost half of only writing
+        // cells that have ink.
+        assert_eq!(dvd.grid.cell_char(2, 1), '\u{28ff}', "a solid interior");
+        assert_eq!(dvd.grid.cell_char(2, 0), '\u{28ea}', "the slanted edge");
+        assert_eq!(dvd.grid.cell_char(0, 0), ' ', "a cell with no ink");
+        assert_eq!(dvd.grid.cell_char(29, 6), ' ', "the far bottom corner");
+    }
+
+    /// The logo is big.
     ///
     /// It was three characters on one line, which is a text label rather than a
-    /// logo. It was previously pinned by name in an integration test too, which
-    /// had to be updated with it.
+    /// logo, and then a 23-cell block letter, which is bigger but not the thing.
+    /// It was previously pinned by name in an integration test too, which had to
+    /// be updated with it. The assertion follows the effect: 30 cells by 7 is the
+    /// wordmark, at braille's 2x4, and it is exactly a quarter of an 80x24
+    /// terminal's width, which is about what a bouncing logo should occupy.
     #[test]
-    fn the_default_logo_is_a_multi_row_block_letter() {
+    fn the_default_logo_is_a_real_wordmark() {
         let dvd = Dvd::new(DvdOptions::default(), (80, 24));
-        assert!(
-            dvd.rows.len() >= 5,
-            "the default logo is {} row(s) tall",
-            dvd.rows.len()
+        assert_eq!(dvd.rows.len(), 28, "28 dot rows");
+        assert_eq!(
+            dvd.rows.iter().map(Vec::len).max().unwrap_or(0),
+            60,
+            "60 dots across"
         );
-        let width = dvd.rows.iter().map(Vec::len).max().unwrap_or(0);
-        assert!(
-            width >= 15,
-            "the default logo is {width} cells wide, which is a label rather \
-             than a logo"
-        );
-        // Ink and gaps, or it is a slab rather than letters. An earlier version
-        // asserted the logo was *majority* full blocks, on the theory that a
-        // sub-cell renderer needs a solid slab to stay solid. That is not how it
-        // works: every ink sample lights every sample it covers, so an ink cell
-        // comes out as a full block whatever its neighbours are, and a
-        // one-cell-wide stroke renders at full size rather than halved.
-        let cells: Vec<char> = dvd.rows.iter().flatten().copied().collect();
-        assert!(
-            cells.contains(&'█') && cells.contains(&' '),
-            "the default logo has no gaps or no ink, so it is not legible as \
-             letters"
-        );
+        assert_eq!(dvd.logo_width(), 30.0, "60 dots is 30 cells");
+        assert_eq!(dvd.logo_height(), 7.0, "28 dots is 7 cells");
+        assert_eq!(dvd.grid.width(), 31, "the logo's cells plus the skew spare");
+        assert_eq!(dvd.grid.height(), 8);
+    }
+
+    /// The logo has to stay whole and stay on screen, at every position.
+    ///
+    /// `max_x` is `screen_width - logo_cells` and the draw is at
+    /// `left_cell + cell_x`, so that bounds math is what keeps the logo's
+    /// right-hand column on screen at the wall. If the width in cells were
+    /// rounded the other way -- down, to 29 for a 58-dot logo -- the last column
+    /// would be off the edge at the far wall, and `Canvas::set` would drop the
+    /// write rather than panicking, so the right-hand sliver of the D would
+    /// quietly disappear for a moment on every crossing.
+    ///
+    /// The positions checked are the four corners *and* the skewed positions just
+    /// short of them, because those are different cases. At a wall `x` is a whole
+    /// number of cells, so the origin is a whole number of dots and the logo
+    /// occupies exactly its 30 cells. Half a cell short, the origin is an odd dot,
+    /// the logo's last column of dots moves into the 31st cell, and that cell has
+    /// to be the last *real* one rather than off the end.
+    ///
+    /// The check decodes what was written rather than counting it. A braille
+    /// glyph is its own bit pattern, so a cell's glyph says exactly which of its
+    /// eight dots are raised -- which means the whole claim can be checked dot by
+    /// dot: every dot of the wordmark must be raised in the cell that contains it,
+    /// and nothing else may be. That is stronger than a cell count (which changes
+    /// with the skew, because shifting a pattern one dot moves ink between cells)
+    /// and it catches clipping, doubling and a mis-signed offset alike.
+    #[test]
+    fn the_logo_is_never_clipped_and_never_escapes() {
+        /// The raised dots of a braille glyph, or zero for anything else -- a
+        /// space saturates to nothing rather than wrapping.
+        fn dots_of(symbol: char) -> u8 {
+            u32::from(symbol).saturating_sub(0x2800) as u8
+        }
+
+        let (width, height) = (80u16, 24u16);
+        // Painted rather than read off a fresh grid: `draw` clears the grid before
+        // filling it, so a `Dvd` that has never been drawn has an empty one.
+        let mut template = Dvd::new(DvdOptions::default(), (width, height));
+        template.grid.clear();
+        template.paint_at(0, 0);
+        let max_x = width as f64 - template.logo_width();
+        let max_y = height as f64 - template.logo_height();
+        let (dot_w, dot_h) =
+            (template.logo_dot_width(), template.logo_dot_height());
+
+        for x in [0.0, 0.5, max_x - 0.5, max_x] {
+            for y in [0.0, 0.25, max_y - 0.25, max_y] {
+                let mut dvd = Dvd::new(DvdOptions::default(), (width, height));
+                dvd.x = x;
+                dvd.y = y;
+                let diff = dvd.get_diff();
+
+                let mut written: std::collections::BTreeMap<(usize, usize), u8> =
+                    Default::default();
+                for (cx, cy, cell) in diff {
+                    assert!(
+                        cx < width as usize && cy < height as usize,
+                        "at ({x}, {y}) the draw emitted ({cx},{cy}), outside the \
+                         terminal"
+                    );
+                    assert_ne!(cell.symbol, ' ', "a blank cell was written");
+                    written.insert((cx, cy), dots_of(cell.symbol));
+                }
+
+                let left = (x * DOTS_X as f64).floor() as usize;
+                let top = (y * DOTS_Y as f64).floor() as usize;
+                for dot_j in 0..dot_h {
+                    for dot_i in 0..dot_w {
+                        // Where this dot of the wordmark lands: the screen cell
+                        // containing its screen dot, and its position *within*
+                        // that cell. Both are offset by the origin, which is the
+                        // whole point -- `dot_i % DOTS_X` would be the unskewed
+                        // answer and would be wrong on every odd frame.
+                        let screen_x = left + dot_i;
+                        let screen_y = top + dot_j;
+                        let cell_x = screen_x / DOTS_X;
+                        let cell_y = screen_y / DOTS_Y;
+                        let bit = 1u8
+                            << ((screen_y % DOTS_Y) * DOTS_X + screen_x % DOTS_X);
+                        let raised = written
+                            .get(&(cell_x, cell_y))
+                            .is_some_and(|bits| bits & bit != 0);
+                        assert_eq!(
+                            raised,
+                            dvd.ink_at(dot_i, dot_j),
+                            "at ({x}, {y}) the wordmark's dot ({dot_i},{dot_j}) is \
+                             not drawn as the bitmap says"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The diagonal has to be a diagonal, and 45 degrees visually.
@@ -879,6 +1628,183 @@ mod tests {
             "a slope of {} draws equal cell deltas, which on this cell aspect \
              ratio is a line at 50 to 63 degrees rather than a diagonal",
             dvd.options.slope
+        );
+    }
+
+    /// The speed cap tracks the width of the logo.
+    ///
+    /// The cap is a property of the logo, not a preference, and the logo changed:
+    /// 23 cells wide before, 30 now. So the cap scales by the old width over the
+    /// new, `24 * 23 / 30 = 18.4`, rounded down.
+    ///
+    /// The bound is a band rather than an equality so that this pins the *scaling*
+    /// and not the digit. It fails if the cap is left at 24, which is the change
+    /// most likely to happen by accident, and it also fails at the other wrong
+    /// answer of 30 -- the reflex "the logo is 30 wide now, so the cap should be
+    /// 30 too" -- which is a 30% speed-up dressed as a correction.
+    ///
+    /// Stated here because it is not the interesting claim: this does *not* hold
+    /// the time to cross one logo width fixed. That would be 31 cells a second,
+    /// not 18. See `DvdOptions::default` for what the cap is actually for and what
+    /// it costs.
+    #[test]
+    fn the_speed_cap_is_scaled_to_the_logo_width() {
+        let options = DvdOptions::default();
+        let logo_cells = options
+            .logo
+            .split('\n')
+            .map(|row| row.chars().count())
+            .max()
+            .unwrap_or(0)
+            .div_ceil(DOTS_X);
+
+        // The ratio, spelled out: 24 was the cap against a 23-cell logo.
+        let scaled = 24.0 * 23.0 / logo_cells as f32;
+        assert!(
+            (options.speed - scaled).abs() < 0.5,
+            "the cap is {} and 24 against the old 23-cell logo scales to {scaled} \
+             for this {logo_cells}-cell one",
+            options.speed
+        );
+        assert!(
+            options.speed > 14.0 && options.speed < 20.0,
+            "the cap is {}, which is not the retune; 24 leaves the old logo's speed \
+             on a 30% wider slab, and 30 is a speed-up rather than a correction",
+            options.speed
+        );
+    }
+
+    /// Only cells with ink are written, and none of them carry a background.
+    ///
+    /// This is the "only write cells that have ink" half of the braille change,
+    /// and it is the half that shows up on the wire and on screen.
+    ///
+    /// A blank braille cell is a space, so painting one costs a byte and erases
+    /// whatever the terminal's background is showing there. The wordmark is 60% ink
+    /// inside its bounding box, and the 40% that is not is the counters of the
+    /// letters and the space around the reflection -- which is exactly the part
+    /// that should show the terminal's own background through.
+    ///
+    /// Measured on the *opening* frame, which is the only one where the claim is
+    /// exact: the canvas starts blank, so every cell the draw reports is one it
+    /// chose to write, and the count is the number of cells in the grid carrying
+    /// at least one raised dot. A later frame also reports the cells the logo has
+    /// just *left* -- those are erasures, they have to be reported or the old logo
+    /// stays on screen, and they are not the same thing.
+    ///
+    /// The background half is the one that fails against the old renderer. The
+    /// quadrant blocks spend a cell's foreground *and* its background on a
+    /// two-tone split, so every edge cell came out as
+    /// `Cell::with_bg(glyph, ink, Color::Rgb { 0, 0, 0 }, ..)`: an
+    /// `ESC[48;2;0;0;0` per edge cell on the wire, and a hard black rectangle
+    /// painted over the un-inked half of every one of them. That is also why the
+    /// old logo was invisible on anything but a black terminal, and why
+    /// `[global] background` never showed through it.
+    #[test]
+    fn only_inked_cells_are_written_and_none_of_them_carry_a_background() {
+        let mut dvd = Dvd::new(DvdOptions::default(), (80, 24));
+        let opening = dvd.get_diff();
+
+        let inked_cells = (0..dvd.grid.height())
+            .flat_map(|cell_y| (0..dvd.grid.width()).map(move |cx| (cx, cell_y)))
+            .filter(|(cx, cy)| dvd.grid.cell_char(*cx, *cy) != ' ')
+            .count();
+        let bounding_box = dvd.grid.width() * dvd.grid.height();
+
+        assert_eq!(
+            opening.len(),
+            inked_cells,
+            "the opening frame wrote {} cells but only {inked_cells} of the logo's \
+             {bounding_box} have ink, so blank cells are being painted",
+            opening.len()
+        );
+        assert!(
+            inked_cells < bounding_box,
+            "{inked_cells} of {bounding_box} cells have ink, so this logo is a slab \
+             and the test is not measuring what it thinks it is"
+        );
+
+        for (_, _, cell) in &opening {
+            assert_ne!(cell.symbol, ' ', "a blank cell was written");
+            assert_eq!(
+                cell.bg,
+                style::Color::Reset,
+                "wrote {:?} with a background of {:?}; braille is one colour per \
+                 cell and the wordmark is a single flat one",
+                cell.symbol,
+                cell.bg
+            );
+        }
+
+        // And over a run, nothing ever acquires a background either -- including
+        // the erasures, which are the cells a naive implementation would blank with
+        // a hard black rather than with the terminal's own background.
+        for _ in 0..200 {
+            dvd.update();
+            for (_, _, cell) in dvd.get_diff() {
+                assert_eq!(cell.bg, style::Color::Reset);
+            }
+        }
+    }
+
+    /// What one frame costs on the wire, and what it does *not* scale with.
+    ///
+    /// This is the measurement `frame_times` reports, run inline so a regression
+    /// is caught by `cargo test` rather than only by looking at a table.
+    ///
+    /// The structural claim is the second one and the one that matters: the cost
+    /// is a property of the logo, not of the terminal. A 400x200 screen is
+    /// eighty times the area of an 80x24 one and the logo still moves at the same
+    /// rate, so the two must cost the same. A draw that walked the whole canvas,
+    /// or a renderer that painted every cell in the logo's bounding box, would
+    /// show up here as a factor of the terminal size.
+    ///
+    /// The absolute number is around 650 bytes a frame, and the reason is worth
+    /// knowing: a braille cell *is* its bit pattern, so moving the logo one dot
+    /// sideways changes every glyph in it and the diff is the whole logo rather
+    /// than its leading edge. That is inherent to placing a shape at 8x, and it
+    /// buys the dot of resolution that the old 2x2 renderer did not have.
+    #[test]
+    fn a_frame_costs_the_same_whatever_size_the_terminal_is() {
+        fn mean_frame_bytes(size: (u16, u16)) -> (usize, usize) {
+            let mut dvd = Dvd::new(DvdOptions::default(), size);
+            let opening = {
+                let mut out: Vec<u8> = Vec::new();
+                crate::common::write_cells(&mut out, size, &dvd.get_diff())
+                    .expect("writing to a Vec cannot fail");
+                out.len()
+            };
+
+            let mut total = 0usize;
+            for _ in 0..120 {
+                dvd.update();
+                let mut out: Vec<u8> = Vec::new();
+                crate::common::write_cells(&mut out, size, &dvd.get_diff())
+                    .expect("writing to a Vec cannot fail");
+                total += out.len();
+            }
+            (opening, total / 120)
+        }
+
+        let (small_open, small) = mean_frame_bytes((80, 24));
+        let (big_open, big) = mean_frame_bytes((400, 200));
+
+        // A ceiling as well, so that a frame which happened to be small at 80x24
+        // for the wrong reason would not pass the ratio below.
+        assert!(
+            small < 1_500 && big < 1_500,
+            "a frame costs {small} bytes at 80x24 and {big} at 400x200, which is \
+             more than a 210-cell logo moving a dot at a time should"
+        );
+        assert!(
+            big * 10 <= small * 12,
+            "a frame costs {small} bytes at 80x24 and {big} at 400x200, so the cost \
+             scales with the terminal rather than with the logo"
+        );
+        assert!(
+            small_open < 1_500 && big_open < 1_500,
+            "the opening frame costs {small_open} bytes at 80x24 and {big_open} at \
+             400x200"
         );
     }
 

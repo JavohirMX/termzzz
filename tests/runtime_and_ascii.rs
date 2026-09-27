@@ -1062,11 +1062,14 @@ fn playlist_defaults_to_a_short_transition() {
     assert!(options.effects.is_empty());
 }
 
-/// The default logo is a block letter, not three characters on a line.
+/// The default logo is the real DVD wordmark, as a dot bitmap.
 ///
 /// Was `"DVD"` -- a text label rather than a logo, and a one-row slab stepping a
-/// whole cell at a time is far more obviously a staircase than a taller one. The
-/// name of this test kept its meaning; the assertion follows the effect.
+/// whole cell at a time is far more obviously a staircase than a taller one.
+/// Then a 23-cell block letter, which was bigger but still an approximation of
+/// the thing rather than the thing. It is now the actual wordmark, 60 dots by 28,
+/// which is 30 by 7 cells. The name of this test kept its meaning; the
+/// assertions follow the effect.
 #[test]
 fn dvd_options_default_to_a_block_letter_logo() {
     let options = Config::default().get_dvd_options();
@@ -1093,16 +1096,20 @@ fn dvd_options_default_to_a_block_letter_logo() {
         rendered.contains("[dvd]"),
         "the dvd section is missing from the rendered config"
     );
-    // Recolours on every wall hit, which is the reference implementation's
-    // behaviour. The option used to be `corner_color_change`, and a corner needs
-    // both axes to reverse on the same frame: at 80x24 that first happens after
-    // 97 seconds, so the logo was effectively one colour for the whole run.
+    // Recolours on every *third* wall hit. The option used to be
+    // `corner_color_change`, and a corner needs both axes to reverse on the same
+    // frame: at 80x24 that first happens after 97 seconds, so the logo was
+    // effectively one colour for the whole run. It was then moved to every
+    // bounce, which is the reference implementation's behaviour and was fine for
+    // a 23-cell slab -- but with a 30-cell wordmark and a reflection under it, a
+    // full-slab hue change every second and a half reads as a strobe. Every third
+    // keeps the colour change tied to a bounce and drops the rate by two thirds.
     assert_eq!(
         options.color_change,
-        termzzz::dvd::effect::ColorChange::Bounce
+        termzzz::dvd::effect::ColorChange::Steady
     );
     // The palette has to be big enough that consecutive bounces look different,
-    // which is the whole point of changing that often.
+    // which is the whole point of changing at all.
     assert!(
         options.slope > 1.0,
         "a slope of {} draws equal cell deltas, which on this cell aspect ratio \
@@ -1111,8 +1118,15 @@ fn dvd_options_default_to_a_block_letter_logo() {
     );
     // And the speed has to be high enough that the drawn position actually
     // changes between frames, which is the whole "not a staircase" requirement.
+    //
+    // The cap was 24 against the old 23-cell logo and is now 18 against the
+    // 30-cell wordmark, scaled by the old width over the new. So this bound comes
+    // down with it: what has to be preserved is dots per second against 60
+    // frames, and 18 cells a second is 36 horizontal dots, comfortably above the
+    // 30 that "changes on more than every other frame" needs. A bound of 20 would
+    // have been a statement about the old logo, not about this one.
     assert!(
-        options.speed >= 20.0,
+        options.speed >= 15.0,
         "the default speed is {}, which is slow enough for the logo to sit still \
          for several frames between steps",
         options.speed
@@ -1164,9 +1178,23 @@ fn legacy_effect_defaults_use_calmer_pacing() {
         "plasma's palette speed went back to 20, which repaints a sixth of the \
          screen every frame"
     );
+    // Life was 8.0 here, and 8.0 is a rate at which no single cell can be
+    // followed: a glider crosses a cell every one and a half frames. It is also
+    // the rate the age ramp was quantised against, and at 8 generations a second
+    // every live cell's character changed on every generation -- which is the
+    // report the banding in `life` answers. The reasoning for both halves lives
+    // in `life`'s own tests; this is here to catch a config default quietly
+    // reverting either. (Edited by the agent that changed the rate; the session
+    // brief scoped it to `src/life/` and this pin is the one place outside that
+    // scope the change touched.)
     assert_eq!(
         config.get_life_options((20, 10)).generations_per_second,
-        8.0
+        3.0
+    );
+    assert!(
+        config.get_life_options((20, 10)).generations_per_second <= 4.0,
+        "life's rate went back to 8, which changes every live cell's character \
+         eight times a second"
     );
     // The donut's rotation speed was 0.022 here. That value is radians per
     // *frame* from when the effect advanced a fixed step per rendered frame, and
