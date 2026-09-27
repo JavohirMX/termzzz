@@ -887,3 +887,87 @@ fn seeded_effects_are_reproducible_and_seed_sensitive() {
          reaches the struct but not the simulation: {seed_ignored:?}"
     );
 }
+
+/// The global terminal colours are the one place a user's terminal, rather than
+/// an effect's canvas, is mutated. That makes them worth pinning from both
+/// ends: the default must not touch the terminal at all, and a value that does
+/// not parse must be refused at load rather than at draw.
+#[test]
+fn the_terminal_colours_default_to_leaving_the_terminal_alone() {
+    let config = Config::default();
+    assert_eq!(config.global.background, crossterm::style::Color::Reset);
+    assert_eq!(config.global.foreground, crossterm::style::Color::Reset);
+    assert!(
+        crossterm::style::Color::Reset != crossterm::style::Color::Black,
+        "if Reset ever equals Black this test is asserting nothing, and the \
+         session would repaint every user's terminal on every start"
+    );
+}
+
+#[test]
+fn terminal_colours_parse_from_names_and_hex() {
+    // `r##` rather than `r#`, because the hex literal below starts with `"#`,
+    // which is exactly the sequence that closes a one-hash raw string.
+    let parsed: Config = toml::from_str(
+        r##"
+[global]
+background = "#0c0c14"
+foreground = "dark_grey"
+"##,
+    )
+    .expect("a hex triple and a colour name both parse");
+
+    assert_eq!(
+        parsed.global.background,
+        crossterm::style::Color::Rgb {
+            r: 0x0c,
+            g: 0x0c,
+            b: 0x14
+        }
+    );
+    assert_eq!(parsed.global.foreground, crossterm::style::Color::DarkGrey);
+}
+
+/// `--print-config` writes every default to disk, so a user who has ever run it
+/// has pinned whatever the defaults were on that day. A value that serialises
+/// to a spelling the parser then rejects would make that generated config
+/// unloadable, which is the one failure mode `--print-config` must not have.
+#[test]
+fn a_generated_config_reloads_unchanged() {
+    let mut configured = Config::default();
+    configured.global.background = crossterm::style::Color::Rgb {
+        r: 0x0c,
+        g: 0x0c,
+        b: 0x14,
+    };
+    configured.global.foreground = crossterm::style::Color::DarkGrey;
+
+    let printed = toml::to_string_pretty(&configured).expect("serializes");
+    let reloaded: Config =
+        toml::from_str(&printed).expect("what --print-config writes must parse");
+    assert_eq!(reloaded.global.background, configured.global.background);
+    assert_eq!(reloaded.global.foreground, configured.global.foreground);
+}
+
+/// A typo has to be an error naming the value, not a silent fallback.
+///
+/// The failure this guards is quiet and total: a config saying
+/// `background = "blak"` that fell back to `Reset` would look like the setting
+/// simply not working, with nothing anywhere pointing at the misspelling.
+#[test]
+fn an_unparseable_terminal_colour_is_refused_with_the_value_in_the_message() {
+    let error = toml::from_str::<Config>(
+        r#"
+[global]
+background = "blak"
+"#,
+    )
+    .expect_err("a misspelled colour name must not parse");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("blak"),
+        "the error should quote the rejected value so the user can find it, \
+         got: {message}"
+    );
+}

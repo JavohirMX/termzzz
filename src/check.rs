@@ -1,7 +1,7 @@
 use crate::common::TerminalEffect;
 use crate::error::Result;
 use crate::runtime::{FrameContext, InputState};
-use crate::session::TerminalSession;
+use crate::session::{SessionColors, TerminalSession};
 use crossterm::{
     cursor,
     event::{self, Event},
@@ -36,8 +36,9 @@ pub fn test_effect<T: TerminalEffect>(
     effect: &mut T,
     frames: usize,
     speed: f32,
+    colors: SessionColors,
 ) -> Result<()> {
-    let mut session = TerminalSession::enter()?;
+    let mut session = TerminalSession::enter_with(colors)?;
     let size = crate::common::normalize_effect_size(terminal::size()?);
     let mut input = InputState::default();
     input.set_size(size);
@@ -82,11 +83,12 @@ pub fn run_test_for_effect(
     frames: usize,
     config: &crate::config::Config,
     speed: f32,
+    colors: SessionColors,
 ) -> Result<()> {
     let effect_id = effect_name
         .parse::<crate::registry::EffectId>()
         .map_err(crate::error::TermzzzError::UnsupportedEffect)?;
     let size = crate::common::normalize_effect_size(terminal::size()?);
     let mut effect = crate::registry::AnyEffect::build(effect_id, config, size);
-    test_effect(&mut effect, frames, speed)
+    test_effect(&mut effect, frames, speed, colors)
 }

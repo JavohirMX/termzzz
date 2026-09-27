@@ -18,6 +18,7 @@ use crate::{
     rain::digital_rain::DigitalRainOptions,
     terrain::TerrainOptions,
 };
+use crossterm::style::Color;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -60,6 +61,39 @@ pub struct GlobalOptions {
     /// one, for the reason above. Four is a fifteenth of the work and still
     /// visibly alive if you alt-tab back and watch for a moment.
     pub idle_fps: f32,
+    /// The terminal's own background colour, for the whole session.
+    ///
+    /// Emitted once as a single escape sequence when the session starts and
+    /// reset on exit, rather than painted cell by cell. That distinction is the
+    /// whole reason this is a global option and not a per-effect one: painting
+    /// every cell would double the byte volume of every sparse effect, and eight
+    /// of them would each need their own copy of the same code.
+    ///
+    /// `reset` -- the default -- leaves the terminal exactly as the user
+    /// configured it. Setting it matters on terminals with a tinted profile: an
+    /// effect that draws its dark end near black looks broken against a
+    /// greyish-blue background, and the cheapest fix is to make the background
+    /// actually black for the duration.
+    ///
+    /// Accepts crossterm's own colour spellings, which are *not* the same as
+    /// the ones `Color::from_str` takes. The serde form wants
+    /// `"dark_grey"`, not `"darkgrey"`, and `"rgb_(12,12,20)"`, not
+    /// `"rgb(12,12,20)"`; `"#0c0c14"` and the plain names (`"black"`,
+    /// `"white"`, `"reset"`) are the same either way. Listed here because the
+    /// mismatch is invisible until a config fails to load, and the resulting
+    /// error message quotes a list of the accepted forms rather than the ones
+    /// most people would try.
+    ///
+    /// Round-trips: `--print-config` writes these back in the `rgb_(r,g,b)`
+    /// form, so a generated config is stable under a second `--print-config`.
+    pub background: Color,
+    /// The terminal's own foreground colour, for the whole session.
+    ///
+    /// The same mechanism as [`background`](Self::background) and the same
+    /// `reset` default. Separate because a user who pins the background to
+    /// black usually wants the foreground pinned too, and the two are chosen
+    /// together.
+    pub foreground: Color,
 }
 
 impl Default for GlobalOptions {
@@ -68,6 +102,11 @@ impl Default for GlobalOptions {
             speed: 1.0,
             pause_when_unfocused: true,
             idle_fps: 4.0,
+            // `Reset` is not "no colour", it is "whatever the terminal profile
+            // says", which is exactly the pre-existing behaviour. Defaulting to
+            // `Black` instead would silently repaint every user's terminal.
+            background: Color::Reset,
+            foreground: Color::Reset,
         }
     }
 }

@@ -11,7 +11,11 @@ documentation = "https://docs.rs/termzzz"
 homepage = "https://github.com/JavohirMX/termzzz"
 
 [dependencies]
-crossterm = "0.29"
+# `serde` so `style::Color` can go straight into `GlobalOptions`. Parsing the
+# colour at config load rather than at session start means a typo in
+# `background` is reported with a TOML error and a line number, instead of
+# silently falling back at the moment the screen is already being drawn.
+crossterm = { version = "0.29", features = ["serde"] }
 directories = "6.0"
 env_logger = "0.11"
 log = "0.4"
@@ -25,6 +29,9 @@ toml = "1"
 criterion = "0.8"
 tempfile = "3.27"
 # Already a runtime dependency; integration tests need it declared here too.
+# Same features, because the config tests assert on `style::Color` values and
+# the `serde` feature is what makes that type nameable from a parsed config.
+crossterm = { version = "0.29", features = ["serde"] }
 toml = "1"
 
 [[bench]]

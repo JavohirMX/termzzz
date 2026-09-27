@@ -980,8 +980,14 @@ fn glyph_palette_rejects_wide_and_control_characters() {
 #[test]
 fn check_mode_rejects_unknown_effects() {
     assert!(
-        termzzz::check::run_test_for_effect("unknown", 1, &Config::default(), 1.0)
-            .is_err()
+        termzzz::check::run_test_for_effect(
+            "unknown",
+            1,
+            &Config::default(),
+            1.0,
+            Default::default(),
+        )
+        .is_err()
     );
 }
 

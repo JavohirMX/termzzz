@@ -8,8 +8,21 @@ use termzzz::{
     host::EffectHost,
     playlist::{Playlist, PlaylistEntry},
     registry::EffectId,
-    session::{TerminalSession, install_panic_hook},
+    session::{SessionColors, TerminalSession, install_panic_hook},
 };
+
+/// The terminal colours this run should install, taken from the config.
+///
+/// A function rather than a `Config` method so that the "read the two global
+/// colour fields" step exists in exactly one place. Every entry point -- single
+/// effect, playlist, and `--check` -- has to agree on this, and the failure mode
+/// when they do not is a check run that looks nothing like the real run.
+fn session_colors(config: &Config) -> SessionColors {
+    SessionColors {
+        background: config.global.background,
+        foreground: config.global.foreground,
+    }
+}
 
 #[derive(Debug)]
 struct AppArgs {
@@ -60,9 +73,13 @@ fn main() -> Result<(), error::TermzzzError> {
     if args.check {
         let effect = check_effect(&args);
         let frames = args.frames.unwrap_or(1);
-        if let Err(error) =
-            check::run_test_for_effect(&effect, frames, &config, speed)
-        {
+        if let Err(error) = check::run_test_for_effect(
+            &effect,
+            frames,
+            &config,
+            speed,
+            session_colors(&config),
+        ) {
             eprintln!("Error: {error}");
             process::exit(1);
         }
@@ -94,7 +111,7 @@ fn main() -> Result<(), error::TermzzzError> {
             .any(|id| id.needs_mouse());
 
         let fps = {
-            let mut session = TerminalSession::enter()?;
+            let mut session = TerminalSession::enter_with(session_colors(&config))?;
             let (width, height) = common::normalize_effect_size(terminal::size()?);
             let mut effect =
                 Playlist::new(options, config.clone(), (width, height));
@@ -129,7 +146,7 @@ fn main() -> Result<(), error::TermzzzError> {
     };
 
     let fps = {
-        let mut session = TerminalSession::enter()?;
+        let mut session = TerminalSession::enter_with(session_colors(&config))?;
         let (width, height) = common::normalize_effect_size(terminal::size()?);
         let mut host = EffectHost::new(effect_id, config.clone(), (width, height));
 
