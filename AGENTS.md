@@ -206,8 +206,29 @@ must not begin with a space, because the sparsest step lands on the row at the t
 of the region and a space there makes the region invisible against whatever is
 behind it.
 
-Determinism is done: all nine effects that used an unseeded generator now carry a
-`seed` option and a seeded `StdRng`, `--seed <N>` overrides all of them, and
+**`DEFAULT_SEED` now means "unset", not 42.** This is the single most important
+thing to know about seeding in this crate, and it is recent. `Config::randomise_seeds`
+gives every effect whose seed is still at `DEFAULT_SEED` its own distinct draw at
+startup, so an unseeded run is different every launch — which is what a screensaver
+is for. `--seed <N>` still pins every effect. There are fifteen seeded effects now;
+`cube`, `donut` and `plasma` gained seeds in this round and previously had none, so
+"all the effects are random" was not true without them.
+
+The shortcut is real and named here so nobody has to rediscover it: the honest
+shape is `Option<u64>` on fifteen option structs, and it was rejected because it
+pushes "was this set?" into every effect's constructor, where an effect rebuilt on
+a terminal resize would draw a *new* seed and change the picture under the user.
+Resolution has to happen once, on the config, before anything is built. The cost is
+that a config pinning `seed = 42` is the same as one that omits it, and both mean
+"give me something different".
+
+That in turn **dissolves** the `--print-config` trap documented elsewhere in this
+file. A generated config used to pin whatever the defaults were when it was
+generated, which is how a 60x-too-slow donut rotation survived a default change in
+this project. For seeds that is now harmless, because 42 pins nothing.
+
+Determinism is done: every effect that uses randomness now carries a `seed` option
+and a seeded `StdRng`, `--seed <N>` overrides all of them, and
 `tests/effect_contracts.rs` asserts both reproducibility and seed sensitivity for
 every effect. Because they became comparable, that suite also found that five of
 them advanced by a fixed step per rendered frame — `maze`, `boids`, `crab`,
