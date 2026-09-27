@@ -173,27 +173,49 @@ const SHADOW_GLYPH: char = '_';
 /// Cells per second, per unit of horizontal velocity, per unit of
 /// `movement_speed`.
 ///
-/// The old effect moved a crab 1.5 to 4.5 cells a second -- `movement_speed`
-/// times a velocity drawn from `-1.5..1.5` -- and `get_diff` rounds to whole
-/// cells, so the drawn position changed once every 14 to 40 frames. Measured at
-/// 80x24 with the default colony, it was once every 21. That is a sprite
-/// visibly teleporting one column at a time, and it is the single largest thing
-/// wrong with the effect.
+/// 1.0, which makes the gain a no-op and puts the walk back where it started.
+/// The constant exists because it was not always 1.0, and both values it has
+/// held were chosen to answer a complaint about the same number.
 ///
-/// There is no way to interpolate on a cell grid, so the fix is a scuttle made
-/// of more, smaller steps rather than fewer big ones. 5.0 puts the default
-/// colony at 10.5 to 19.5 cells a second -- a cell every three to six frames --
-/// which is continuous to the eye. Past about 25 the sprite outruns its own
-/// animation and the legs appear to slide rather than step, so the top of that
-/// range is where this stops.
-const WALK_GAIN: f32 = 5.0;
+/// It was 5.0, raised to fix a real one. `get_diff` rounds to whole cells, so a
+/// colony moving 1.5 to 4.5 cells a second changed its drawn column once every
+/// 13 to 40 frames -- measured at 80x24, once every 21. A sprite that jumps a
+/// column a third of a second at a time reads as teleporting, and that was
+/// worth fixing. There is no way to interpolate on a character grid, so the fix
+/// had to be a faster crab: 5.0 put the default colony at 10.5 to 19.5 cells a
+/// second, a cell every three to six frames, which is continuous to the eye.
+///
+/// It overshot, and the person who asked for the change then reported the
+/// crabs "change too fast". Nineteen and a half cells a second is a crab
+/// crossing a third of its own body length every pose -- the pose interval is
+/// 0.2 seconds and the body does 3.9 cells in one -- and one drawn column every
+/// three frames, so the whole sprite is somewhere else before the eye has
+/// finished following it. 1.0 is back in the original band: 2.1 to 3.9 cells a
+/// second after [`WALK_SPEED_RANGE`] narrowed the velocity range, which is one
+/// drawn column every 15 to 29 frames.
+///
+/// The two complaints are the same knob, which is the part worth recording so
+/// this is not "fixed" a third time. A crab is drawn one cell at a time, so its
+/// drawn speed and its drawn smoothness are the same number: any gain high
+/// enough to change the column every few frames also moves the crab several
+/// cells between poses. There is no setting that buys both, and 5.0 bought
+/// smoothness with speed and lost the other end.
+///
+/// Note what does *not* follow from lowering it. The pose cycle is not derived
+/// from the walk -- `animation_speed` is a plain interval in seconds and the
+/// legs cycle at `1 / animation_speed` whatever this is -- so the legs do not
+/// slow down. What halves is the cells covered per leg position, which is the
+/// other end of the same trade: at 0.6 cells a pose the crab is still moving
+/// between leg positions rather than planting and then sliding.
+const WALK_GAIN: f32 = 1.0;
 
 /// The horizontal speed a crab is drawn from, as a fraction of a cell per
 /// second.
 ///
 /// Narrower than the old `-1.5..1.5`. A crab twice as fast as its neighbours
-/// looks like it is trying to escape, and at `WALK_GAIN` the fast end of a wide
-/// range is a sprint; the width is a personality range instead.
+/// looks like it is trying to escape, and even at `WALK_GAIN` a fast end much
+/// past 1.3 is a sprint rather than a personality; the width is a range of
+/// characters, not of speeds.
 const WALK_SPEED_RANGE: (f32, f32) = (0.7, 1.3);
 
 /// Upward speed at the start of a hop, in cells per second.
@@ -230,6 +252,59 @@ fn touch_distance() -> f32 {
     sprite().0 as f32 + 2.0
 }
 
+/// The closest two crabs may stand to each other, in cells.
+///
+/// A floor, not a whole sprite's width, and the screen is the reason. The
+/// sprite is fifteen columns across, so a fifteen-column gap needs a terminal
+/// of about a hundred and forty before even three crabs fit on it, and this
+/// effect is required to run at six by six. Six keeps the two shells clear of
+/// one another -- at three the claws of the left-hand crab are inside the body
+/// of the right-hand one -- without asking the seabed for a sprite per crab,
+/// which turns a crossing colony into a queue.
+///
+/// Anything above one cell carries a second property, and it is the one the
+/// report was actually about. `get_diff` rounds to whole columns, so two crabs
+/// a tenth of a cell apart are *drawn* in the same column, and two sprites that
+/// overlap on fifteen of their fifteen columns are one crab, not two. A gap of
+/// one is the smallest that can guarantee two crabs are never painted on top of
+/// each other, and a screen narrower than the colony cannot give even that --
+/// see [`separation`].
+const MIN_SEPARATION: f32 = 6.0;
+
+/// The gap to actually enforce, given a screen and a colony size.
+///
+/// [`MIN_SEPARATION`] where the seabed can afford it, and otherwise a share of
+/// the seabed per crab.
+///
+/// The second branch is not a nicety. `right_edge` is zero on any terminal
+/// narrower than the sprite -- which includes the six by six the contract suite
+/// drives -- so five crabs on a small screen all integrate to column zero and
+/// there is no gap between anything. Demanding six cells there would be a
+/// demand the screen cannot pay, and the two ways of trying to pay it are both
+/// worse than the problem: refuse to move, which is a frozen seabed, or push a
+/// crab off the edge, which is a crab on the moon.
+///
+/// Divided by `count` rather than by `count - 1`, and the difference of one is
+/// the whole of it. There are only `count - 1` gaps between `count` crabs, so a
+/// gap of `span / (count - 1)` uses the seabed exactly to the last column and
+/// the colony is then *rigid*: at twenty by nine, three crabs are pinned to
+/// columns 0, 2.5 and 5 forever and the drawn column changes seven times in a
+/// hundred seconds. One gap's worth of slack lets them shuffle along it, which
+/// is the difference between a crowded seabed and a frozen one.
+///
+/// Capping at that share is also what makes the sweep in
+/// [`Crab::separate_crabs`] provably stay on the screen. It guarantees
+/// `(count - 1) * separation < span`, which is the inequality the whole of that
+/// function rests on, and
+/// `the_gap_asked_for_never_exceeds_what_the_seabed_can_hold` is its test.
+fn separation(screen_width: u16, count: usize) -> f32 {
+    if count < 2 {
+        return 0.0;
+    }
+    let span = right_edge(screen_width, sprite().0);
+    MIN_SEPARATION.min(span / count as f32)
+}
+
 // Individual crab entity
 #[derive(Clone)]
 struct CrabEntity {
@@ -257,14 +332,21 @@ pub struct CrabOptions {
     /// livelier walk also shortened the crab's clap, which is not a thing anyone
     /// would ask for and is invisible in a config file because both are the
     /// same number. [`clap_duration`](Self::clap_duration) is the second half.
+    ///
+    /// This is *not* derived from the walk speed, which was the assumption when
+    /// the walk was slowed for being too fast. It is a plain timer, so a crab
+    /// whose body has been slowed from 15 cells a second to 3 still snaps
+    /// between leg poses five times a second -- and at that rate the legs read as
+    /// a flicker rather than as a scuttle, which is the complaint the walk speed
+    /// was slowed for in the first place. 0.4 is two and a half poses a second.
     pub animation_speed: f32,
 
     /// How long a clap lasts, in seconds.
     ///
     /// Independent of [`animation_speed`](Self::animation_speed) so the two can
-    /// be tuned separately. 0.6 is a quarter of a second at a 0.2 second walk
-    /// interval, which is long enough to see the claws open and short enough
-    /// that a colony of clapping crabs does not look like a colony of statues.
+    /// be tuned separately. 0.6 is a quarter of a second, long enough to see the
+    /// claws open and short enough that a colony of clapping crabs does not look
+    /// like a colony of statues.
     pub clap_duration: f32,
 
     pub clap_chance: f32, // Random chance for special animation
@@ -286,7 +368,7 @@ impl Default for CrabOptions {
     fn default() -> Self {
         Self {
             crab_count: 5,
-            animation_speed: 0.2,
+            animation_speed: 0.4,
             clap_duration: 0.6,
             clap_chance: 0.05,
             movement_speed: 3.0,
@@ -369,12 +451,8 @@ impl CrabEntity {
         clap_chance: f32,
         rng: &mut EffectRng,
     ) {
-        let (width, height) = sprite();
-        let sand_row = screen_size.1.saturating_sub(1);
-        // The seabed line itself takes the bottom row, so a grounded crab's
-        // feet are on the row above it. That is what leaves room for the
-        // shadow: a crab whose feet are *on* the sand has nowhere to put one.
-        let ground = (sand_row.saturating_sub(height as u16)) as f32;
+        let (width, _height) = sprite();
+        let ground = ground_row(screen_size);
 
         // Gravity first, so a hop that ends this frame still lands.
         if self.position.1 < ground {
@@ -490,6 +568,22 @@ fn right_edge(screen_width: u16, sprite_width: usize) -> f32 {
     (screen_width as f32 - sprite_width as f32).max(0.0)
 }
 
+/// The row a grounded crab's feet stand on.
+///
+/// The seabed line takes the bottom row, so a crab's feet are on the row above
+/// it -- which is what leaves room for the shadow, since a crab whose feet were
+/// *on* the sand would have nowhere to put one.
+///
+/// One function for the three places that need it: integration, the renderer,
+/// and the collision response's own question of whether a crab is on the ground
+/// or in the air. When those were three separate expressions they could drift,
+/// and a drift here is not a wrong pixel -- it is a crab that believes it is
+/// airborne and so cannot be startled, forever.
+fn ground_row(screen_size: (u16, u16)) -> f32 {
+    let sand_row = screen_size.1.saturating_sub(1);
+    sand_row.saturating_sub(SPRITE_ROWS as u16) as f32
+}
+
 /// The width of a crab's shadow, in cells, at a given height above the sand.
 ///
 /// Narrowing with altitude is the whole of the shadow's second job. A shadow
@@ -512,9 +606,9 @@ impl TerminalEffect for Crab {
     fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
         self.canvas.clear();
 
-        let (width, height) = sprite();
+        let (width, _height) = sprite();
         let sand_row = self.canvas.height().saturating_sub(1);
-        let ground = (sand_row.saturating_sub(height)) as f32;
+        let ground = ground_row(self.screen_size);
 
         // The seabed, then the shadows, then the crabs. A crab's feet are on the
         // row above the sand, so the shadow has a row of its own and the two
@@ -624,6 +718,17 @@ impl Crab {
             );
         }
 
+        // Separation before the collision response rather than after it, and the
+        // order is the point. The response fires at a sprite's width -- three
+        // gaps -- so a pair that is genuinely on a collision course has already
+        // turned around by the time a correction could reach it, and the
+        // correction has nothing left to do. What it *does* have to fix is the
+        // pair the response never sees at all: `check_crab_collisions` acts only
+        // on a closing pair, and two crabs in the same column travelling the
+        // same way are not closing on each other, so they were skipped forever
+        // and stayed stacked for the rest of the run. That was the whole of the
+        // report, and there was no code here that could have answered it.
+        self.separate_crabs();
         self.check_crab_collisions();
     }
 
@@ -714,6 +819,108 @@ impl Crab {
         columns
     }
 
+    /// Keeps the colony from standing on top of itself, every frame.
+    ///
+    /// Along the seabed axis only, and that is a decision rather than a
+    /// shortcut. The general answer -- push two things apart along the line
+    /// between them, the way a boids flock separates -- is wrong for this
+    /// scene: crabs share one row of ground and hop a cell or two off it, so the
+    /// line between a grounded crab and one mid-hop is nearly vertical, and
+    /// separating along it lifts them. A colony that swims is not a colony on a
+    /// seabed. The horizontal component is also the component that decides
+    /// whether they overlap at all, since every crab is drawn within
+    /// [`SPRITE_ROWS`] rows of the same sand row, so correcting along it is the
+    /// whole correction and nothing is being left out.
+    ///
+    /// It moves positions rather than velocities, which is the thing to be
+    /// careful about, because two crabs pushing each other along a line can push
+    /// themselves back and forth forever and the usual answer is to damp the
+    /// correction. This one does not need damping. A sorted sweep is a
+    /// *projection*, not a force: each crab is moved by exactly the overlap and
+    /// no more, the movement is always in the same direction for a given
+    /// arrangement, and once the gaps are wide enough the sweep does nothing at
+    /// all. A second pass over an already-separated colony is therefore a no-op,
+    /// which is what settles it -- and that is a property worth a test rather
+    /// than a claim, so `separation_settles_rather_than_jittering` is the
+    /// assertion.
+    ///
+    /// Sorted rather than a pairwise loop over indices, for the same reason. A
+    /// pairwise loop corrects in index order, so crab 0 and crab 1 can each be
+    /// shoved by a *different* neighbour in the same frame and end the frame
+    /// exactly where they started -- and with three crabs in a line that is not
+    /// a corner case, it is the only case. The order is by column with the
+    /// index as the tie-break, so the sweep is a function of the positions
+    /// alone: nothing here draws from the generator and a run replays.
+    fn separate_crabs(&mut self) {
+        let count = self.crabs.len();
+        if count < 2 {
+            return;
+        }
+        let min_gap = separation(self.screen_size.0, count);
+        if min_gap <= 0.0 {
+            return;
+        }
+        let max_x = right_edge(self.screen_size.0, sprite().0);
+
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by(|&a, &b| {
+            self.crabs[a]
+                .position
+                .0
+                .total_cmp(&self.crabs[b].position.0)
+                .then(a.cmp(&b))
+        });
+
+        // Left to right, each crab lifted to at least a gap behind the one in
+        // front of it, and held inside the right-hand wall. One pass, because a
+        // crab moved here is the `behind` the next crab in the order is measured
+        // against -- which is also why the order has to be by column and not by
+        // index. A gap between adjacent crabs of a sorted order is a gap between
+        // all of them, since everything between has to be between them too.
+        for window in order.windows(2) {
+            let (behind, ahead) = (window[0], window[1]);
+            let floor = self.crabs[behind].position.0 + min_gap;
+            let lifted = self.crabs[ahead].position.0.max(floor);
+            // The clamp is load-bearing, not defensive. Without it a colony
+            // that is wider than the seabed walks the back of itself off the
+            // right-hand side, and the whole two-pass argument below is about
+            // keeping every column inside `[0, max_x]`.
+            self.crabs[ahead].position.0 = lifted.min(max_x);
+        }
+
+        // Right to left, each crab drawn back to at most a gap ahead of the one
+        // in front of it. This is what the first pass cannot do, and the reason
+        // is the clamp: five crabs bunched at the right-hand wall all clamp to
+        // the same column there, and only a pass running the other way can tell
+        // them apart.
+        //
+        // Two passes and no third, and that is the whole correctness argument
+        // rather than a guess. Writing `a` for the columns the first pass left
+        // and `f` for the result, `f[k] = min(a[k], f[k+1] - gap)`, which
+        // unfolds to `f[k] = min over j >= k of (a[j] - (j - k) * gap)`. The
+        // gap between neighbours is then
+        // `f[k] - f[k-1] = max(P - a[k-1], gap)` for `P = f[k]`, which is never
+        // below `gap` however the two passes came out. And the bounds: `f` never
+        // rises above `a`, so nothing goes past the right-hand wall, and where
+        // the first pass's clamp bit, `f[k-1] = max_x - gap` and the chain
+        // continues leftwards as `max_x - m * gap`, which stays non-negative for
+        // every `m < count` precisely because `separation` guarantees
+        // `(count - 1) * gap <= max_x`. That inequality is the one thing this
+        // function leans on, and
+        // `the_gap_asked_for_never_exceeds_what_the_seabed_can_hold` is its
+        // test.
+        for window in order.windows(2).rev() {
+            // Same reading as the first pass, not the mirrored one: `windows(2)`
+            // slides forward either way, so `window[0]` is still the crab
+            // further left. Reversing the iteration is not reversing the pair.
+            let (behind, ahead) = (window[0], window[1]);
+            let ceiling = self.crabs[ahead].position.0 - min_gap;
+            if self.crabs[behind].position.0 > ceiling {
+                self.crabs[behind].position.0 = ceiling;
+            }
+        }
+    }
+
     // Check for collisions between crabs and handle them
     fn check_crab_collisions(&mut self) {
         let crab_count = self.crabs.len();
@@ -721,8 +928,6 @@ impl Crab {
             return;
         }
 
-        // Simple collision detection based on proximity.
-        //
         // The turn-away and the clap are gated separately, and that split is the
         // fix. Gating the whole response on "neither crab is already clapping"
         // stopped the re-clapping -- without it, two crabs re-triggered each
@@ -731,11 +936,15 @@ impl Crab {
         // neighbours and the clap became a state rather than an event. But it
         // also stopped the *turn-away*, and that is the part which is not
         // cosmetic: a crab whose neighbour happened to be clapping walked
-        // straight through it, and the colony measured a third of all pairs
-        // occupying the same cell.
+        // straight through it.
         //
         // So: always reverse, always hop, and clap only if neither is already
         // clapping. The clap's own duration is the cooldown.
+        //
+        // `ground` is this loop's own question about a crab and it is worth
+        // having a single answer for, since integration, the renderer and here
+        // all ask it.
+        let ground = ground_row(self.screen_size);
         let reach = touch_distance();
         let reach = reach * reach;
         for i in 0..crab_count {
@@ -747,18 +956,39 @@ impl Crab {
                 if distance_squared >= reach {
                     continue;
                 }
-                // Only if they are closing. Unconditional reversal makes two
-                // crabs that are merely *near* each other swap directions every
-                // frame they are near, which sends them into each other again
-                // immediately -- a pair that met once spent the rest of the run
-                // oscillating across the screen and 27% of all pairs were inside
-                // a sprite's width. Reversing only a closing pair separates them
-                // once and lets them travel.
+                // Only for a pair that is closing *and* head-on. The two halves
+                // are different questions and either one alone leaves a lock.
+                //
+                // `closing` is the rate of change of the gap, so it is true for
+                // two crabs walking the same way when the one behind is the
+                // faster -- an overtake. Reversing both of those does not turn
+                // them around, it turns them into a head-on pair that is
+                // *more* closing than they were, and the pair then oscillates:
+                // measured at the current walk speed, two crabs sixteen columns
+                // apart reversed on 571 of 600 consecutive frames, so the whole
+                // colony was vibrating in place and its drawn column changed
+                // half a time a second instead of three. The path length looked
+                // right -- each crab covered three cells a second -- which is
+                // exactly why this took a trace to find rather than a number.
+                //
+                // Unconditional reversal has the same failure from the other
+                // end: two crabs that are merely *near* each other swap
+                // directions every frame they are near, which sends them into
+                // each other again immediately, and a pair that met once spent
+                // the rest of the run oscillating across the screen.
+                //
+                // A genuine overtake is not a collision, and it does not get
+                // one: nothing here fires, and the pair is left to
+                // [`separate_crabs`](Self::separate_crabs), which is the
+                // question that actually concerns a same-direction pair --
+                // whether the faster one is about to be inside the slower one.
                 let relative = self.crabs[i].position.0 - self.crabs[j].position.0;
                 let closing = (self.crabs[i].velocity.0 - self.crabs[j].velocity.0)
                     * relative
                     < 0.0;
-                if !closing {
+                let head_on =
+                    self.crabs[i].velocity.0 * self.crabs[j].velocity.0 < 0.0;
+                if !closing || !head_on {
                     continue;
                 }
                 let clap = !self.crabs[i].is_special && !self.crabs[j].is_special;
@@ -767,6 +997,25 @@ impl Crab {
                     if clap {
                         self.crabs[crab].is_special = true;
                         self.crabs[crab].special_timer = self.options.clap_duration;
+                    }
+
+                    // The turn-away is a hop, and a crab cannot hop while it is
+                    // already in the air. Gating on that is the fix for a crowd:
+                    // a crab with a head-on neighbour on each side is reversed
+                    // again the frame after it turned, and on a crowded colony it
+                    // was doing that on every frame -- 47 reversals a second,
+                    // the colony going nowhere. A startled crab is off the
+                    // ground for about half a second, so it cannot be startled
+                    // again until it lands, and the rate falls to a couple a
+                    // second.
+                    //
+                    // Gated per crab rather than per pair, so the neighbour on
+                    // the ground still turns away from the one flying over it,
+                    // which reads correctly. Measured: 47 reversals a second
+                    // without this, at most 4 with it, across every size and
+                    // colony this effect is given.
+                    if self.crabs[crab].position.1 < ground {
+                        continue;
                     }
                     self.crabs[crab].velocity.0 = -self.crabs[crab].velocity.0;
                     self.crabs[crab].direction =
@@ -822,23 +1071,100 @@ mod tests {
         let _ = Crab::new(options, (6, 6));
     }
 
-    /// The drawn column must change far more often than once every fourteen
-    /// frames.
+    /// The default walk is a scuttle, and the band it sits in is the point.
     ///
-    /// The bug, measured rather than argued. The old effect moved a crab 1.5 to
-    /// 4.5 cells a second and `get_diff` rounds to whole cells, so the drawn
-    /// position changed once every 14 to 40 frames -- and at 80x24 with the
-    /// default colony it measured once every 21. A sprite that moves one column
-    /// every third of a second is not walking, it is teleporting, and no amount
-    /// of extra animation frames hides that: the *body* has to move too.
+    /// 2.1 to 3.9 cells a second at the defaults: `movement_speed` of 3.0, a
+    /// gain of 1.0, and a velocity drawn from `0.7..1.3`. That is inside the
+    /// 1.5 to 4.5 the effect walked at before any gain existed, and it is
+    /// deliberately back inside.
     ///
-    /// Asserted as a rate over a run rather than as a minimum step size, because
-    /// a rate is the thing that was wrong. A crab can be momentarily still --
-    /// bouncing off a wall, or mid-hop with its column unchanged -- so the
-    /// assertion is about the average, and the threshold is a quarter of frames,
-    /// i.e. one column per four.
+    /// The gain was 5.0 for one session, which put the colony at 10.5 to 19.5
+    /// cells a second, and the person who had asked for *that* then reported the
+    /// crabs "change too fast". The two reports are about the same number from
+    /// opposite ends, which is why this asserts the whole band rather than a
+    /// single ceiling: the fast end of `WALK_SPEED_RANGE` and the slow end both
+    /// have to be inside it, so neither end of the personality range can quietly
+    /// become a sprint.
     #[test]
-    fn the_drawn_column_moves_far_often_often() {
+    fn the_default_walk_is_a_scuttle_rather_than_a_sprint() {
+        let cells_per_second = |velocity: f32| {
+            velocity * CrabOptions::default().movement_speed * WALK_GAIN
+        };
+        let slow = cells_per_second(WALK_SPEED_RANGE.0);
+        let fast = cells_per_second(WALK_SPEED_RANGE.1);
+
+        assert!(
+            (1.5..=4.5).contains(&slow) && (1.5..=4.5).contains(&fast),
+            "the default colony walks at {slow:.1} to {fast:.1} cells a second. \
+             It wants the 1.5 to 4.5 band: below it a crab jumps a whole column \
+             every third of a second, and above it the body crosses a cell \
+             between every two leg positions"
+        );
+    }
+
+    /// And a running colony really covers that much ground.
+    ///
+    /// The test above reads constants, which is a proxy; this one reads the
+    /// simulation, and it is the one that would notice the constants being
+    /// right and the *walk* being wrong -- a crab that was turned around on every
+    /// frame would have a plausible-looking velocity and cover no ground at all.
+    ///
+    /// Measured as total path length rather than displacement, because a crab
+    /// that meets a neighbour and turns away is still walking. That is the whole
+    /// subtlety: a colony locked into a vibration has a large path length and a
+    /// displacement of nothing, and the pair of measurements is what tells those
+    /// apart. The bounds are the same 1.5 to 4.5 as above, measured at 2.2 to
+    /// 3.7 on the default colony.
+    #[test]
+    fn a_running_colony_covers_the_ground_its_speed_says() {
+        let mut crab = colony();
+        for _ in 0..30 {
+            crab.step(1.0 / 60.0);
+        }
+
+        let frames = 600u16;
+        let mut path = vec![0.0f32; crab.crabs.len()];
+        for _ in 0..frames {
+            let before: Vec<f32> =
+                crab.crabs.iter().map(|c| c.position.0).collect();
+            crab.step(1.0 / 60.0);
+            for (index, crab) in crab.crabs.iter().enumerate() {
+                path[index] += (crab.position.0 - before[index]).abs();
+            }
+        }
+
+        let seconds = f32::from(frames) / 60.0;
+        for (index, walked) in path.iter().enumerate() {
+            let per_second = walked / seconds;
+            assert!(
+                (1.5..=4.5).contains(&per_second),
+                "crab {index} covered {walked:.1} cells in ten seconds, which is \
+                 {per_second:.1} cells a second rather than a scuttle"
+            );
+        }
+    }
+
+    /// The drawn column keeps up with the walk -- and does not run ahead of it.
+    ///
+    /// Two bounds, because the drawn column and the walk are the same number and
+    /// both readings of it have been reported as bugs.
+    ///
+    /// The lower one: `get_diff` rounds to whole columns, so a crab is a sprite
+    /// that jumps a column at a time, and the rate it does that at is its speed
+    /// divided by one. A colony whose crabs each change column about three times
+    /// a second is walking. A colony whose crabs change column half a time a
+    /// second is *vibrating* -- measured, in a version of this effect whose
+    /// collision response turned two crabs walking the same way around on every
+    /// frame, so the two of them were permanently "closing", permanently
+    /// reversing, and never got a column apart. Its velocities looked correct
+    /// throughout, which is why this is asserted on the drawn column and not on
+    /// the speed.
+    ///
+    /// The upper one: a crab cannot change column faster than it walks, so this
+    /// is the check that fails if the walk is ever turned up again. At the old
+    /// gain of 5.0 it measured 12.6 changes a second per crab.
+    #[test]
+    fn the_drawn_column_keeps_up_with_the_walk() {
         let mut crab = colony();
         for _ in 0..30 {
             crab.step(1.0 / 60.0);
@@ -870,45 +1196,70 @@ mod tests {
             previous = now;
         }
 
-        let per_crab_frame =
-            changes as f64 / (frames * crab.crabs.len().max(1)) as f64;
-        // A fifth of frames, i.e. a cell every five. Measured at 19.3% on the
-        // default colony, against 4.7% for the old effect -- so this is a 4.1x
-        // improvement and not a marginal one. The threshold sits below the
-        // measurement so the test is about the order of magnitude rather than
-        // about a particular crab's luck at a wall.
+        let per_crab_second = changes as f64
+            / (frames as f64 / 60.0)
+            / crab.crabs.len().max(1) as f64;
         assert!(
-            per_crab_frame > 0.15,
-            "a crab changed column on only {:.1}% of frames, so it moves one \
-             cell every {:.0} frames; the old effect managed one every 21",
-            per_crab_frame * 100.0,
-            1.0 / per_crab_frame.max(f64::MIN_POSITIVE)
+            per_crab_second > 1.0,
+            "a crab changed drawn column {per_crab_second:.1} times a second, so \
+             it is standing still and twitching rather than walking; a vibrating \
+             colony measured 0.5"
+        );
+        assert!(
+            per_crab_second < 4.5,
+            "a crab changed drawn column {per_crab_second:.1} times a second, \
+             which is faster than the fastest crab in the colony is meant to walk; \
+             the gain of 5.0 measured 12.6"
         );
     }
 
-    /// And not so fast that the sprite outruns its own legs.
+    /// A pose change and a step of the body are the same event, and neither runs
+    /// away from the other.
     ///
-    /// The other end of the same knob, and it is a real one: a crab covering
-    /// three cells between two pose changes reads as sliding rather than
-    /// stepping, and the fix for the teleporting bug would have introduced it.
+    /// `cells_per_pose` is the number of cells the body covers between two leg
+    /// positions, and it is the relationship the eye actually judges a scuttle
+    /// by: too many and the body slides through the picture while the legs trail
+    /// behind it, too few and the legs move in slow motion on a crab that has
+    /// stopped. At the defaults it is 0.6 cells.
+    ///
+    /// Both bounds are one-sided arguments about which failure is worse. The
+    /// upper one is the sprite's own half-width: a real crab's stride is about
+    /// that, so more than a couple of cells per pose is faster than life rather
+    /// than slower. The lower one is a quarter of a cell, which is the point at
+    /// which a pose change is no longer accompanied by the body having gone
+    /// anywhere at all.
+    ///
+    /// The pose *rate* is checked here too because it is the other half of the
+    /// same knob and it is not derived from the walk: the legs cycle at
+    /// `1 / animation_speed` whatever `WALK_GAIN` is. Three poses per second is
+    /// a scuttle; below two it is a shuffle, and much above eight the three
+    /// distinct pictures blur into a shimmer -- which is what a two-pose cycle at
+    /// five hertz used to be.
     #[test]
-    fn the_crab_does_not_outrun_its_own_walk_cycle() {
+    fn the_legs_and_the_body_move_at_the_same_time() {
         let options = CrabOptions::default();
         let cells_per_second = (WALK_SPEED_RANGE.0 + WALK_SPEED_RANGE.1)
             * 0.5
             * options.movement_speed
             * WALK_GAIN;
         let cells_per_pose = cells_per_second * options.animation_speed;
+        let poses_per_second = 1.0 / options.animation_speed;
 
-        // Four cells per pose, against a sprite fifteen columns wide. The
-        // natural bound is the sprite's own half-width: a real crab's stride is
-        // about that, so anything under about seven is slower than life rather
-        // than faster. Below two the legs would be moving faster than the body,
-        // which is the other way to look wrong.
         assert!(
-            (2.0..4.0).contains(&cells_per_pose),
+            (0.25..3.0).contains(&cells_per_pose),
             "a crab covers {cells_per_pose:.1} cells between poses, so the legs \
-             are either faster than the body or too slow to read as steps"
+             are either trailing a sliding body or pedalling on a crab that is \
+             not moving"
+        );
+        // Capped at 4, not at 8. The walk speed and the leg rate are separate
+        // timers, so slowing the body left the legs snapping five times a second
+        // and the complaint that came back was "they change too fast" -- which is
+        // the legs, not the body. Above about 4 the pose change stops reading as
+        // a step and starts reading as a flicker.
+        assert!(
+            (1.5..=4.0).contains(&poses_per_second),
+            "the legs cycle {poses_per_second:.1} times a second, which is not a \
+             scuttle"
         );
         assert!(
             cells_per_second < 25.0,
@@ -1168,64 +1519,404 @@ mod tests {
         }
     }
 
-    /// No two crabs share a drawn cell, and none of them walks off the seabed.
+    /// No two crabs are ever drawn in the same column.
     ///
-    /// "Pathologically" needs a number. The colony is placed with a whole
-    /// sprite's width between neighbours where the terminal allows it, which is
-    /// 17 columns; the crabs then walk freely and the collision response turns
-    /// them around, so the honest bound is the sprite's own width: two crabs
-    /// closer than that are on top of each other, and two crabs at the same
-    /// drawn cell are certainly on top of each other.
+    /// The bug, measured rather than argued. There was no runtime separation at
+    /// all -- only the spawn-time placement, which is a suggestion rather than a
+    /// rule -- and `check_crab_collisions` could not cover for it, because it
+    /// acts only on a *closing* pair. Two crabs travelling the same way in the
+    /// same column are not closing on each other, so nothing ever separated them
+    /// and they stayed stacked for the rest of the run. At 200x50 with the
+    /// colony size that terminal actually builds, the closest approach over ten
+    /// seconds was 0.03 cells and a pair shared a drawn column on 28 of 39,600
+    /// pair-frames; at 80x24 with nine crabs it was 0.0004 and 835 of 21,600.
+    ///
+    /// Asserted as *zero* now rather than as a rate, because it is a rate no
+    /// longer: [`separate_crabs`](Crab::separate_crabs) runs every frame, so the
+    /// guarantee is a floor and not a tendency. The old bound allowed one frame
+    /// in fifty on the reasoning that "two crabs meeting *is* the collision
+    /// response", which was true of the turn-away and false of the pair that had
+    /// already met and could not separate.
+    ///
+    /// The same drawn column rather than a cell, because that is what is on
+    /// screen: the sprite is drawn from the crab's rounded column, so two crabs a
+    /// tenth of a cell apart are one crab painted twice. The vertical component
+    /// is deliberately not compared, since a hop is a real difference on screen.
+    ///
+    /// The sizes are the ones a terminal gives a real colony, and the one that
+    /// is left out is the one where the claim is not true. Below sixteen columns
+    /// the sprite is wider than the screen, so `right_edge` is zero and there is
+    /// exactly one column a crab may stand in: three crabs on a six-column
+    /// terminal are one crab, and no arrangement of them is any other. That is
+    /// asserted separately at the end of this test rather than left implicit, so
+    /// the exclusion in the loop is a consequence and not a preference.
     #[test]
-    fn crabs_do_not_stack_on_each_other() {
-        let mut crab = colony();
-        let (sprite_width, _) = sprite();
+    fn no_two_crabs_are_ever_drawn_in_the_same_column() {
+        for (width, height) in [
+            (20u16, 9u16),
+            (40, 12),
+            (80, 24),
+            (120, 40),
+            (200, 50),
+            (400, 200),
+        ] {
+            // The colony the runtime would build here, which for a large screen
+            // is the densest one this effect is ever given.
+            let count =
+                ((width as f32 * height as f32) / 800.0).clamp(3.0, 15.0) as u16;
+            let mut crab = Crab::new(
+                CrabOptions {
+                    crab_count: count,
+                    ..Default::default()
+                },
+                (width, height),
+            );
+            assert!(
+                separation(width, crab.crabs.len()) >= 1.0,
+                "{width}x{height} is in this list but cannot hold {} crabs a \
+                 column apart, so the assertion below would fail for a reason \
+                 that has nothing to do with the separation",
+                crab.crabs.len()
+            );
 
-        let mut stacked = 0usize;
-        let mut overlapping = 0usize;
-        let frames = 600;
-        for _ in 0..frames {
-            crab.step(1.0 / 60.0);
-            let cells: Vec<(i64, i64)> = crab
-                .crabs
-                .iter()
-                .map(|c| (c.position.0.round() as i64, c.position.1.round() as i64))
-                .collect();
-            let mut unique = HashSet::new();
-            for cell in &cells {
-                if !unique.insert(*cell) {
-                    stacked += 1;
-                }
-            }
-            for (index, a) in cells.iter().enumerate() {
-                for b in cells.iter().skip(index + 1) {
-                    if (a.0 - b.0).unsigned_abs() < sprite_width as u64 {
-                        overlapping += 1;
-                    }
+            for frame in 0..600 {
+                crab.step(1.0 / 60.0);
+                let columns: Vec<i64> = crab
+                    .crabs
+                    .iter()
+                    .map(|c| c.position.0.round() as i64)
+                    .collect();
+                let mut unique = HashSet::new();
+                for column in &columns {
+                    assert!(
+                        unique.insert(column),
+                        "{width}x{height}, frame {frame}: two crabs are both \
+                         drawn in column {column}, which is two crabs painted as \
+                         one: {columns:?}"
+                    );
                 }
             }
         }
 
-        // Not zero. Two crabs meeting *is* the collision response, and they are
-        // level for the frame before they turn around; asserting they are never
-        // level would be asserting that the collision code never runs. Under one
-        // frame in fifty is a collision rather than a pile-up.
-        assert!(
-            stacked * 50 < frames,
-            "two crabs shared a cell on {stacked} of {frames} frames, which is \
-             a pile-up rather than a collision"
+        // And the screen that cannot: the sprite is fifteen columns wide, so on
+        // anything narrower than that `right_edge` is zero and every crab is
+        // clamped to column zero. Fifteen is the last such width and sixteen the
+        // first with a seabed at all, one column of it. The claim is unmeetable
+        // rather than unmet, and the only honest thing is to say so in the test
+        // that states it.
+        for (width, height) in [(1u16, 1u16), (6, 6), (15, 5)] {
+            let mut crab = Crab::new(CrabOptions::default(), (width, height));
+            assert_eq!(
+                right_edge(width, sprite().0),
+                0.0,
+                "{width}x{height} now has a seabed, so the degenerate case has \
+                 to move out of this comment and into the loop above"
+            );
+            for _ in 0..60 {
+                crab.step(1.0 / 60.0);
+            }
+            for entity in &crab.crabs {
+                assert_eq!(
+                    entity.position.0, 0.0,
+                    "{width}x{height}: a crab is at column {} where the only \
+                     column is zero",
+                    entity.position.0
+                );
+            }
+        }
+    }
+
+    /// And no two crabs are ever closer than the separation, which is a stronger
+    /// claim than the one above.
+    ///
+    /// A gap of one cell is the smallest that guarantees distinct drawn columns,
+    /// so this is the property that says the two are not an accident of
+    /// rounding: on a crowded colony the sweep holds the whole row, and the
+    /// measured closest approach comes out at exactly the gap rather than near
+    /// it. The gap it is measured against is [`separation`]'s, not
+    /// [`MIN_SEPARATION`]'s, because a screen narrower than the colony cannot
+    /// give six cells to every pair and asking for six anyway is not a stricter
+    /// test, it is an unmeetable one.
+    ///
+    /// Driven across the sizes and colony sizes where the two differ, because the
+    /// small ones are the interesting ones: at 20x9 a crab is fifteen columns of
+    /// a twenty-column screen and there is a cell and two thirds of slack between
+    /// three of them.
+    #[test]
+    fn no_two_crabs_are_ever_within_the_separation() {
+        for (width, height) in [
+            (20u16, 9u16),
+            (40, 12),
+            (80, 24),
+            (120, 40),
+            (200, 50),
+            (400, 200),
+        ] {
+            for count in [3u16, 5, 12, 15] {
+                let mut crab = Crab::new(
+                    CrabOptions {
+                        crab_count: count,
+                        ..Default::default()
+                    },
+                    (width, height),
+                );
+                let wanted = separation(width, crab.crabs.len());
+
+                for frame in 0..300 {
+                    crab.step(1.0 / 60.0);
+                    for (index, a) in crab.crabs.iter().enumerate() {
+                        for (other, b) in
+                            crab.crabs.iter().enumerate().skip(index + 1)
+                        {
+                            let gap = (a.position.0 - b.position.0).abs();
+                            // A thousandth of a cell of slack for the arithmetic
+                            // in the sweep, which subtracts and adds gaps of
+                            // this size across up to fifteen of them.
+                            assert!(
+                                gap >= wanted - 1.0e-3,
+                                "{width}x{height} with {count} crabs, frame \
+                                 {frame}: crabs {index} and {other} are {gap:.3} \
+                                 cells apart, inside the {wanted:.3} the seabed \
+                                 can hold"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gap the effect asks for is one the seabed can actually pay.
+    ///
+    /// The single inequality
+    /// [`Crab::separate_crabs`] rests on, and the reason it is a test rather
+    /// than a comment: it is not checked anywhere in the code, because the sweep
+    /// *cannot* check it -- a violation does not fail, it quietly walks a crab
+    /// off the left-hand wall, and `crabs_stay_inside_the_canvas` would then be
+    /// the thing reporting a separation bug as a rendering one.
+    #[test]
+    fn the_gap_asked_for_never_exceeds_what_the_seabed_can_hold() {
+        for width in [1u16, 6, 15, 20, 40, 80, 120, 200, 400] {
+            let span = right_edge(width, sprite().0);
+            for count in [2usize, 3, 5, 9, 12, 15, 16] {
+                let wanted = separation(width, count);
+                assert!(
+                    wanted as f64 * (count - 1) as f64 <= span as f64 + 1.0e-3,
+                    "{count} crabs on a {width}-column screen ask for {wanted:.3} \
+                     cells each, which needs {:.1} of the {span:.1} columns of \
+                     seabed they have",
+                    wanted as f64 * (count - 1) as f64
+                );
+                assert!(
+                    wanted <= MIN_SEPARATION,
+                    "the gap is {wanted:.3} on a {width}-column screen, so a \
+                     screen wide enough is not getting the full \
+                     {MIN_SEPARATION}"
+                );
+            }
+        }
+        // A colony of one has nothing to be separated from, and the old formula
+        // divided by `count - 1` -- which is zero there.
+        assert_eq!(separation(200, 1), 0.0);
+        assert_eq!(separation(200, 0), 0.0);
+    }
+
+    /// Catching up to a slower crab is not a collision.
+    ///
+    /// The head-on half of the collision gate, asserted on the two shapes of
+    /// encounter it separates rather than on a rate, because a rate cannot tell
+    /// them apart: both of them reverse crabs, and the difference is whether the
+    /// pair was ever going to meet.
+    ///
+    /// `closing` is the rate of change of the *gap*, so a faster crab behind a
+    /// slower one is closing on it for as long as it takes. Reversing both of
+    /// those does not turn them around -- it points them at each other, which is
+    /// more closing than the overtake was, and the pair then oscillates without
+    /// ever passing. Measured: two crabs sixteen columns apart, both walking
+    /// right, the one behind a fifth faster, reversed on 571 of 600
+    /// consecutive frames. Neither of them went anywhere, and every velocity
+    /// reading in the effect was correct throughout.
+    ///
+    /// The other half of the same test is the head-on pair, which *must* turn
+    /// around: without that the gate would be satisfied by never reacting at all,
+    /// and the turn-away is the whole reason two crabs meeting looks like
+    /// something.
+    #[test]
+    fn a_crab_following_a_slower_one_is_not_a_collision() {
+        /// Two crabs, at the given columns with the given horizontal velocities,
+        /// and nothing else in play. Both on the sand, both facing with their
+        /// velocity, no hop pending, so the assertions are about the turn-away
+        /// and not about whether a crab happened to be airborne.
+        fn facing(width: u16, first: (f32, f32), second: (f32, f32)) -> Crab {
+            let mut colony = Crab::new(CrabOptions::default(), (width, 24));
+            colony.crabs.truncate(2);
+            let ground = ground_row(colony.screen_size);
+            for (entity, (x, velocity)) in
+                colony.crabs.iter_mut().zip([first, second])
+            {
+                entity.position = (x, ground);
+                entity.velocity = (velocity, 0.0);
+                entity.hop_timer = HOP_INTERVAL.1;
+                entity.is_special = false;
+                entity.special_timer = 0.0;
+                entity.direction = if velocity >= 0.0 {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                };
+            }
+            colony
+        }
+
+        // Ten columns apart, which is inside the sprite-width reach, and the
+        // left crab is walking away from the right one and the right crab is
+        // walking left towards it.
+        let head_on = facing(80, (30.0, 1.0), (40.0, -1.0));
+        let following = facing(80, (30.0, 1.2), (40.0, 1.0));
+
+        for (label, mut crab) in [("head-on", head_on), ("following", following)] {
+            for _ in 0..5 {
+                crab.step(1.0 / 60.0);
+            }
+            let heading: Vec<f32> =
+                crab.crabs.iter().map(|c| c.velocity.0.signum()).collect();
+            if label == "head-on" {
+                assert_eq!(
+                    heading,
+                    vec![-1.0, 1.0],
+                    "two crabs walking into each other ten columns apart did not \
+                     turn around, so the collision response is not running"
+                );
+            } else {
+                assert_eq!(
+                    heading,
+                    vec![1.0, 1.0],
+                    "a crab that was overtaking a slower one turned around \
+                     instead: {heading:?}"
+                );
+            }
+        }
+    }
+
+    /// A separation that settles: a second pass over a separated colony moves
+    /// nothing.
+    ///
+    /// The reason a positional correction is worth being careful about. Two
+    /// crabs pushing each other along a line can push themselves back and forth
+    /// forever, and the standard answer is to damp the correction or give it a
+    /// deadzone. A sorted two-pass sweep needs neither, and this is the assertion
+    /// for that: the sweep is a projection rather than a force, so it moves each
+    /// crab by exactly the overlap and no more, and over a colony that is already
+    /// a gap apart it is the identity. If a future change makes it a force
+    /// instead -- a relaxation factor, a "nudge rather than a shove" multiplier,
+    /// a deadzone that is subtracted rather than avoided -- this is the test that
+    /// says it no longer settles.
+    ///
+    /// Asserted on a colony that is deliberately *not* separated first, so the
+    /// test covers the transition as well as the resting state: the first call
+    /// has real work to do and the second must do none of it.
+    #[test]
+    fn separation_settles_rather_than_jittering() {
+        let mut crab = Crab::new(
+            CrabOptions {
+                crab_count: 8,
+                ..Default::default()
+            },
+            (120, 24),
         );
-        // And not usually overlapping either. The turn-away is at a sprite's
-        // width, so a pair is inside that only for the frame or two it takes to
-        // react: at 0.25 cells a frame that is a quarter of a cell of overshoot.
-        // A tenth of frames is the bound, against the old constant's third --
-        // which is what "a colony where a third of all pairs overlap" measured.
-        let pairs = frames * crab.crabs.len() * (crab.crabs.len() - 1) / 2;
-        assert!(
-            overlapping * 10 < pairs,
-            "two crabs were within a sprite's width on {overlapping} of {pairs} \
-             frames, so the colony is a heap rather than a shoal"
-        );
+        // All eight in one column, which is the state the report was about.
+        for entity in &mut crab.crabs {
+            entity.position.0 = 10.0;
+        }
+
+        crab.separate_crabs();
+        let after_first: Vec<f32> =
+            crab.crabs.iter().map(|c| c.position.0).collect();
+        let mut columns = after_first.clone();
+        columns.sort_by(f32::total_cmp);
+        for pair in columns.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= MIN_SEPARATION - 1.0e-3,
+                "the first pass left a gap of {:.3}: {columns:?}",
+                pair[1] - pair[0]
+            );
+        }
+
+        crab.separate_crabs();
+        let after_second: Vec<f32> =
+            crab.crabs.iter().map(|c| c.position.0).collect();
+        for (index, (a, b)) in after_first.iter().zip(&after_second).enumerate() {
+            assert_eq!(
+                a, b,
+                "crab {index} moved again on the second pass, from {a} to {b}, so \
+                 the correction is a force and will oscillate"
+            );
+        }
+    }
+
+    /// A crab walks, and does not reverse itself several times a second.
+    ///
+    /// The symptom of the collision response being wrong, and the reason it
+    /// needed a trace to find rather than a number: a crab whose velocity sign
+    /// flips every frame has a *plausible* speed, covers three cells a second of
+    /// path, and does not go anywhere. Every speed measurement in this file was
+    /// happy with it.
+    ///
+    /// Two of the ways to get here, both real, both measured at the time:
+    ///
+    /// - A same-direction pair. `closing` is the rate of change of the gap, so
+    ///   it is true when the crab behind is the faster one, and reversing *both*
+    ///   turns an overtake into a head-on pair that is more closing than the
+    ///   overtake was. Measured: 571 reversals in 600 consecutive frames, a
+    ///   drawn column changing half a time a second, at five crabs on 80x24.
+    /// - A crab in the middle of a chain of three, reversed once by the pair on
+    ///   its left and again by the pair on its right in the same frame, so it
+    ///   ended the frame going the way it started. Measured: 47 reversals a
+    ///   second on a crowded colony, after the first fix.
+    ///
+    /// The bound is loose on purpose -- a crab legitimately meets a neighbour
+    /// every second or so, and a hop it cannot be startled out of is half a
+    /// second long -- because the property is that the response is an *event*
+    /// rather than a state, and 47 and 571 are not on the same side of that line
+    /// as anything measured here.
+    #[test]
+    fn a_crab_walks_rather_than_vibrating_in_place() {
+        for (width, height) in [(80u16, 24u16), (120, 40), (200, 50), (400, 200)] {
+            for count in [3u16, 5, 12, 15] {
+                let mut crab = Crab::new(
+                    CrabOptions {
+                        crab_count: count,
+                        ..Default::default()
+                    },
+                    (width, height),
+                );
+                let mut reversals = vec![0usize; crab.crabs.len()];
+                let mut previous: Vec<f32> =
+                    crab.crabs.iter().map(|c| c.velocity.0).collect();
+
+                let frames = 600;
+                for _ in 0..frames {
+                    crab.step(1.0 / 60.0);
+                    for (index, entity) in crab.crabs.iter().enumerate() {
+                        if entity.velocity.0 * previous[index] < 0.0 {
+                            reversals[index] += 1;
+                        }
+                        previous[index] = entity.velocity.0;
+                    }
+                }
+
+                let seconds = frames as f64 / 60.0;
+                for (index, turns) in reversals.iter().enumerate() {
+                    let per_second = *turns as f64 / seconds;
+                    assert!(
+                        per_second < 10.0,
+                        "{width}x{height} with {count} crabs: crab {index} turned \
+                         itself around {per_second:.0} times a second, so it is \
+                         vibrating rather than walking"
+                    );
+                }
+            }
+        }
     }
 
     /// Every crab is on the sand, and the sand is on the bottom row.
@@ -1473,19 +2164,35 @@ mod tests {
     /// `movement_speed` is unchanged, because a test outside this module pins
     /// it and the gain is a separate constant.
     ///
-    /// The walk is faster than it was, and it had to be: at 3.0 the old effect
-    /// moved a crab 1.5 to 4.5 cells a second, which is one drawn column every
-    /// 14 to 40 frames. `WALK_GAIN` is where the change went instead of into
-    /// this default, so `movement_speed` keeps the meaning a user's config gave
-    /// it -- it still scales how fast a crab walks -- and the pinned value still
-    /// holds.
+    /// The walk's *rate* has been changed twice and both times it went here
+    /// rather than into this default, so a user's config keeps the meaning it
+    /// was written with: `movement_speed` still multiplies how fast a crab
+    /// walks, and `WALK_GAIN` is a fixed factor on top of it that no config
+    /// file can see.
+    ///
+    /// That is the argument for keeping the pinned 3.0, and it is why the
+    /// revert did not go here. At 3.0 with a 1.0 gain the colony walks 2.1 to
+    /// 3.9 cells a second, which is the band the effect had before any gain
+    /// existed; getting there by dividing `movement_speed` by five would have
+    /// moved the number a test in `tests/runtime_and_ascii.rs` deliberately
+    /// pins, and would have silently redefined the scale of a key that a user's
+    /// config file already contains.
     #[test]
     fn movement_speed_is_unchanged_and_the_gain_carries_the_speed() {
         assert_eq!(CrabOptions::default().movement_speed, 3.0);
         // Not an `assert!`: `WALK_GAIN` is a constant, so the comparison is
         // resolved at compile time and an `assert!` over it is a `true` the
         // optimiser removes, which is the warning clippy is right to raise. A
-        // constant that is supposed to be above 1.0 says so by being above 1.0.
-        const _: () = assert!(WALK_GAIN > 1.0);
+        // constant that is supposed to be *at most* 1.5 says so by being at
+        // most 1.5, and this one is caught as a build failure rather than a
+        // test failure, which is the right severity for a value that was
+        // wrong once and had to be put back.
+        //
+        // 1.5 rather than 1.0 because the width of `WALK_SPEED_RANGE` is
+        // deliberately a personality range and a gain has to leave room for
+        // it: 1.5 * 3.0 * 1.3 is 5.85 cells a second at the fast end, which is
+        // already a blur. See `the_default_walk_is_a_scuttle_rather_than_a_
+        // sprint` for the band this exists to keep.
+        const _: () = assert!(WALK_GAIN <= 1.5);
     }
 }

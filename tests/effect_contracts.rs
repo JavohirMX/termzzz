@@ -6,7 +6,7 @@
 //! from `EffectId::all()` and `Config` rather than hard-coding per-effect
 //! values, so a newly added effect is covered without editing this file.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use termzzz::buffer::Cell;
@@ -274,7 +274,7 @@ fn omitting_any_single_key_keeps_its_real_default() {
         let mut depth: i32 = 0;
         let mut start: Option<usize> = None;
         // TOML multi-line strings span lines, and a value inside one is not a key.
-        // `dvd.logo` is a five-row block letter, so the serialised config contains
+        // `dvd.logo` is a 60-by-28 dot bitmap, so the serialised config contains
         // one, and without this the scanner treats each row of the letter as a key
         // of its own -- which it did, until this test caught it.
         let mut in_multiline = false;
@@ -558,10 +558,25 @@ fn effects_advance_using_the_frame_delta() {
     let nominal = Duration::from_secs_f64(1.0 / 60.0);
     let faster = Duration::from_secs_f64(0.05);
 
+    // Returns the final frame *and* the set of every cell the run touched.
+    //
+    // Two comparators, because neither alone works. The final frame is what
+    // distinguishes a full-repaint effect (`terrain`, `plasma`, `mandelbrot`),
+    // which repaints every cell every frame and so has a non-empty last diff
+    // whose *content* depends on how far it got. The set of touched cells is
+    // what distinguishes a sparse one (`crab`, `matrix`, `boids`), where the
+    // last frame is frequently empty no matter what -- which is exactly the trap
+    // this ran into: at three cells a second a crab moves 0.05 of a cell per
+    // frame at 60 Hz, so its final diff was empty at both rates and comparing
+    // two empty vectors reported a delta-driven effect as ignoring its delta.
+    //
+    // A delta-*ignoring* effect produces the same final frame and touches the
+    // same cells at both rates, so it fails both and is still caught.
     let run = |id: EffectId, delta: Duration| {
         let mut effect = AnyEffect::build(id, &config, size);
         let mut input = termzzz::runtime::InputState::default();
         input.set_size(size);
+        let mut touched: BTreeSet<(usize, usize)> = BTreeSet::new();
 
         for frame in 0..FRAMES {
             let step = termzzz::runtime::FrameContext::new(
@@ -571,7 +586,9 @@ fn effects_advance_using_the_frame_delta() {
                 delta,
                 input.clone(),
             );
-            effect.get_diff_with_context(&step);
+            for (x, y, _) in effect.get_diff_with_context(&step) {
+                touched.insert((x, y));
+            }
             effect.update_with_context(&step);
         }
 
@@ -582,7 +599,7 @@ fn effects_advance_using_the_frame_delta() {
             delta,
             input,
         );
-        effect.get_diff_with_context(&view)
+        (effect.get_diff_with_context(&view), touched)
     };
 
     let mut ignore_delta: Vec<&str> = Vec::new();
@@ -639,7 +656,12 @@ fn effects_advance_using_the_frame_delta() {
             continue;
         }
 
-        if baseline == run(id, faster) {
+        // Delta-driven if *either* comparator sees a difference. See the comment
+        // on `run`: a full-repaint effect is caught by its last frame and a
+        // sparse one by the ground it covered, and requiring both would fail
+        // each kind on the other's blind spot.
+        let other = run(id, faster);
+        if baseline.0 == other.0 && baseline.1 == other.1 {
             ignore_delta.push(id.as_str());
         }
     }
