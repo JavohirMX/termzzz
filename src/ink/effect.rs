@@ -1,4 +1,6 @@
-use super::renderer::{AsciiRenderer, GlyphPalette, PHOSPHOR_RAMP};
+use super::renderer::{
+    AsciiRenderer, DEFAULT_PALETTE_NAME, GlyphPalette, PHOSPHOR_RAMP,
+};
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::TerminalEffect;
@@ -33,10 +35,58 @@ pub struct AsciiFieldOptions {
     /// nothing and gives no reason. Anything the terminal can draw is kept
     /// rather than second-guessed, so `["reset"]` is a real answer -- "whatever
     /// my terminal's own foreground is" -- and `["ansi(15)"]` is too.
+    ///
+    /// # Interaction with `palette`
+    ///
+    /// **`palette` wins if both are set, and the default is set.** So a stock
+    /// config -- which has `colors` written out in it, because
+    /// `palette = "green"` is the default and resolving the default here would
+    /// mean a generated config could not be told to use orange -- has to
+    /// continue to work, and it can only do that if an untouched `colors` gets
+    /// out of the way.
+    ///
+    /// That is the whole argument, and it has a cost: the two options are
+    /// opposites rather than layers, so `palette = "orange"` alongside a
+    /// configured `colors` list silently discards the list. Stated here rather
+    /// than discovered later because there is no warning to give -- printing
+    /// every time both are set would be noise on a stock config, where both
+    /// *are* set by definition.
+    ///
+    /// `palette` is the friendlier spelling and it wins because it is the one
+    /// that says what it means. To use the list, set `palette = ""`.
     pub colors: Vec<Color>,
+    /// The name of a built-in colour ramp: `green`, `orange`, `blue`,
+    /// `magenta`, `ice`, or `amber`.
+    ///
+    /// The user asked for this: "can we make the colors more varied? Currently
+    /// it's green; can we have different settings, like an orange palette?"
+    /// `colors` was already a knob and was the wrong shape for the request --
+    /// getting orange out of it means writing `rgb_(255, 140, 32)` -- so the
+    /// names are the answer and `colors` stays for everything the names do not
+    /// cover.
+    ///
+    /// Case-insensitive. **An unknown name is not an error and not a blank
+    /// screen**: it falls back to `green`, the same way an empty `colors` list
+    /// falls back to [`PHOSPHOR_RAMP`], and for the same reason. A typo in a
+    /// hand-edited config should give you the default, not an invisible effect.
+    ///
+    /// The empty string is the default, which means "use `colors`", which is
+    /// what makes [`Self::colors`] still work -- see the note there on which of
+    /// the two wins.
+    ///
+    /// `Palette::named` already resolves names against a *different* table, of
+    /// multi-hue ramps that cycle. This one is deliberately a separate table of
+    /// single-hue brightness ramps: this effect indexes a ramp by value and stops
+    /// at the top, so it wants the other kind, and a user who typed
+    /// `palette = "ember"` here would get a ramp that ends on amber for a field
+    /// that is supposed to end on white. See [`super::FIELD_PALETTES`].
+    pub palette: String,
 }
 
 impl Default for AsciiFieldOptions {
+    /// Hand-written for the same reason as the plasma options': the real defaults
+    /// have to live in one place, and a derived `Default` is how a config file
+    /// that omits a key ends up with a zero in it.
     fn default() -> Self {
         Self {
             seed: 42,
@@ -44,7 +94,16 @@ impl Default for AsciiFieldOptions {
             pointer_strength: 0.7,
             brush_radius: 0.2,
             glyphs: super::renderer::DEFAULT_GLYPHS.to_string(),
+            // The default `colors` is still written, not left empty, for the
+            // reason given on `colors`: `--print-config` writes every key, so a
+            // generated config pins whatever the defaults were the day it was
+            // generated, and a default that is "empty, meaning green" would make
+            // every existing config resolve to green by accident rather than by
+            // decision. It also means this field renders identically with or
+            // without the new `palette` key, which is what "nothing changes for
+            // anyone who has not asked for this" has to mean in practice.
             colors: PHOSPHOR_RAMP.to_vec(),
+            palette: String::new(),
         }
     }
 }
@@ -138,7 +197,7 @@ impl AsciiField {
         let height = screen_size.1 as usize;
         let renderer = AsciiRenderer::new(GlyphPalette::new(
             &options.glyphs,
-            options.colors.clone(),
+            resolve_colors(&options),
         ));
         let phase = Self::phase_for_seed(options.seed);
 
@@ -239,6 +298,17 @@ impl AsciiField {
         }
     }
 
+    /// Which of the three glyph sets is currently drawn, for a test.
+    ///
+    /// Exists because a test that reaches into `palette_index` from another
+    /// module cannot, and the alternative -- a test that only says "the colours
+    /// are still right" -- cannot say *which* palette switch lost them. Six
+    /// presses of `]` is three glyph sets and three back round again, so a
+    /// number here is what makes a failure legible.
+    pub fn glyph_set_index(&self) -> usize {
+        self.palette_index
+    }
+
     fn decay_pointer(&mut self) {
         if let Some(pointer) = &mut self.pointer {
             pointer.strength *= 0.94;
@@ -266,10 +336,40 @@ impl AsciiField {
             0 => self.options.glyphs.as_str(),
             index => ALTERNATES[index - 1],
         };
+        // `resolve_colors` rather than `self.options.colors`, so a `palette =`
+        // name survives a `[`/`]` press. Reading the option directly here is
+        // what would make the new knob work on the first frame and then quietly
+        // revert the moment anyone pressed a key -- the exact bug
+        // `cycling_the_glyph_set_keeps_the_configured_colours` was written for.
         self.renderer = AsciiRenderer::new(GlyphPalette::new(
             glyphs,
-            self.options.colors.clone(),
+            resolve_colors(&self.options),
         ));
+    }
+}
+
+/// The colour stops to paint with, given both knobs.
+///
+/// `palette` wins when it names something, because it is the spelling that says
+/// what it means, and because the default `colors` is *always* populated -- so
+/// the alternative is that the new option could never take effect for anyone
+/// whose config file has the old key in it, which is everyone. The trade is
+/// written out on [`AsciiFieldOptions::colors`].
+///
+/// An unknown name resolves to the default rather than to nothing, for the same
+/// reason an empty `colors` list does: a typo in a hand-edited config should
+/// give you the default effect, not a blank screen and no explanation. The
+/// name is not case-sensitive, so `Orange` and `orange` are one name and not a
+/// typo.
+fn resolve_colors(options: &AsciiFieldOptions) -> Vec<Color> {
+    if options.palette.trim().is_empty() {
+        return options.colors.clone();
+    }
+    match super::renderer::palette_by_name(options.palette.trim()) {
+        Some(stops) => stops.to_vec(),
+        None => super::renderer::palette_by_name(DEFAULT_PALETTE_NAME)
+            .expect("the default palette is in the table")
+            .to_vec(),
     }
 }
 

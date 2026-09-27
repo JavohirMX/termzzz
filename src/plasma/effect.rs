@@ -4,7 +4,15 @@ use crate::common::TerminalEffect;
 use crate::render::glyph_ramp::{self, GlyphRamp};
 use crossterm::style;
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
+use std::f64::consts::{PI, SQRT_2};
+
+/// `std::f64::consts::SQRT_3` is still unstable, so it is spelled out here.
+///
+/// The literal is the correctly-rounded `f64` nearest `sqrt(3)`, which is all a
+/// frequency ratio needs: what matters is that it is irrational and that it is
+/// not a rational multiple of [`TIME_FREQ_WAVE`]'s base, and both properties
+/// survive to the last bit.
+const SQRT_3: f64 = 1.732_050_807_568_877_2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -92,39 +100,202 @@ const PALETTE_LEN: usize = 256;
 ///
 /// # Why this ordering
 ///
-/// Ten steps, the same count `SHADE` has, so the value resolution is unchanged.
+/// Sixteen steps, up from ten. The count is a *variety* decision and the user
+/// asked for it -- "you can use more different characters" -- and it is worth
+/// being honest about the ceiling. ASCII runs out of distinguishable weights
+/// long before it runs out of characters: below about a tenth of the cell's ink
+/// the repertoire is a crowd of one-tick marks, and no choice of sixteen of them
+/// makes sixteen *bands*. Nine of the fifteen boundaries below are within the
+/// ink table's resolution of their neighbour and are named as ties in the
+/// ordering test, which is what "a ramp for a *filled region* cannot begin with
+/// a space"-style limits look like from the inside. The consequence is stated
+/// where it is paid for, in [`VALUE_RESPONSE`].
+///
 /// Ordered lightest-first by estimated coverage, and shaped for this effect
 /// specifically:
-///
-/// - The heavy end is the tail. A smooth field spends most of its *area* near
-///   the middle of its value range, so a ramp that is already heavy at its
-///   midpoint makes the majority of the screen the darkest-ink thing on it.
-///   Every glyph below `#` is under about a third of the cell.
 ///
 /// - The mid-range glyphs differ in *shape* as well as in weight. `SHADE`'s
 ///   middle is `-`, `=`, `+`, `*`: four variations on a straight stroke, so a
 ///   whole region of the field is one repeated form and the value it carries is
-///   hard to read. `-`, `:`, `;`, `+`, `X` are five different silhouettes.
+///   hard to read. `-`, `:`, `=`, `;`, `*`, `+`, `X` are seven different
+///   silhouettes, and no two glyphs in the whole set share one.
 ///
-/// - The step sizes are roughly even, so one ramp step is one visible step.
-///   The gaps here are 5, 2, 4, 3, 2, 5, 6, 6 and 13 points, and the last is
-///   the price: `@` is a ring, an inner bowl and a tail, and there is nothing
-///   between `#` and it that a proportional ramp can use without stepping on
-///   `%`.
+/// - The heavy end adds *shapes* rather than more of the same mark. A
+///   punctuation-only ramp past `#` has nowhere to go but a thicker `+`, and the
+///   five steps from `O` to `@` are five closed or bounded forms at five weights:
+///   a ring, two rings and a slash, a bowl and a loop, four long strokes, and a
+///   ring with an inner bowl and a tail. The eye separates silhouettes more
+///   reliably than it separates weights, so this is where extra steps buy most.
+///
+/// - The heavy end is no longer a tail in *area*, which the ten-step version of
+///   this note relied on, and the reason is the re-spacing: `@` now covers about
+///   a sixteenth of the field rather than none of it. It is still a tail in
+///   *value* -- reaching it takes a value above 0.768, which is where the field's
+///   bright cores are -- but not in area, and the note that used to lean on area
+///   is what [`glyph_value`] had to be written to undo.
+///
+/// - A monochrome plasma is an unusual thing to want, and worth saying why the
+///   two channels are worth separating. The colour is a saturated hue wheel
+///   carrying the *raw* value, and it is doing most of the visual work: it never
+///   repeats a shade, it has a genuine dark end, and it changes hue as the field
+///   breathes. The glyph is a second, much lower-resolution encoding of the same
+///   scalar, and at sixteen steps it is the channel that runs out of distinct
+///   levels. Calibration belongs on the channel that needs it.
 ///
 /// # The pairs the estimate cannot separate
 ///
-/// Three, and they are named in the test rather than left to be rediscovered:
-/// `.-`, `:;` and `;+` are all within three percentage points of coverage, which
-/// is the point at which the table is measuring the font rather than the glyph.
-/// Their order is a legibility decision. `-` is the single most widely
-/// supported character in the repertoire; `:` is the most widely recognised
-/// "slightly more than that". `.` is a dot, and a dot is the lightest mark a
-/// font can draw. The pairs that are *not* ties and that this ordering gets
-/// right in a way `SHADE` does not: `-` before `:` (one mark against two) and
-/// `+` before `X` (a bar reaching the cell in both axes against two diagonals
-/// that cut across it, so the diagonals are longer but the total is close).
-const DEFAULT_GLYPHS: &str = " .-:;+X#%@";
+/// **Nine**, up from three, and they are named in the test rather than left to
+/// be rediscovered. That is the cost of a sixteen-step ASCII ramp and it is
+/// stated here rather than discovered later: see
+/// `the_default_ramp_is_ordered_by_estimated_ink_coverage`. The pattern in them
+/// is worth seeing on its own -- every one of the nine is at the *light* end and
+/// none at the heavy end. Below about a fifth of the cell's ink, ASCII is a
+/// crowd of one-mark glyphs, and the repertoire runs out of distinguishable
+/// weights long before it runs out of characters. A ramp wanting sixteen
+/// *reliably* separated bands would have to be a font, not a character set.
+const DEFAULT_GLYPHS: &str = " '.-:=;*+X#O%&M@";
+
+/// The value the glyph ramp is indexed by, remapped from the field's own value.
+///
+/// # What is wrong with indexing the ramp on the raw value
+///
+/// It is not that the mapping is wrong. It is *well* ordered: a higher field
+/// value still gets a denser character, and every ordering property in the test
+/// module survives whatever is done here. What is wrong is the **calibration**,
+/// and the measurement is blunt. Over 200 frames at 80x24 the ten-step ramp put
+/// `;` and `+` together on 49% of the screen and `@` on **0.00%**: the brightest
+/// glyph in the set was never drawn, not once. At 200x50, where the field is
+/// better sampled, `+` still took 23.5% and `@` 0.20%. The cause is that a sum
+/// of four sines is a *bell*: its value is concentrated near the middle of its
+/// range, so a ramp divided evenly in value spends most of its steps on
+/// distinctions the eye cannot find and leaves its extremes unreachable.
+///
+/// The field's measured quantiles at 1/16 intervals, at 200x50:
+///
+/// ```text
+/// 0.232 0.296 0.343 0.382 0.417 0.449 0.478 0.506 0.534 0.563
+/// 0.593 0.626 0.663 0.707 0.768
+/// ```
+///
+/// # Why a table and not an exponent
+///
+/// A gamma curve was tried and it is the wrong shape. `t^g` is convex or
+/// concave, so it can only tilt a bell, not flatten it: swept over 0.6 to 2.0 at
+/// 400x200 the best it managed was 13.6% in the busiest band, against 14.2% with
+/// no curve at all, while the *sparsest* band stayed at 0.0% in nine of the
+/// eleven exponents tried and 0.1% in the other two -- the field does not reach
+/// there, and no power of it will. Flattening a bell needs a curve that is
+/// *steep* in the middle and *shallow* at the ends, and a power curve is never
+/// S-shaped. Putting the boundaries at the measured quantiles is exactly that
+/// curve, and it is what [`VALUE_BOUNDARIES`] is.
+///
+/// # What it costs
+///
+/// - **The field's tails are compressed.** A value of 0.0 and a value of 0.23
+///   now draw the same glyph, and 0.77 and 1.0 draw the same other one. That is
+///   a real loss of contrast at the extremes, paid for in the middle: two
+///   characters that used to cover half the screen between them now cover an
+///   eighth of it, and the busiest character covers 6.4% against 29.1%. A region
+///   of the field reads as banded rather than as a wash. Banded is what "more
+///   different characters" asks for, and it is a change of look rather than a
+///   fix, so it is worth knowing that it is one.
+///
+/// - **The heavy end is no longer a tail in *area*,** which the ten-step note on
+///   [`DEFAULT_GLYPHS`] relied on. `@` now covers a sixteenth of the field rather
+///   than none of it. It is still a tail in *value*: reaching it takes a value
+///   above 0.768, which is where the field's bright cores are.
+///
+/// - **The colour channel is deliberately left alone.** A cell's colour is
+///   `palette[plasma + offset]` on the raw value, and remapping that too would
+///   change which colour a given brightness gets for no gain in variety -- the
+///   hue wheel is already continuous, so there is nothing to even out. The two
+///   channels therefore carry *different* transforms of one field, which is
+///   visible: a cell and its colour no longer step together. It is the right
+///   trade, and it is a trade.
+///
+/// # Where the boundaries are not
+///
+/// They are fitted at 200x50, and 400x200 agrees with them to within 0.006 at
+/// every one of the fifteen -- which the measurement in
+/// `every_glyph_of_the_default_ramp_carries_its_share_of_the_screen` confirms
+/// from the other end, by finding every step at 6.0% to 6.6% there too.
+///
+/// **80x24 does not agree, and cannot.** Reaching the field's extreme values is
+/// a coincidence in three variables at once, so a small screen does not sample
+/// them often enough: over 460,800 samples at 80x24 the field spans 0.032 to
+/// 0.941, against 0.0002 to 0.9998 at 400x200. The bottom of the ramp therefore
+/// comes out *thin* rather than empty at that size -- the space draws 1.54% and
+/// `'` 2.44% where each step draws 6.3% at 200x50 -- and no static table can do
+/// better, because the missing mass is in the field and not in the mapping. See
+/// `a_short_terminal_thins_the_ends_of_the_ramp` for what *is* asserted there.
+const VALUE_BOUNDARIES: [f64; 15] = [
+    0.232, 0.296, 0.343, 0.382, 0.417, 0.449, 0.478, 0.506, 0.534, 0.563, 0.593,
+    0.626, 0.663, 0.707, 0.768,
+];
+
+/// The remap itself: the glyph ramp's own value for a field value.
+///
+/// Monotonically non-decreasing, and *that* is the whole contract. Every ordering
+/// claim about this effect -- higher value means denser ink, the ramp never runs
+/// backwards, the darkest and brightest cells differ -- is a statement about the
+/// order of this function, and none of them depends on it being linear. A
+/// non-monotone curve here would break all of them at once, which is why the
+/// shape is a table of measured numbers rather than an expression.
+///
+/// `VALUE_BOUNDARIES[i]` maps to `(i + 0.5) / 15`, which is the middle of ramp
+/// step `i`, and the two ends map to themselves. The alignment is the whole
+/// trick and getting it wrong is invisible: a first version mapped each boundary
+/// to the *far* edge of its step, `(i + 1) / 15`, which is one half-step out of
+/// line. It still produced sixteen distinct glyphs and still satisfied every
+/// ordering claim, and it starved the two ends -- the space drew 1.28% of the
+/// field where every other step drew about 6.3%, and the top step drew 8.93%,
+/// because each segment then straddled a band boundary instead of filling one.
+/// With each segment filling exactly one band, every step takes a sixteenth.
+///
+/// The ends are half-width in output and a full chunk in input, while the middle
+/// is full-width in both, so the curve's slope is about fifteen times shallower at
+/// the extremes than in the middle. That is the point: the field's mass is in the
+/// middle, and an S-curve is the only shape that flattens a bell.
+///
+/// Cost is a binary search over fifteen entries and one division, per cell,
+/// which is not what a terminal screensaver should be spending its frame on but
+/// is also a good deal cheaper than the four sines and a square root that produce
+/// the value it is applied to.
+fn glyph_value(value: f64) -> f64 {
+    let value = if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    };
+
+    // How many boundaries the value is at or past, so `0..=15`: fifteen means it
+    // is above all of them and belongs in the last step.
+    let index = VALUE_BOUNDARIES.partition_point(|bound| *bound <= value);
+
+    let (low, high) = match index {
+        0 => (0.0, VALUE_BOUNDARIES[0]),
+        15 => (VALUE_BOUNDARIES[14], 1.0),
+        _ => (VALUE_BOUNDARIES[index - 1], VALUE_BOUNDARIES[index]),
+    };
+    // `GlyphRamp::index_for` is `round(f * 15)`, so step `index` is the interval
+    // from `(index - 0.5) / 15` to `(index + 0.5) / 15`. Step 0's lower edge and
+    // step 15's upper edge fall outside `0..=1` and cannot be reached, which is
+    // why those two segments come out half-width rather than full-width.
+    let (out_low, out_high) = match index {
+        0 => (0.0, 0.5 / 15.0),
+        15 => (14.5 / 15.0, 1.0),
+        _ => ((index as f64 - 0.5) / 15.0, (index as f64 + 0.5) / 15.0),
+    };
+
+    // A zero-width input segment is reachable only if two boundaries are equal,
+    // and a hand-edited table can do that. Guard the division rather than trust it.
+    let fraction = if high <= low {
+        0.0
+    } else {
+        ((value - low) / (high - low)).clamp(0.0, 1.0)
+    };
+    out_low + fraction * (out_high - out_low)
+}
 
 /// Builds the glyph ramp, never empty and never a character that could shear a
 /// cell-indexed grid.
@@ -168,6 +339,50 @@ const CELL_ASPECT: f64 = 1.2;
 /// rather than merge, and measured within noise of the alternatives on both
 /// metrics the tests use.
 const FOURTH_RADIUS_DIVISOR: f64 = 8.0;
+
+/// # The time frequencies, and why the field never repeats
+///
+/// The user said "right now it just goes up and down; it's not something new"
+/// and "make it unique each time and continuous, not a loop". The loop was not
+/// a stylistic matter. The four time terms ran at `now/2`, `now`, `0` and
+/// `now/4`, so their periods were `4*pi`, `2*pi`, infinite and `8*pi`, and the
+/// field's period was the least common multiple of those: **exactly `8*pi` =
+/// 25.1 units of `plasma.time`**, which at the default `time_scale` of 0.5 is
+/// 50 seconds of wall clock. After that the screen was not merely similar to
+/// what it had been, it was *identical*, cell for cell and colour for colour,
+/// forever. `the_field_does_not_repeat_over_the_period_it_used_to_have` is that
+/// sentence as a test.
+///
+/// The fix is the frequencies rather than anything about how they are combined.
+/// A sum repeats only if a single `T` advances *every* term by a whole number
+/// of periods, so what matters is the **ratios** between the frequencies and not
+/// their size: rational ratios have a common period, and mutually irrational
+/// ratios do not. The three below are `{1, sqrt(2), sqrt(3)}` over a common
+/// two, and every pair has an irrational ratio -- `sqrt(2)`, `sqrt(3)` and
+/// `sqrt(3/2)`. So there is no `T > 0` for which all three come back to where
+/// they started, and the field has no period at all.
+///
+/// Two consequences worth being straight about, because neither is free:
+///
+/// - **The composition does not rescue a rational set.** Each term is
+///   `sin(spatial - c * sin(f*t))` rather than a bare sine, so a term's
+///   harmonics sit at *integer multiples* of its own `f`. That makes the field's
+///   frequency content the additive group generated by the three `f`, which
+///   still contains each `f` itself, so a common period would still have to
+///   satisfy `f*T = 2*pi*n` for all three. Wrapping the phase in a sine delays
+///   the repeat; it does not remove it.
+///
+/// - **The speeds barely moved, and that was the design constraint.** Dividing
+///   the whole set by two keeps the ordering the field already had -- the fourth
+///   term's ripple drifts slowest, the first term's wave second, the second
+///   term's sweep fastest -- and keeps the total churn within 10% of what it was.
+///   Measured as the root-sum-square of `c*f` over the three terms, which is what
+///   drives mean |change| per second, the set below scores 0.93x the old
+///   `0.5, 1.0, 0.25`. The obvious alternative, `1, sqrt(2), sqrt(3)` unscaled,
+///   scores 1.67x and puts the slowest ripple where the fastest sweep was.
+const TIME_FREQ_RIPPLE: f64 = 0.5;
+const TIME_FREQ_WAVE: f64 = SQRT_2 / 2.0;
+const TIME_FREQ_SWEEP: f64 = SQRT_3 / 2.0;
 
 pub struct Plasma {
     pub screen_size: (u16, u16),
@@ -316,6 +531,12 @@ impl Plasma {
     /// ellipses 2 : 1 tall in units -- 1.67 : 1 on a 1 : 1.2 font, which
     /// measured as a vertical rate 1.46x the horizontal one at 80x24 and 1.87x
     /// at 400x200.
+    ///
+    /// The three time terms run at [`TIME_FREQ_WAVE`], [`TIME_FREQ_SWEEP`] and
+    /// [`TIME_FREQ_RIPPLE`], whose ratios are mutually irrational, so the field
+    /// has no period. The colour channel is *not* remapped: only the glyph
+    /// channel goes through [`glyph_value`], and the reason the two are allowed
+    /// to disagree is written there.
     fn plasma_value(x: f64, y: f64, now: f64, w: f64, h: f64, scale: f64) -> f64 {
         // Both radial terms are anchored at the screen centre.
         //
@@ -334,15 +555,18 @@ impl Plasma {
         let radius = ((x - w / 2.0).powi(2) + (y - h / 2.0).powi(2)).sqrt();
 
         let value = (128.0
-            + (128.0 * ((x / 8.0) * scale - (now / 2.0).cos()).sin())
+            + (128.0 * ((x / 8.0) * scale - (now * TIME_FREQ_WAVE).cos()).sin())
             + 128.0
-            + (128.0 * ((y / 16.0) * scale - now.sin() * 2.0).sin())
+            + (128.0
+                * ((y / 16.0) * scale - (now * TIME_FREQ_SWEEP).sin() * 2.0)
+                    .sin())
             + 128.0
             + (128.0 * ((radius / 4.0 * scale).sin()))
             + 128.0
             + (128.0
-                * ((radius / FOURTH_RADIUS_DIVISOR * scale - (now / 4.0).sin())
-                    .sin())))
+                * ((radius / FOURTH_RADIUS_DIVISOR * scale
+                    - (now * TIME_FREQ_RIPPLE).sin())
+                .sin())))
             / 4.0;
 
         (value / 256.0).clamp(0.0, 1.0)
@@ -353,7 +577,10 @@ impl Plasma {
     /// The cell's colour *and* its glyph are read from the same value, which is
     /// the point: every cell used to be a hard-coded `*` that carried nothing,
     /// so the glyph channel was decoration and the field had one degree of
-    /// freedom less than it looked like it had.
+    /// freedom less than it looked like it had. They are read from *different
+    /// transforms* of that value, which is [`glyph_value`]'s whole subject: the
+    /// colour indexes the wheel on the raw value and the ramp indexes the
+    /// calibrated one.
     #[allow(clippy::too_many_arguments)]
     fn update_plasma(
         size: (u16, u16),
@@ -395,7 +622,7 @@ impl Plasma {
                 // the glyph now carrying brightness a brightening hint would
                 // corrupt that too.
                 let cell = Cell::new(
-                    ramp.sample(value as f32),
+                    ramp.sample(glyph_value(value) as f32),
                     cell_color,
                     style::Attribute::Reset,
                 );
@@ -622,11 +849,24 @@ mod tests {
     /// spans 0.0006 to 0.9974; measured over the old 18% it spans to 0.913, and
     /// a ten-step ramp's ninth step is never reached.
     ///
-    /// So the sweep is now a whole cycle at a finer step, which examines four
-    /// times as much of the field as before. That makes the clause *harder* to
-    /// satisfy rather than easier, and it is the clause that was wrong about the
-    /// world: the field does reach its top, it just does not get there inside an
-    /// eighth of a cycle.
+    /// So the sweep widened twice since. First to a whole cycle, and now that
+    /// there is no cycle, to a **window eight times as long** -- 64*pi = 201
+    /// units, which at the default `time_scale` is about six and a half minutes
+    /// of wall clock. A window rather than a period is the honest word for it:
+    /// naming a period would reintroduce the assumption this effect no longer
+    /// has.
+    ///
+    /// The bound on the two ends changed with the calibration, and the reason is
+    /// not that it got looser. It used to be 10% and it still is, but the number
+    /// it is compared against moved: the ends used to hold a few tenths of a
+    /// percent of the field's *values* while the busy middle held a quarter of
+    /// them, and now the ends hold a sixth of the *field's area* while the middle
+    /// holds a sixteenth each. 10% is a real constraint on that -- it is the
+    /// bound that would catch a remap which flattened one end and left the other
+    /// alone -- but it is a constraint on a different quantity than it was.
+    /// `every_glyph_of_the_default_ramp_carries_its_share_of_the_screen` is the
+    /// test that holds all sixteen steps to the same bound rather than two of
+    /// them.
     #[test]
     fn the_rendered_value_is_not_pinned_to_either_end_of_the_ramp() {
         let size = (200u16, 50u16);
@@ -634,13 +874,9 @@ mod tests {
         let ramp = plasma.ramp.clone();
         let steps = ramp.len();
 
-        // Sampled over a whole cycle of the field rather than one, because a
-        // field this size is not in the same place twice and a single frame --
-        // or a fraction of a cycle -- could sit on one side of a rail by luck.
-        // The slowest of the four time terms is the fourth, through `sin(now/4)`,
-        // which has a period of `8 * pi` in `plasma.time`. Fifty seconds of wall
-        // clock at the default `time_scale` of 0.5.
-        const CYCLE: f64 = 8.0 * std::f64::consts::PI;
+        // Eight of what the field's period used to be, which is the only sense in
+        // which a span of time can be described here now.
+        const WINDOW: f64 = 64.0 * std::f64::consts::PI;
         const FRAMES: u64 = 48;
 
         let mut at_bottom = 0usize;
@@ -649,10 +885,17 @@ mod tests {
         let mut used: HashSet<usize> = HashSet::new();
 
         for frame in 0..FRAMES {
-            plasma.time = CYCLE * frame as f64 / FRAMES as f64;
+            plasma.time = WINDOW * frame as f64 / FRAMES as f64;
             for (x, y, cell) in plasma.get_diff() {
                 let value = value_at(size, x, y, plasma.time);
-                let index = ramp.index_for(value as f32);
+                // The glyph is indexed by the *remapped* value. It was indexed
+                // by the raw one when this test was written, and it is worth
+                // naming the difference: a rail in the field is a property of the
+                // value, and a rail in the calibration is a property of
+                // `glyph_value`. The completeness clause below is about the
+                // first and the shares are about the second, and conflating
+                // them is how a test ends up checking that a table is sorted.
+                let index = ramp.index_for(glyph_value(value) as f32);
                 used.insert(index);
                 if index == 0 {
                     at_bottom += 1;
@@ -667,7 +910,7 @@ mod tests {
                 // the wrong thing.
                 assert_eq!(
                     cell.symbol,
-                    ramp.sample(value as f32),
+                    ramp.sample(glyph_value(value) as f32),
                     "cell ({x}, {y}) at value {value:.3} drew {:?} rather than \
                      the ramp's own step",
                     cell.symbol
@@ -692,7 +935,7 @@ mod tests {
         let mut vmin = 1.0f64;
         let mut vmax = 0.0f64;
         for step in 0..400 {
-            let now = step as f64 * CYCLE / 400.0;
+            let now = step as f64 * WINDOW / 400.0;
             for y in 0..size.1 as usize {
                 for x in 0..size.0 as usize {
                     let v = value_at(size, x, y, now);
@@ -705,9 +948,289 @@ mod tests {
             used.len(),
             steps,
             "only {} of {steps} ramp steps were reached; the field spans \
-             {vmin:.4} to {vmax:.4} over a cycle, so the ramp divides more than \
-             the field uses",
+             {vmin:.4} to {vmax:.4} over the window, so the ramp divides more \
+             than the field uses",
             used.len()
+        );
+    }
+
+    /// Every glyph of the ramp has to earn its place, and the report has to say
+    /// by how much it failed.
+    ///
+    /// The user's second complaint: "you can use more different characters".
+    /// Sixteen characters on a field where two of them covered half the screen
+    /// is not sixteen characters. The numbers are in the failure message because
+    /// a histogram assertion whose message is only "assertion failed" is a test
+    /// that gets deleted rather than fixed.
+    ///
+    /// The two bounds are 20% and 1%, against a measured busiest of 6.4% and a
+    /// measured sparsest of 6.1%. Before the fix the same run at this size
+    /// measured 23.5% for the busiest glyph and **0.20%** for the densest, so
+    /// both bounds were violated. Sixteen steps on a field is a sixteenth of the
+    /// screen each if the calibration is right and a long tail of nothing if it
+    /// is not, and this is the test that says which.
+    ///
+    /// 200x50 and not 80x24, and the difference is not cosmetic. At 80x24 the
+    /// sparsest glyph measures 1.6% and cannot be made to measure more, because
+    /// the field does not reach its own extremes often enough at that size -- so
+    /// asserting a 1% floor there would be asserting something about the field
+    /// that is not true. `a_short_terminal_thins_the_ends_of_the_ramp` covers
+    /// the small case on the terms it can actually meet.
+    #[test]
+    fn every_glyph_of_the_default_ramp_carries_its_share_of_the_screen() {
+        let size = (200u16, 50u16);
+        let shares = glyph_shares(size, 200);
+        let measured = describe_shares(&shares);
+
+        for (step, share) in shares.iter().enumerate() {
+            assert!(
+                *share <= 0.20,
+                "ramp step {step} covers {share:.2}% of a {size:?} screen over 200 \
+                 frames, so it is a shade in name only; the whole distribution is \
+                 [{measured}]"
+            );
+            assert!(
+                *share >= 0.01,
+                "ramp step {step} covers {share:.2}% of a {size:?} screen over 200 \
+                 frames, so it is effectively not drawn at all; the whole \
+                 distribution is [{measured}]"
+            );
+        }
+    }
+
+    /// What a small terminal gets, stated rather than assumed.
+    ///
+    /// The calibration is fitted at 200x50 and this is the 80x24 measurement of
+    /// the same run, and it is a different answer. The shares run 1.54% at the
+    /// space up to 9.36% at `M`, and they run *monotonically up* to `M` and then
+    /// back down at `@` -- which is the shape of a field that does not reach its
+    /// own extremes often enough at this size, and so leaves the bottom of the
+    /// ramp thin. The field over 460,800 samples spans 0.032 to 0.941 here
+    /// against 0.0002 to 0.9998 at 400x200.
+    ///
+    /// The 3% floor from `every_glyph_of_the_default_ramp_carries_its_share_of_
+    /// the_screen` is deliberately *not* asserted here, and saying so in a test
+    /// is better than silently applying a bound the size cannot meet.
+    ///
+    /// What is asserted is that the degradation is graceful: the screen is still
+    /// spread across nearly the whole ramp, and no single glyph has taken the
+    /// screen over. Both halves were false before the calibration -- the busiest
+    /// glyph measured 29.1% of an 80x24 screen and 23.5% of a 200x50 one -- and
+    /// neither is true now, at 9.4% and 6.4%.
+    #[test]
+    fn a_short_terminal_thins_the_ends_of_the_ramp() {
+        let size = (80u16, 24u16);
+        let shares = glyph_shares(size, 200);
+        let measured = describe_shares(&shares);
+        let steps = shares.len();
+
+        let busiest = shares.iter().copied().fold(0.0f64, f64::max);
+        assert!(
+            busiest <= 0.20,
+            "at {size:?} one glyph covers {busiest:.2}% of the screen, so the \
+             calibration is not reaching the small case at all; the whole \
+             distribution is [{measured}]"
+        );
+
+        // Fourteen of sixteen, a step below what it measures, so this catches a
+        // calibration that has stopped applying rather than one whose tail has
+        // thinned slightly.
+        let used = shares.iter().filter(|share| **share > 0.0).count();
+        assert!(
+            used >= 14,
+            "only {used} of {steps} ramp steps were drawn at {size:?}, so the ramp \
+             is barely being used on a small screen; the whole distribution is \
+             [{measured}]"
+        );
+    }
+
+    /// The distribution as one string, for a failure message.
+    ///
+    /// A histogram test that prints its own distribution only when it fails is a
+    /// histogram test nobody can check when it passes, and the thing being
+    /// asserted here is the *shape*. Printing it always costs one line of test
+    /// output and makes a regression in the calibration visible as a drifting
+    /// series rather than as a threshold finally tripping.
+    fn describe_shares(shares: &[f64]) -> String {
+        let ramp = glyph_ramp(&PlasmaOptions::default().glyphs);
+        let described: Vec<String> = ramp
+            .glyphs()
+            .iter()
+            .zip(shares.iter())
+            // Times a hundred, because a share is a fraction and a "%" in a
+            // format string is a literal. The first version of this printed
+            // "0.06%" for a step that covers 6.25% of the screen, which is a
+            // number small enough to look like a fault and is not one.
+            .map(|(glyph, share)| format!("{glyph:?} {:.2}%", share * 100.0))
+            .collect();
+        let line = described.join(", ");
+        println!("plasma glyph shares: {line}");
+        line
+    }
+
+    /// The share of the screen each ramp step takes, over a fixed run.
+    ///
+    /// Reads the *value* rather than the drawn cell, and that is a deliberate
+    /// choice worth defending. `get_diff` returns only the cells that changed
+    /// from the previous frame, so counting its glyphs measures which characters
+    /// are *animating* -- which is a different question, and one this crate has
+    /// been caught by before. Plasma repaints every cell every frame, so the two
+    /// ought to agree, and they do not: the field is smooth enough that a large
+    /// region holds the same character across consecutive frames, and those cells
+    /// drop out of the diff entirely. Counting the diff gives a distribution
+    /// weighted towards the *boundaries* between characters, which is where the
+    /// field is changing fastest and nowhere near where it spends its area.
+    ///
+    /// Measured, the difference is a factor of fifteen: this reports 6.3% per
+    /// step and the diff-based version reported 0.06%, which is a distribution
+    /// that looks plausible and is a histogram of a different thing. `total` is
+    /// the full cell count, not the diff's length, so a diff that quietly
+    /// returned nothing would show up as every step at zero rather than as a
+    /// passing test.
+    ///
+    /// The step is 0.5 units of `plasma.time` between frames, so 200 frames is
+    /// 100 units -- four times the period this field used to have, so the old
+    /// code would have measured the same frame four times over.
+    fn glyph_shares(size: (u16, u16), frames: u64) -> Vec<f64> {
+        let ramp = glyph_ramp(&PlasmaOptions::default().glyphs);
+        let mut counts = vec![0usize; ramp.len()];
+        let mut total = 0usize;
+        for frame in 0..frames {
+            let now = frame as f64 * 0.5;
+            for y in 0..size.1 as usize {
+                for x in 0..size.0 as usize {
+                    let v = value_at(size, x, y, now);
+                    let g = glyph_value(v);
+                    let i = ramp.index_for(g as f32);
+                    counts[i] += 1;
+                    total += 1;
+                }
+            }
+        }
+        assert!(total > 0, "the run drew nothing at all");
+        counts.iter().map(|c| *c as f64 / total as f64).collect()
+    }
+
+    /// The remap's own contract, checked on the remap rather than on the screen.
+    ///
+    /// Every ordering claim in this module is downstream of this one. A ramp that
+    /// ran backwards, a `glyph_value` that dipped, a table that stopped being
+    /// sorted -- each of those would still draw a plausible-looking field, and
+    /// `the_glyph_ramp_runs_sparse_to_dense_with_the_value` would catch it at the
+    /// cost of a whole rendered frame per sample. This is the same property at
+    /// the cost of a loop over a thousand values.
+    ///
+    /// A remap that is *not* strictly increasing is the subtler failure, and it
+    /// is a real one for a table like this: two boundaries within a float apart
+    /// produce a segment of zero width, and the division there is guarded, so
+    /// the function stays defined and quietly discards a step. Non-decreasing is
+    /// the contract; *strictly* increasing over the interior is what makes each
+    /// ramp step reachable, and both are asserted.
+    #[test]
+    fn the_value_remap_is_monotone_and_reaches_both_ends() {
+        let samples = 20_000;
+        let mut previous = f64::NEG_INFINITY;
+        for step in 0..=samples {
+            let value = step as f64 / samples as f64;
+            let remapped = glyph_value(value);
+            assert!(
+                remapped >= previous,
+                "glyph_value went backwards: {value:.5} mapped to {remapped:.5} \
+                 after {previous:.5}"
+            );
+            previous = remapped;
+        }
+
+        // And the two ends exactly, because a remap that starts or ends short
+        // quietly loses a ramp step without any of the ordering checks noticing:
+        // the value is clamped, so the step is still reachable, just by nothing.
+        assert_eq!(glyph_value(0.0), 0.0, "the bottom of the range is not 0");
+        assert_eq!(glyph_value(1.0), 1.0, "the top of the range is not 1");
+
+        // A NaN has to read as the bottom rather than sail through the bounds
+        // check, the same way `GlyphRamp::index_for` treats it. The sum of four
+        // sines cannot produce one, but a hand-edited `spatial_scale` of NaN can,
+        // and a NaN that reached `partition_point` would be an unspecified index.
+        assert_eq!(
+            glyph_value(f64::NAN),
+            glyph_value(0.0),
+            "a NaN value did not read as the bottom of the range"
+        );
+
+        // Every step reachable, and strictly so. A step with an empty preimage is
+        // a character the ramp will never draw, which is the thing the
+        // histogram test above is about -- asserted here on the function so a
+        // failure points at the table rather than at the screen.
+        let ramp = glyph_ramp(&PlasmaOptions::default().glyphs);
+        let mut reached: HashSet<usize> = HashSet::new();
+        for step in 0..=samples {
+            reached.insert(
+                ramp.index_for(glyph_value(step as f64 / samples as f64) as f32),
+            );
+        }
+        assert_eq!(
+            reached.len(),
+            ramp.len(),
+            "only {} of {} ramp steps have a non-empty preimage under glyph_value, \
+             so the calibration has a step the field can never draw",
+            reached.len(),
+            ramp.len()
+        );
+    }
+
+    /// The table is a calibration, so its inputs have to be sane.
+    ///
+    /// `VALUE_BOUNDARIES` is fifteen measured numbers, and a table is the easiest
+    /// kind of constant to edit wrongly without noticing: swap two, leave one out
+    /// of order, and `glyph_value` still returns a value in `0..=1`, still
+    /// monotone, and still draws a field that looks like plasma. None of the
+    /// ordering tests can see it and the histogram test would report a shifted
+    /// distribution rather than a fault.
+    ///
+    /// So the three properties the numbers have to have are asserted on the
+    /// numbers. Length is the one that catches an accidental edit, since the
+    /// array's type fixes it and the *semantics* need the rest: strictly
+    /// increasing, inside the open interval, and symmetric about the middle
+    /// enough that the top of the ramp is not starved relative to the bottom.
+    #[test]
+    fn the_value_boundaries_are_a_sorted_interior_table() {
+        assert_eq!(
+            VALUE_BOUNDARIES.len(),
+            15,
+            "there are sixteen ramp steps, so fifteen boundaries separate them"
+        );
+
+        for pair in VALUE_BOUNDARIES.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "the boundaries run backwards: {} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        for bound in VALUE_BOUNDARIES {
+            assert!(
+                (0.0..1.0).contains(&bound),
+                "the boundary {bound} is not inside the value range, so a step of \
+                 the ramp can never be reached on one side of it"
+            );
+        }
+
+        // The two end steps are the ones a mis-shaped table starves, because
+        // they are the only ones whose preimage is a *half* segment. Measured
+        // shares at 200x50 are 6.19% for the bottom step and 6.20% for the top,
+        // and this is the cheap check that the table has not been edited into
+        // an asymmetry since.
+        let lowest = VALUE_BOUNDARIES[0];
+        let highest = 1.0 - VALUE_BOUNDARIES[VALUE_BOUNDARIES.len() - 1];
+        let ratio = highest / lowest;
+        assert!(
+            (0.7..1.4).contains(&ratio),
+            "the value range below the first boundary is {lowest:.3} and above the \
+             last is {highest:.3}, a ratio of {ratio:.2}, so the calibration is \
+             lopsided: one end of the ramp covers a different amount of the field \
+             from the other"
         );
     }
 
@@ -977,6 +1500,7 @@ mod tests {
         /// about that font.
         const INK_BY_COVERAGE: &[(char, f32)] = &[
             (' ', 0.0),  // nothing
+            ('\'', 2.0), // a short tick, the lightest mark in the set
             ('.', 5.0),  // one small square at the baseline
             ('-', 7.0),  // one thin bar, the full cell width
             (':', 11.0), // two dots stacked
@@ -986,7 +1510,11 @@ mod tests {
             ('+', 16.0), // one full-width bar and one full-height bar
             ('X', 21.0), // two full-cell diagonals, longer strokes than `+`
             ('#', 27.0), // four strokes, two of them full height
+            ('O', 30.0), // one closed ring at full cell height
             ('%', 33.0), // two rings and a slash
+            ('&', 38.0), // a bowl, a loop and a leg
+            ('M', 42.0), // four strokes, two of them full height and two
+            // full-cell diagonals
             ('@', 46.0), // a ring, an inner bowl and a tail
         ];
 
@@ -1047,26 +1575,72 @@ mod tests {
             );
         }
 
-        // And the pairs the estimate genuinely cannot separate. Three
-        // percentage points of cell coverage is a shade over half a stroke
-        // width; below it the table is measuring the font rather than the
-        // glyph. These are ties, not inversions -- the ramp may put them in
-        // either order, and the order is a legibility decision:
+        // And the pairs the estimate genuinely cannot separate. Three percentage
+        // points of cell coverage is a shade over half a stroke width; below it
+        // the table is measuring the font rather than the glyph. These are ties,
+        // not inversions -- the ramp may put them in either order, and the order
+        // is a legibility decision.
         //
-        // - `.-` -- a period and a hyphen, one dot and one bar. A dot is the
+        // **Nine of them, up from three**, and the growth is the finding rather
+        // than an oversight. Six of the six new boundaries are at the light end
+        // -- ` '`, `'.`, `.-`, `:=`, `=;`, `;*` -- and two more sit at the heavy
+        // end where the two new ring glyphs went in. The three that were already
+        // ties are all at the light end too. There are only so many
+        // distinguishable weights below a quarter of a cell, and a sixteen-step
+        // ramp has to spend six of its fifteen boundaries down there. The
+        // estimates are the argument for the order, not a claim of resolution the
+        // set does not have.
+        //
+        // What can be said about each:
+        //
+        // - ` '` -- a space and an apostrophe, two points apart. This is the
+        //   weakest claim in the table: "nothing" and "one short tick" differ by
+        //   the width of the tick's stroke, and the two points are the table
+        //   saying that a tick is a small thing rather than measuring it. It is
+        //   still an improvement on leaving the space and the next glyph five
+        //   points apart, which is what the ten-step ramp did.
+        // - `'.` -- an apostrophe and a period, three points apart. Both are one
+        //   small mark; `'` is a narrow tick and `.` is a square blob, and most
+        //   fonts draw the square heavier. The table is least sure of this one.
+        // - `.-` -- a period and a hyphen, two points apart. A dot is the
         //   lightest mark a font can draw and a bar is one of the heaviest
-        //   single-stroke marks, so this gap is the smallest in the ramp
-        //   because the table is least sure of it, not because they are close.
-        // - `:;` -- a colon and a semicolon differ by a tail hanging off the
-        //   lower dot. A tail is a fraction of a dot.
-        // - `;+` -- a semicolon against a plus sign. Both are two marks, and a
-        //   plus reaches the cell in both axes.
+        //   single-stroke marks, so this gap is small because the table is least
+        //   sure of it, not because they are close.
+        // - `:=` -- a colon and an equals sign, one point apart. Two dots against
+        //   two bars, and the table cannot tell which is heavier. The order here
+        //   is a legibility call: `:` is the most widely recognised "slightly
+        //   more than nothing" and `=` the most widely recognised "slightly more
+        //   than that".
+        // - `=;` -- an equals sign and a semicolon, two points apart, and the two
+        //   disagree about *how* to spend a second mark: two bars, or a dot and
+        //   a tail. `;` is given the heavier reading because a tail hangs below
+        //   the baseline and a font's baseline strokes are its heaviest.
+        // - `;*` -- a semicolon and an asterisk, one point apart. Both are two or
+        //   three short marks; an asterisk's strokes are each shorter than a tail.
+        // - `*+` -- an asterisk and a plus sign, one point apart. An asterisk is
+        //   several strokes none of which reaches the cell; a plus is two bars
+        //   that both do, and the table cannot resolve the difference.
+        // - `#O` -- a hash and a capital O, three points apart. Four thin strokes
+        //   against one closed ring. `O` is a longer path but a single stroke,
+        //   and which covers more of the cell depends on the font. This is the
+        //   first of the two places the table gives up at the *heavy* end.
+        // - `O%` -- a capital O and a percent sign, three points apart, and the
+        //   same argument with one more ring: the percent's two small rings are
+        //   not the O's one large one, so a font that draws a bold `O` can put
+        //   them either way round.
+        //
+        // The seven boundaries it *is* confident about are `-:`, `;+`, `+X`, `X#`,
+        // `%&`, `&M` and `M@`, and four of those are the heavy end, where the
+        // repertoire is not crowded. That asymmetry is the argument for saying
+        // the ramp is ordered: the crowd is at one end and the other end is
+        // solid.
         //
         // Asserted as an exact set, so a glyph moved across one of these
         // boundaries -- or a new tie quietly created -- has to be argued for
         // rather than slipping past.
         const TIE_RESOLUTION: f32 = 3.0;
-        const EXPECTED_TIES: &[&str] = &[".-", ":;", ";+"];
+        const EXPECTED_TIES: &[&str] =
+            &[" '", "'.", ".-", ":=", "=;", ";*", "*+", "#O", "O%"];
         let mut measured: Vec<String> = glyphs
             .windows(2)
             .filter(|pair| (ink(pair[1]) - ink(pair[0])).abs() <= TIE_RESOLUTION)
@@ -1081,6 +1655,134 @@ mod tests {
             "the set of adjacent ramp pairs within the ink table's resolution \
              has changed, so either a glyph crossed a boundary or a new tie \
              appeared; both need saying out loud"
+        );
+    }
+
+    // --- repetition -------------------------------------------------------
+
+    /// The field has to stop coming back. The user's complaint, as a number.
+    ///
+    /// "Right now it just goes up and down; it's not something new" and "make it
+    /// unique each time and continuous, not a loop". The loop was exact, not
+    /// approximate: the four time terms ran at `now/2`, `now`, `0` and `now/4`,
+    /// so their periods were `4pi`, `2pi`, infinite and `8pi`, and the field's
+    /// was the least common multiple, **`8*pi` = 25.13 units of `plasma.time`**.
+    /// After 50 seconds of wall clock at the default `time_scale`, every cell was
+    /// drawing the same character in the same colour it had drawn 50 seconds
+    /// earlier, and it would keep doing so indefinitely.
+    ///
+    /// Asserted twice over, because the two halves fail differently. The
+    /// frequency search is the one that catches the bug directly: it looks for a
+    /// `T` that advances all three time terms by whole cycles, and against the
+    /// old frequencies it finds one on the first grid point worth trying, `8*pi`
+    /// itself. The frame comparison is the one that says what the user sees, and
+    /// it is deliberately a *weak* threshold -- a hundredth of the range, against
+    /// a measured 0.105 at `8*pi` -- because the claim is only "this is a
+    /// different field", not "this is an unrelated field".
+    ///
+    /// The weak threshold needs the guard below it, or the test would also pass
+    /// against a field that never changed at all. A constant field has no period
+    /// either, so "does not repeat" is vacuously true of it.
+    #[test]
+    fn the_field_does_not_come_back_to_where_it_was() {
+        // A period `T` has to satisfy `f * T = 2*pi * n` for every time
+        // frequency, so `f * T / 2*pi` has to be very nearly an integer. Searched
+        // rather than proved: irrationality is not something an `f64` can
+        // assert, and a grid at this resolution with this tolerance is the
+        // strongest statement available without an arbitrary-precision library.
+        // The tolerance is a millionth of a cycle, and the grid is a
+        // thousandth of a unit of `plasma.time` -- 0.1s of wall clock at the
+        // default scale.
+        const SEARCH_FROM: f64 = 0.05;
+        const SEARCH_TO: f64 = 200.0;
+        const SEARCH_STEP: f64 = 0.001;
+        /// How close to a whole cycle counts as one. Generous, because the point
+        /// is to be beaten by the *old* frequencies and the old ones miss by
+        /// nothing at all.
+        const CYCLE_TOLERANCE: f64 = 1.0e-6;
+
+        let frequencies = [TIME_FREQ_RIPPLE, TIME_FREQ_WAVE, TIME_FREQ_SWEEP];
+        let mut steps = (SEARCH_TO - SEARCH_FROM) / SEARCH_STEP;
+        let mut best: Option<(f64, f64)> = None;
+        while steps >= 0.0 {
+            let period = SEARCH_FROM + steps * SEARCH_STEP;
+            let worst = frequencies
+                .iter()
+                .map(|f| {
+                    let cycles = f * period / (2.0 * PI);
+                    (cycles - cycles.round()).abs()
+                })
+                .fold(0.0f64, f64::max);
+            if best.is_none_or(|(_, previous)| worst < previous) {
+                best = Some((period, worst));
+            }
+            if worst <= CYCLE_TOLERANCE {
+                panic!(
+                    "a period of {period:.3} units advances all three time \
+                     frequencies ({frequencies:?}) by a whole number of cycles, \
+                     to within {CYCLE_TOLERANCE:e}, so the field repeats on it"
+                );
+            }
+            steps -= 1.0;
+        }
+        let (period, worst) = best.expect("the search ran at least once");
+        assert!(
+            worst > CYCLE_TOLERANCE,
+            "the closest approach to a common period in the whole search was \
+             {period:.3} units, off by {worst:.2e} cycles"
+        );
+
+        // And what that means on screen. 8*pi is the period the field used to
+        // have; 2*pi and pi are two of its divisors, and a field with a period of
+        // 8*pi also "repeats" at those in the weak sense that the screen looks
+        // the same, so all three are checked.
+        for (label, period) in [
+            ("8*pi, the period it had", 8.0 * PI),
+            ("2*pi", 2.0 * PI),
+            ("pi", PI),
+        ] {
+            let mut total = 0.0f64;
+            let mut samples = 0.0f64;
+            for now in [0.0, 3.1, 7.7, 11.3, 19.9, 26.3] {
+                for y in 0..24usize {
+                    for x in 0..80usize {
+                        total += (value_at((80, 24), x, y, now)
+                            - value_at((80, 24), x, y, now + period))
+                        .abs();
+                        samples += 1.0;
+                    }
+                }
+            }
+            let mean = total / samples;
+            assert!(
+                mean > 0.01,
+                "at {label} the field is back where it was: the mean absolute \
+                 difference across a whole 80x24 screen is {mean:.5}, so the \
+                 screen looks the same after {period:.2} units of `plasma.time`"
+            );
+        }
+
+        // The guard the weak threshold needs. Against the old frequencies this
+        // was satisfied at every pair above by a mean difference of exactly
+        // zero, so a field that had stopped moving would pass all of it.
+        let mut drift = 0.0f64;
+        let mut samples = 0.0f64;
+        for now in [0.0, 3.1, 7.7, 11.3, 19.9, 26.3] {
+            for y in 0..24usize {
+                for x in 0..80usize {
+                    drift += (value_at((80, 24), x, y, now)
+                        - value_at((80, 24), x, y, now + 0.5))
+                    .abs();
+                    samples += 1.0;
+                }
+            }
+        }
+        let mean = drift / samples;
+        assert!(
+            mean > 0.001,
+            "the field changes by {mean:.6} in half a unit of `plasma.time`, so it \
+             has stopped moving altogether -- which would satisfy every check \
+             above while drawing nothing"
         );
     }
 
