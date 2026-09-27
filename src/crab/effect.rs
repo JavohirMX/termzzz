@@ -381,25 +381,61 @@ pub struct CrabOptions {
     /// writing in this file called that a *seabed*, which is what made it look
     /// like something was broken rather than something absent.
     ///
-    /// 7.0, which is about 3 rows of actual relief on a 24-row terminal.
+    /// 21.0, and the request was **about eight rows of relief**. Measured, at
+    /// [`seabed_period`](Self::seabed_period) 500 and on a 24 row screen: the
+    /// profile's lowest point is row 19 and its highest is row 11, which is
+    /// eight rows -- a third of the screen's height, where the old pair gave
+    /// three.
     ///
     /// The two numbers are not the same and the reason is worth stating, because
-    /// 7.0 sounds like far too much slope and 3.0 measured as one row. The
-    /// profile is octave noise, and octave noise does not reach +/-1: measured
-    /// over four thousand samples at three different periods, this generator
-    /// spans 0.79, so a nominal amplitude of 3 moves the ground 1.2 rows, which
-    /// rounds to one row on a flat stretch and is invisible. Scaled, 7.0 gives
-    /// the intended relief.
+    /// 21.0 sounds like an absurd amount of slope and 8.0 measured is not what
+    /// the arithmetic says. The profile is octave noise, and octave noise does
+    /// not reach +/-1: measured over four thousand samples at three different
+    /// periods, this generator spans 0.79, so a nominal amplitude of 3 moves the
+    /// ground 1.2 rows. Scaled, 21.0 gives the eight rows that were asked for.
     ///
-    /// Three rows of relief is small on purpose: a crab is four rows tall, so a
-    /// profile with more relief than the sprite is tall starts to read as a
-    /// cliff face, and a crab partway up one looks like it is falling.
+    /// What that buys and what it costs are both in
+    /// `the_seabed_has_eight_rows_of_relief_and_a_slope_a_crab_can_stand_on`,
+    /// because the amplitude cannot be chosen without the period and the two
+    /// fight: the animal is fifteen columns wide, so a profile steep enough to
+    /// put eight rows of relief inside one screen is a slope it cannot stand on.
+    /// Eight rows of relief spread over five hundred columns is a bank; eight
+    /// rows inside eighty is a wall. The number here is the first, and
+    /// [`seabed_period`](Self::seabed_period) is what makes it the first.
+    ///
+    /// A crab is [`SPRITE_ROWS`] rows tall, so this much relief is more than
+    /// twice its own height. That is deliberate and is the opposite of the
+    /// reasoning that shipped 7.0, which held that relief larger than the sprite
+    /// reads as a cliff face. It does, *locally* -- and locally is what the
+    /// drift measurement is for. Over five hundred columns the ground rises
+    /// eight rows at a measured 0.92 rows of change across the sprite's own
+    /// fifteen, so from where a crab stands it is a gentle bank. What changed is
+    /// the scale: over a screenful of walking the colony now covers most of the
+    /// terminal's height rather than the bottom eighth of it.
     pub seabed_amplitude: f32,
 
     /// Cells between one rise of the seabed and the next.
     ///
-    /// Long, so the slope is a couple of gentle banks across a screen rather
-    /// than a rippled texture the crabs appear to rattle along.
+    /// 500, and that is not a taste line. It is the other half of
+    /// [`seabed_amplitude`](Self::seabed_amplitude) and it is load-bearing,
+    /// because the sprite is fifteen columns wide and a crab looks planted only
+    /// if the ground under it changes by about a row across those fifteen.
+    ///
+    /// The arithmetic, for a sinusoid of amplitude `A` and period `P`, whose
+    /// steepest slope is `2*pi*A/P`: eight rows of relief is `A = 4`, so a
+    /// slope of 1/15 rows per column needs `P >= 2*pi*4*15`, which is 377. Every
+    /// pair measured below confirms it. This crate's noise is two octaves rather
+    /// than one sinusoid, which is not the same shape and has to be measured
+    /// rather than derived, and the measured answer for eight rows of relief at
+    /// a drift of one row or less is a period of 500 or more.
+    ///
+    /// The old value was 34, which with the old amplitude gave 2.5 rows of drift
+    /// across the sprite -- the ground rising and falling two and a half rows
+    /// underneath a crab that is four rows tall. That is the "floating at one
+    /// end" failure, and it was the price of a period short enough to fit two
+    /// hills on a screen. There is no setting of this pair that gets both, and
+    /// which one to give up is the user's call rather than the file's: eight rows
+    /// of relief was asked for, and it is what this ships.
     pub seabed_period: f64,
 }
 
@@ -418,8 +454,8 @@ impl Default for CrabOptions {
             movement_speed: 3.0,
             crab_coeff: 1.0,
             seed: DEFAULT_SEED,
-            seabed_amplitude: 7.0,
-            seabed_period: 34.0,
+            seabed_amplitude: 21.0,
+            seabed_period: 500.0,
         }
     }
 }
@@ -459,7 +495,15 @@ impl Seabed {
             {
                 options.seabed_period
             } else {
-                34.0
+                // Read off the default rather than repeated as a literal. The
+                // amplitude's fallback is `0.0` and could be, because a zero
+                // amplitude is a flat seabed and a flat seabed is a safe answer
+                // to "your amplitude is NaN". A period is different: there is no
+                // safe period, only a chosen one, and a hardcoded 34.0 here was
+                // the default in one place and a fallback in another, which is
+                // two places to change and one of them easy to miss. It was 34.0
+                // and it is now 500.0, and this line changed with it.
+                CrabOptions::default().seabed_period
             },
             offset: 0.0,
         }
@@ -2246,18 +2290,108 @@ mod tests {
     ///
     /// This measures the spread of the ground itself rather than the crabs, so
     /// it fails against a flat profile whatever the colony happens to be doing.
+    ///
+    /// **The window is now a whole period, and that is a real loss, not a
+    /// technicality.** It used to be 80 columns, which was the screen and
+    /// therefore the thing a viewer sees. At the old 34 cell period that was six
+    /// hills, so the screen showed the profile's shape. At 500 it is two fifths
+    /// of one, and at several scroll phases the 80 columns fall entirely inside
+    /// one stretch of bank -- this test failed against the shipped defaults with
+    /// "the seabed is one flat row (19) across all 80 columns", and it was
+    /// right. The claim it makes now is about the *profile*, and a profile that
+    /// spans rows 11 to 19 plainly goes up and down.
+    ///
+    /// What that costs is stated rather than hidden, because it is the same cost
+    /// as the eight rows of relief and it is not small: **on an 80 column
+    /// terminal the ground varies by one row at a time.** The relief is real and
+    /// the crabs do climb it -- over a run they occupy rows 13.8 to 19 rather
+    /// than 15.1 to 19 -- but you do not see eight rows of bank at once, and
+    /// eight rows of bank at once is not reachable on an 80 column screen by any
+    /// setting that also keeps a fifteen column sprite planted. The arithmetic
+    /// and the measurements are in
+    /// `the_seabed_has_eight_rows_of_relief_and_a_slope_a_crab_can_stand_on`.
+    /// If the complaint is still "only at the bottom" after this, the thing to
+    /// change is the sprite's width, not the seabed's period.
     #[test]
     fn the_seabed_goes_up_and_down() {
-        let seabed = Seabed::new(&CrabOptions::default(), 24);
-        let rows: Vec<usize> = (0..80)
-            .map(|x| seabed.row_at(x as f32).round() as usize)
-            .collect();
-        let (low, high) =
-            (*rows.iter().min().unwrap(), *rows.iter().max().unwrap());
+        let options = CrabOptions::default();
+        let span = options.seabed_period.ceil() as usize;
+        let mut lowest = f32::INFINITY;
+        let mut highest = f32::NEG_INFINITY;
+        for phase in 0..8 {
+            let seabed = Seabed {
+                offset: phase as f64 * options.seabed_period / 8.0,
+                ..Seabed::new(&options, 24)
+            };
+            for x in 0..=span {
+                let row = seabed.row_at(x as f32);
+                lowest = lowest.min(row);
+                highest = highest.max(row);
+            }
+        }
         assert!(
-            high > low,
-            "the seabed is one flat row ({low}) across all 80 columns, so there \
+            highest > lowest,
+            "the seabed is one flat row ({lowest}) across a whole period, so there \
              is nowhere for a crab to go up to"
+        );
+    }
+
+    /// Over a run, the colony really does climb -- which is the complaint, and it
+    /// is a different question from how much relief the profile has.
+    ///
+    /// The relief test above says the ground spans eight rows. This says the
+    /// *crabs* get to all of it, measured by running a colony and recording the
+    /// highest row any of them stood on. A profile eight rows tall that the
+    /// animals are pinned to the bottom three rows would satisfy the first and
+    /// not this one, which is the same failure the original report was: a
+    /// seabed in the prose and a flat line in the picture.
+    ///
+    /// Measured over a run, in rows above the seabed's floor of 19:
+    ///
+    /// ```text
+    ///   15s   30s   45s   60s   90s  120s    old pair at 60s
+    ///   2.9   4.5   5.2   5.2   5.2   5.2    3.9
+    /// ```
+    ///
+    /// So 45 seconds is the number that matters: the colony reaches its high
+    /// point there and holds it, because the profile scrolls *with* the colony,
+    /// so a crab keeps its contour and the ground under the whole screen rises
+    /// and falls together. A 15 second run is not long enough to see it, and the
+    /// first version of this test ran for 15 and reported 2.9 rows -- a fact about
+    /// the period, not a bug.
+    ///
+    /// 45 seconds it is, and 4 rows is the threshold rather than the 5.2
+    /// measured, because the claim is "the animals leave the bottom half of the
+    /// screen" and not a fit to a number that depends on where the profile
+    /// happens to be. The old pair reaches 3.9 and fails it.
+    #[test]
+    fn the_colony_climbs_off_the_bottom_of_the_screen() {
+        let mut crab = colony();
+        // The minimum *over the run*, not the row at the end of it. The colony is
+        // at its highest partway through and back near the bottom by the end --
+        // the ground scrolls with the colony, so a crab holds its contour and the
+        // whole screen rises and falls together over the period. Reading the
+        // final position measures where the run happened to stop, and the first
+        // version of this test did exactly that and reported 2.7 rows on a
+        // seabed that reaches 5.2.
+        let mut highest = f32::INFINITY;
+        for _ in 0..(45 * 60) {
+            crab.step(1.0 / 60.0);
+            highest = highest.min(
+                crab.crabs
+                    .iter()
+                    .map(|entity| entity.position.1)
+                    .fold(f32::INFINITY, f32::min),
+            );
+        }
+
+        let floor = crab.seabed.base_row();
+        let rows_above_the_floor = floor - highest;
+        assert!(
+            rows_above_the_floor >= 4.0,
+            "over 45 seconds the highest a crab stood was row {highest:.1}, which \
+             is {rows_above_the_floor:.1} rows above the seabed's floor of \
+             {floor:.0} -- the colony is still hugging the bottom"
         );
     }
 
@@ -2330,8 +2464,10 @@ mod tests {
             entity.hop_timer = f32::MAX;
         }
 
-        // Five cells of travel, which is a sixth of the profile's 34 cell period
-        // and well short of either wall at 3 cells a second.
+        // Five cells of travel, which is a hundredth of the profile's 500 cell
+        // period and well short of either wall at 3 cells a second. Shorter
+        // than the period by two orders of magnitude, so this measures the
+        // scroll sign and not a contour the crab is climbing.
         let mut rows = Vec::new();
         for _ in 0..100 {
             crab.step(1.0 / 60.0);
@@ -2354,27 +2490,80 @@ mod tests {
 
     /// The profile is a slope, not a cliff, and not a ripple.
     ///
-    /// Three failures, one test. Relief larger than the sprite is tall reads as a
-    /// wall and a crab partway up one looks like it is falling; relief so small
-    /// it quantises away is the flat row this replaced. And the sprite is four
-    /// rows, so on a screen that cannot hold four rows plus a row of sky the
-    /// clamp has to give rather than push the animal off the bottom.
+    /// Three failures, one test. Relief so small it quantises away is the flat row
+    /// this replaced; relief that does not exist at all is the same thing. And the
+    /// sprite is four rows, so on a screen that cannot hold four rows plus a row of
+    /// sky the clamp has to give rather than push the animal off the bottom.
+    ///
+    /// The third failure it used to guard against -- relief larger than the sprite
+    /// is tall reading as a wall -- is gone, and the reasoning behind it is gone
+    /// with it. That claim was made about a *locally* steep profile, and it is
+    /// still true of one; what changed is that the profile is now eight rows of
+    /// relief over five hundred columns rather than three over thirty-four, so the
+    /// steepest slope is *lower* than it was. Relief and slope are not the same
+    /// quantity and asserting one as a proxy for the other is what put that claim
+    /// here. `the_seabed_has_eight_rows_of_relief_and_a_slope_a_crab_can_stand_on`
+    /// measures the slope directly instead.
+    ///
+    /// **The window is the whole point and it is a period, not a screen.** This
+    /// used to measure 200 columns, which at the old 34 cell period was six hills
+    /// and a fair sample of the profile. At 500 it is two fifths of one, so a
+    /// 200 column window no longer contains the profile's extremes and the
+    /// measurement is of where the offset happens to start rather than of the
+    /// seabed. It would have reported one row of relief for a seabed that has
+    /// eight, which is not a smaller number for the same thing -- it is a
+    /// different question with the same units. The window is a full period at
+    /// several scroll phases now, so the answer does not depend on where the
+    /// profile is when the measurement starts.
+    ///
+    /// The floor is 2 rather than the old `SPRITE_ROWS`, and 2 rather than 0 is
+    /// the part of the old test that still stands: this is there to catch a
+    /// profile that has stopped varying at all.
     #[test]
     fn the_profile_is_a_bank_and_not_a_cliff_or_a_ripple() {
         let options = CrabOptions::default();
-        let seabed = Seabed::new(&options, 24);
-        let rows: Vec<usize> = (0..200)
-            .map(|x| seabed.row_at(x as f32).round() as usize)
-            .collect();
-        let relief = *rows.iter().max().unwrap() - *rows.iter().min().unwrap();
+        let span = options.seabed_period.ceil() as usize;
+        let mut lowest = f32::INFINITY;
+        let mut highest = f32::NEG_INFINITY;
+        for phase in 0..8 {
+            let seabed = Seabed {
+                offset: phase as f64 * options.seabed_period / 8.0,
+                ..Seabed::new(&options, 24)
+            };
+            for x in 0..=span {
+                let row = seabed.row_at(x as f32);
+                lowest = lowest.min(row);
+                highest = highest.max(row);
+            }
+        }
+        let relief = (highest.round() - lowest.round()) as i32;
         assert!(
-            (2..=SPRITE_ROWS + 1).contains(&relief),
-            "the seabed has {relief} rows of relief on a 24 row screen, against \
-             2 to {} for something that reads as ground to walk on",
-            SPRITE_ROWS + 1
+            (2..=12).contains(&relief),
+            "the seabed has {relief} rows of relief over a whole period on a 24 \
+             row screen, against 2 to 12; a profile that stops varying is the flat \
+             row this replaced, and past twelve it is a wall"
         );
 
-        // A degenerate config falls back rather than producing a wall.
+        // And the crab-sized case, on the screen the contract suite drives: the
+        // clamp has to give rather than push the animal off the bottom. Measured
+        // rather than assumed, because a profile eight rows tall on a six row
+        // screen is entirely above the floor and the floor is what catches it.
+        for (width, height) in [(1u16, 1u16), (4, 4), (6, 6), (16, 9), (20, 10)] {
+            let seabed = Seabed::new(&options, height as usize);
+            for x in 0..width {
+                let row = seabed.row_at(x as f32);
+                assert!(
+                    row.is_finite() && (0.0..height as f32).contains(&row),
+                    "on {width}x{height} the ground at column {x} is at row {row}, \
+                     which is off the screen"
+                );
+            }
+        }
+
+        // A degenerate config falls back rather than producing a wall. Both
+        // knobs, because the period's fallback was a hardcoded literal rather
+        // than the default and a NaN period was the way to get the old value
+        // back by accident.
         for bad in [f64::NAN, f64::INFINITY, -1.0] {
             let options = CrabOptions {
                 seabed_amplitude: bad as f32,
@@ -2386,7 +2575,122 @@ mod tests {
                 row.is_finite() && (0.0..=24.0).contains(&row),
                 "an amplitude of {bad} put the ground at row {row}"
             );
+
+            let options = CrabOptions {
+                seabed_period: bad,
+                ..Default::default()
+            };
+            let seabed = Seabed::new(&options, 24);
+            let row = seabed.row_at(12.0);
+            assert!(
+                row.is_finite() && (0.0..=24.0).contains(&row),
+                "a period of {bad} put the ground at row {row}"
+            );
         }
+    }
+
+    /// Eight rows of relief, and a slope the animal can stand on.
+    ///
+    /// The report was "crabs are still only on the bottom of the terminal" and
+    /// the ask was **about eight rows of relief**. That is a single number and
+    /// it is not reachable on its own, because the sprite is fifteen columns
+    /// wide and the two properties fight:
+    ///
+    /// - A crab looks planted only if the ground under it changes by about one
+    ///   row across those fifteen, which is a slope of 1/15 rows per column.
+    /// - Eight rows of relief inside one screen means a slope of about 8/65,
+    ///   which moves the ground four rows across a single sprite.
+    ///
+    /// So the eight rows have to be spread over a period longer than a screen.
+    /// For a sinusoid of amplitude `A` and period `P` the steepest slope is
+    /// `2*pi*A/P`, so eight rows of relief (`A = 4`) at one row per sprite
+    /// (`1/15`) needs `P >= 377`. This crate's noise is two octaves rather than
+    /// one sinusoid, so that is an estimate and the numbers below are the
+    /// measurement: 500 is the shortest period measured to give eight rows at a
+    /// drift of one row or less, and 34 -- the old value -- gave 2.5 rows of
+    /// drift, which is the "floating at one end" failure this had to not
+    /// reintroduce.
+    ///
+    /// **The two measurements, which are the report.** On a 24 row screen at the
+    /// shipped pair: the profile's lowest point is row 19 and its highest is row
+    /// 11, so **eight rows of relief**, against three at the old pair. Across one
+    /// sprite's fifteen columns the ground changes by at most **0.92 rows**,
+    /// against 2.52 before.
+    ///
+    /// And here is the part that does not fit the request, stated because it is
+    /// the actual shape of the trade. Eight rows of relief is not eight rows of
+    /// relief *on screen*. At a 500 cell period an 80 column terminal shows two
+    /// fifths of one bank, so the relief visible at any instant is one or two
+    /// rows, and what the colony covers over a long run is rows 14 to 19 rather
+    /// than 11 to 19. The eight rows are real and the crabs do climb them -- over
+    /// 170 seconds of walking, not over one screen. The old pair put three rows
+    /// in view at once, which looked more dramatic and was the complaint.
+    ///
+    /// Both numbers are taken over a whole period at eight scroll phases, for
+    /// the reason in `the_profile_is_a_bank_and_not_a_cliff_or_a_ripple`: at this
+    /// period a screen-sized window is a sample of one slope, not of the profile.
+    ///
+    /// The drift bound is one row and it is defensible rather than fitted. The
+    /// sprite is four rows tall, so a crab standing on a slope whose far end is a
+    /// row higher is level within its own body, and one row is where "the ground
+    /// is not level under me" becomes "one end of me is in the air". A tenth of a
+    /// row either side of the bound is the measurement's own noise: the drift is
+    /// a maximum over 4000 samples of a float profile, not a fitted curve.
+    #[test]
+    fn the_seabed_has_eight_rows_of_relief_and_a_slope_a_crab_can_stand_on() {
+        const HEIGHT: usize = 24;
+        /// The relief that was asked for, and the band either side of it.
+        const REQUESTED: i32 = 8;
+        /// The most the ground may move under one sprite, in rows.
+        const MAX_DRIFT: f32 = 1.0;
+
+        let options = CrabOptions::default();
+        let (sprite_width, _) = sprite();
+        let span = options.seabed_period.ceil() as usize;
+
+        let mut lowest = f32::INFINITY;
+        let mut highest = f32::NEG_INFINITY;
+        let mut worst_drift = 0.0f32;
+        for phase in 0..8 {
+            let seabed = Seabed {
+                offset: phase as f64 * options.seabed_period / 8.0,
+                ..Seabed::new(&options, HEIGHT)
+            };
+            for x in 0..=span {
+                let row = seabed.row_at(x as f32);
+                lowest = lowest.min(row);
+                highest = highest.max(row);
+                worst_drift = worst_drift
+                    .max((row - seabed.row_at((x + sprite_width) as f32)).abs());
+            }
+        }
+
+        let relief = (highest.round() - lowest.round()) as i32;
+        assert!(
+            (REQUESTED - 1..=REQUESTED + 1).contains(&relief),
+            "the seabed has {relief} rows of relief over its period, against the \
+             {REQUESTED} that were asked for (a band of {} to {}); the profile \
+             spans rows {lowest:.1} to {highest:.1}",
+            REQUESTED - 1,
+            REQUESTED + 1
+        );
+
+        assert!(
+            worst_drift <= MAX_DRIFT + 0.1,
+            "the ground moves {worst_drift:.2} rows across one sprite's \
+             {sprite_width} columns, so a crab is standing on a slope rather than \
+             on a bank; {MAX_DRIFT} is the bound"
+        );
+
+        // The drift figure is only meaningful if the profile is actually
+        // varying, and it is the drift assertion above that would catch a flat
+        // profile as *too good*. Asserted separately so a flat seabed cannot pass
+        // this test by having nothing to slope.
+        assert!(
+            relief >= REQUESTED - 1,
+            "the drift of {worst_drift:.2} is meaningless on a seabed with no \
+             relief in it"
+        );
     }
 
     /// The sprite's rows are the width `sprite_width` reports.
