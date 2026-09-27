@@ -863,12 +863,19 @@ fn seeded_effects_are_reproducible_and_seed_sensitive() {
         drawn
     };
 
-    // `blank` draws a constant field and `plasma`, `cube` and `donut` are pure
-    // functions of time, so a seed cannot change them. Terrain renders once and
-    // then never again, so its settled frame is empty either way. Those five
-    // have no business being seed-sensitive; the rest do.
-    const SEED_INSENSITIVE: &[&str] =
-        &["blank", "cube", "donut", "plasma", "terrain"];
+    // `blank` draws a constant field, and that is the whole list.
+    //
+    // It used to be five entries and every one of the other four was wrong, in
+    // three different ways. `plasma`, `cube` and `donut` were "pure functions of
+    // time" -- true when they had no seed at all, and all three grew one in this
+    // round. `terrain` was "renders once and then never again", which stopped
+    // being true three rounds ago when the height field started scrolling.
+    //
+    // The reason this was dangerous rather than merely stale: the list
+    // `continue`s *after* the reproducibility half, so all four still passed
+    // their reproducibility check while silently skipping the seed-sensitivity
+    // one. Three separate agents flagged it as out of their reach.
+    const SEED_INSENSITIVE: &[&str] = &["blank"];
 
     let mut not_reproducible: Vec<&str> = Vec::new();
     let mut seed_ignored: Vec<&str> = Vec::new();
