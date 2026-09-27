@@ -245,9 +245,34 @@ const SATURN: usize = 5;
 /// Inclination of Saturn's rings to its own orbital plane, degrees.
 const RING_TILT: f64 = 26.73;
 
-/// Inner and outer ring radius, in Saturn radii.
-const RING_INNER: f64 = 1.24;
-const RING_OUTER: f64 = 2.27;
+/// Inner and outer ring radius, **in Saturn radii** -- multiples of the radius
+/// the planet is actually drawn at.
+///
+/// These were 1.24 and 2.27, and those are the real numbers: Saturn's B ring
+/// starts at about 1.11 equatorial radii and the A ring's outer edge is at
+/// 2.27. The report was "the rings of saturn are too big", and the first
+/// explanation offered for it -- that the medium exaggerates them, braille being
+/// two dots wide by four tall -- is not what was happening, for two reasons.
+/// A squashed ellipse is *shorter* vertically, not longer, so that cannot make
+/// a ring look too big. And the measured ring was not 2.27 times the planet at
+/// all: at 80x24 it reached 65 dots from Saturn's centre against a planet 5
+/// dots across, which is thirteen times the body rather than 2.27. On a 200x50
+/// it reached 147, because the ring's radius was a *cell* count added to a
+/// world-space centre and so grew with the terminal while the planet did not.
+/// See [`SolarSystem::draw_rings`].
+///
+/// So the astronomical ratio is not the target here, and these two numbers are
+/// not astronomy any more. They are a picture, chosen by measurement, and the
+/// measurements are in
+/// `the_rings_are_the_size_of_the_ring_and_not_of_the_orbit`. 1.7 reads as
+/// rings around a planet; 2.27 read as a hoop drawn through the inner solar
+/// system. The inner edge at 1.05 is very nearly the planet's own limb -- on the
+/// dot lattice it lands inside the drawn disc -- which is where the real B ring
+/// is, and which means the ring appears to grow out of the planet rather than to
+/// hover beside it. The two edges are 3 dots apart, so the annulus is a band
+/// with a middle and not a filled ellipse.
+const RING_INNER: f64 = 1.05;
+const RING_OUTER: f64 = 1.7;
 
 /// The sun's glow, as a multiple of its core radius.
 ///
@@ -871,28 +896,78 @@ impl SolarSystem {
     }
 
     /// Saturn's rings, as an annulus in a plane tilted to its own orbit.
+    ///
+    /// Drawn as an offset around the *projected* centre, in cells, rather than as
+    /// a ring of world-space points around the world-space centre. That is not a
+    /// stylistic choice; the old version was wrong, and it is the reason the rings
+    /// looked enormous rather than merely large.
+    ///
+    /// It computed `r = body_radius_cells(planet) * edge` and then added that to
+    /// `centre`, which is in the compressed world units the orbits are measured
+    /// in. Two different units in one expression. A body radius is *deliberately*
+    /// a fixed number of cells -- see [`body_radius_cells`](Self::body_radius_cells)
+    /// -- while a world unit scales with the terminal, so the ring was sized in
+    /// cells and then drawn in world units, which multiplied it by the display
+    /// scale. Saturn is drawn 2.30 cells across and orbits at 2.76 world units;
+    /// at 2.27 the ring's radius came out as 5.22 world units, which is 1.9 times
+    /// its own orbit and past Neptune's. Measured at 80x24 the ring reached 65
+    /// dots from the planet's centre against a 5 dot body, and at 200x50 it
+    /// reached 147 while the body stayed 5.
+    ///
+    /// So the ratio in [`RING_OUTER`] now means what it says -- a multiple of the
+    /// radius Saturn is actually drawn at -- and it means it at every screen size
+    /// rather than at 80x24 and not at 200x50.
+    ///
+    /// The simplification this buys is the same one `draw_disc` already makes: the
+    /// whole ring is drawn at the planet's own depth, so the near half does not
+    /// pass in front of the far half. The ring is drawn before the disc, and
+    /// `raise` only gives a cell's colour to the nearer claimant, so where the
+    /// two overlap the planet wins. That is also why the inner edge at
+    /// [`RING_INNER`] disappears under the disc rather than crossing it, which is
+    /// what the real thing does from most angles.
     fn draw_rings(&mut self, planet: &Body, centre: (f64, f64, f64), scale: f64) {
+        self.draw_ring_edges(planet, centre, scale, &[RING_INNER, RING_OUTER]);
+    }
+
+    /// One pass of [`draw_rings`](Self::draw_rings), over whichever edges it is
+    /// given.
+    ///
+    /// A seam rather than a loop because the two edges have to be measurable
+    /// separately. "Are the ring's two edges distinguishable" is not a question
+    /// about the set of raised dots -- the annulus, its inner edge and its outer
+    /// edge all raise the same kind of dot, and any measurement of the union
+    /// passes whether the ring is a band or a filled ellipse. Rendering one edge
+    /// at a time is what lets a test measure the gap between them.
+    fn draw_ring_edges(
+        &mut self,
+        planet: &Body,
+        centre: (f64, f64, f64),
+        scale: f64,
+        edges: &[f64],
+    ) {
+        let Some(p) = self.project(centre, scale) else {
+            return;
+        };
         let body = self.body_radius_cells(planet.radius_km);
         let tilt = RING_TILT.to_radians();
-        let (sin_t, cos_t) = tilt.sin_cos();
+        let cos_t = tilt.cos();
         let color = rgb(dim(planet.color, 0.8));
         let samples = 160;
 
         for step in 0..samples {
             let angle = TAU * step as f64 / samples as f64;
+            let (sin_a, cos_a) = angle.sin_cos();
             // Both edges of the annulus, so the ring has visible thickness rather
             // than being a single circle.
-            for edge in [RING_INNER, RING_OUTER] {
+            for &edge in edges {
                 let r = body * edge;
-                let (sin_a, cos_a) = angle.sin_cos();
-                let point = (
-                    centre.0 + r * cos_a,
-                    centre.1 + r * sin_a * cos_t,
-                    centre.2 + r * sin_a * sin_t,
+                // Cells, the same unit as `body`, so the edge really is `edge`
+                // times the drawn planet. Screen y runs down, hence the minus.
+                self.mark(
+                    (p.x + r * cos_a, p.y - r * sin_a * cos_t),
+                    color,
+                    p.depth,
                 );
-                if let Some(p) = self.project(point, scale) {
-                    self.mark((p.x, p.y), color, p.depth);
-                }
             }
         }
     }
@@ -1667,5 +1742,220 @@ mod tests {
                 "seeds 1234 and 4321 drew the same sky after {frames} frames"
             );
         }
+    }
+
+    /// How far a drawn thing reaches, in the two units that are easy to confuse.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct Reach {
+        /// Dots raised. Zero means nothing was drawn, which is a failure and not
+        /// a zero.
+        dots: usize,
+        /// Furthest dot from the centre, **in cells**.
+        ///
+        /// In cells and not in dot indices, because a braille cell is two dots
+        /// wide by four tall and a dot *index* distance is not a distance: the
+        /// same eight dot indices is four cells across and two cells down.
+        /// Dividing each axis by its own dots-per-cell is what makes this
+        /// comparable with [`body_radius_cells`](SolarSystem::body_radius_cells).
+        cells: f64,
+        /// Furthest dot from the centre along x, in dot indices.
+        ///
+        /// The horizontal figure alone, kept because it is the one a reader can
+        /// check against a picture: a ring eight dots out around a planet five
+        /// dots wide is a ring.
+        across: f64,
+    }
+
+    /// What to measure at a given rotation.
+    #[derive(Clone, Copy)]
+    enum Subject {
+        /// Saturn's disc, as `draw_disc` draws it.
+        Planet,
+        /// One edge of the annulus, as `draw_ring_edges` draws it.
+        Ring(f64),
+    }
+
+    /// Measures `subject` at a rotation, by drawing it and reading the dots.
+    ///
+    /// Reads the dot grid rather than recomputing the geometry. The obvious
+    /// alternative -- project the edge and measure where it lands -- is the same
+    /// arithmetic the drawing code does, so a test written that way checks its
+    /// own reimplementation of the formula rather than the drawing. This one
+    /// cannot be satisfied by a formula that is right in a comment and wrong in
+    /// the renderer.
+    fn reach_of(size: (u16, u16), frames: u64, subject: Subject) -> Reach {
+        let mut system = SolarSystem::new(SolarSystemOptions::default(), size);
+        for _ in 0..frames {
+            system.advance(1.0 / 60.0);
+        }
+        let scale = system.fit_scale();
+        let saturn = &PLANETS[SATURN];
+        let centre = system.orbit_point(
+            saturn,
+            system.drawn_radius(saturn),
+            system.mean_anomaly(saturn),
+        );
+        let projected = system
+            .project(centre, scale)
+            .expect("Saturn is behind the camera at every rotation tested here");
+        // The dot the centre lands in, which is what `draw_disc` and
+        // `draw_ring_edges` both measure from.
+        let (centre_x, centre_y) = (
+            (projected.x * DOTS_X as f64).floor(),
+            (projected.y * DOTS_Y as f64).floor(),
+        );
+
+        system.dots.clear();
+        match subject {
+            Subject::Planet => system.draw_disc(
+                centre,
+                system.body_radius_cells(saturn.radius_km),
+                saturn.color,
+                scale,
+            ),
+            Subject::Ring(edge) => {
+                system.draw_ring_edges(saturn, centre, scale, &[edge])
+            }
+        }
+
+        let mut reach = Reach::default();
+        system.dots.for_each_dot(|x, y, raised| {
+            if raised {
+                let dx = x as f64 - centre_x;
+                let dy = y as f64 - centre_y;
+                reach.dots += 1;
+                reach.cells = reach
+                    .cells
+                    .max((dx / DOTS_X as f64).hypot(dy / DOTS_Y as f64));
+                reach.across = reach.across.max(dx.abs());
+            }
+        });
+        reach
+    }
+
+    /// Saturn's rings are a ring around a planet, not a hoop drawn through the
+    /// inner solar system.
+    ///
+    /// The report was "in solarsystem i think the rings of saturn are too big",
+    /// and the numbers are the answer. Every figure here is read off the raised
+    /// dots at four rotations, on an 80x24 and on a 200x50, through
+    /// [`reach_of`].
+    ///
+    /// **Before**, at 1.24 and 2.27: the outer edge reached 63 dots from Saturn's
+    /// centre on an 80x24 and 147 on a 200x50, against a planet 5 dots across.
+    /// That is twelve times the body on the small terminal and twenty-nine on
+    /// the large one, and the large one is a hoop through the whole inner system
+    /// -- it reached past Neptune's orbit, because it was scaled by the display
+    /// fit while the planet was not.
+    ///
+    /// **After**, at 1.05 and 1.7: 8 dots out on both sizes, which is 1.7 times
+    /// the planet's own drawn radius. Small enough to be rings; large enough that
+    /// the planet is inside them rather than beside them.
+    ///
+    /// The first assertion is the size. The second is the one that says *why*,
+    /// and it is the reason the test exists: the ratio is a property of the
+    /// constants and the units, so it cannot depend on the terminal. It did. The
+    /// old code computed the ring's radius in cells -- `body_radius_cells`, which
+    /// is deliberately a fixed cell count -- and added it to a world-space centre,
+    /// which is scaled to fit the screen, so the ring grew with the window and
+    /// the planet did not. Tuning the constants alone would not have fixed it:
+    /// at 1.7 the old arithmetic still measures 9.4 times the body, which is
+    /// outside the band below and fails the first assertion. The unit is the bug;
+    /// the constants were only ever the reason nobody had noticed the picture was
+    /// wrong, because they made a wrong unit produce an absurd number rather than
+    /// a nearly-right one.
+    ///
+    /// The band is 1.3 to 2.0 rather than a point, and it is wide because the
+    /// measurement is a pair of maxima over a rotating ellipse on a two-by-four
+    /// lattice. It is not wider than that because the upper end is what "too big"
+    /// meant: the old constants under the *new* arithmetic measure 2.3 times the
+    /// body, which is a hoop the width of a tenth of a 200 column terminal and
+    /// still past the top of the band.
+    ///
+    /// The last two assertions are about the ring still being a *ring*. The
+    /// report did not ask about them and they are the failure the new numbers are
+    /// most able to cause, since they brought the outer edge in by a third. Two
+    /// edges one dot apart do not read as a band, they read as a filled ellipse,
+    /// and the draw code loops over both edges precisely so that there is a
+    /// middle. Measured: 1.5 cells and three dots of separation, against a
+    /// one-dot floor.
+    #[test]
+    fn the_rings_are_a_ring_around_a_planet_and_not_a_hoop_around_a_solar_system() {
+        // Far enough apart that the camera swing and the planets' own motion
+        // have both turned the system right round, which is what makes the
+        // size-independence assertion below mean something.
+        const ROTATIONS: [u64; 4] = [0, 300, 900, 1500];
+
+        let mut ratios = Vec::new();
+        for size in [(80u16, 24u16), (200u16, 50u16)] {
+            for frames in ROTATIONS {
+                let planet = reach_of(size, frames, Subject::Planet);
+                let inner = reach_of(size, frames, Subject::Ring(RING_INNER));
+                let outer = reach_of(size, frames, Subject::Ring(RING_OUTER));
+
+                assert!(
+                    planet.dots > 0 && inner.dots > 0 && outer.dots > 0,
+                    "on {size:?} at frame {frames} the planet raised {} dots, the \
+                     inner edge {} and the outer {}, so this measured nothing",
+                    planet.dots,
+                    inner.dots,
+                    outer.dots
+                );
+
+                let ratio = outer.cells / planet.cells;
+                ratios.push(ratio);
+                assert!(
+                    (1.3..=2.0).contains(&ratio),
+                    "on {size:?} at frame {frames} the outer ring edge reaches \
+                     {:.2} cells from Saturn's centre and the planet is {:.2}, so \
+                     the ring is {ratio:.1} times the body -- past 2.0 it is a hoop \
+                     drawn across the picture rather than rings on a planet",
+                    outer.cells,
+                    planet.cells
+                );
+
+                // The ring must clear the planet rather than cut through it.
+                // Measured 1.08 to 1.12, so this is a floor and not a fit.
+                assert!(
+                    inner.cells >= planet.cells * 0.95,
+                    "on {size:?} at frame {frames} the inner ring edge is only \
+                     {:.2} cells out against a planet of {:.2}, so the ring starts \
+                     inside the body",
+                    inner.cells,
+                    planet.cells
+                );
+
+                // A band with a middle, in both units. One dot of separation
+                // draws a filled ellipse, not a ring.
+                let band = outer.cells - inner.cells;
+                let band_dots = outer.across - inner.across;
+                assert!(
+                    band >= 1.0,
+                    "on {size:?} at frame {frames} the two ring edges are {band:.2} \
+                     cells apart, so they are one edge and not an annulus"
+                );
+                assert!(
+                    band_dots >= 2.0,
+                    "on {size:?} at frame {frames} the two ring edges are \
+                     {band_dots:.0} dots apart across, which is not enough to read \
+                     as two edges"
+                );
+            }
+        }
+
+        // The same ratio on a small terminal and a large one. This is the
+        // assertion that is about the *unit*, and it is the one that fails
+        // against the old draw code at any pair of ring constants: 12.6 on the
+        // 80x24 against 29.4 on the 200x50. Tolerance a tenth, because the
+        // measured ratio moves by about 0.06 across the rotations at a fixed
+        // size, and that much is the lattice, not the fit.
+        let widest = ratios.iter().cloned().fold(0.0f64, f64::max);
+        let narrowest = ratios.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            widest - narrowest < 0.1,
+            "the ring measures {narrowest:.2} times the planet on one terminal and \
+             {widest:.2} on another, so the ring is being sized in world units \
+             and the planet in cells"
+        );
     }
 }
