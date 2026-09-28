@@ -166,9 +166,15 @@ fn the_field_is_called_ink_and_ascii_is_gone() {
         "a stale [ascii] section was honoured, so the rename did not take"
     );
 
-    // And it is still the only effect that wants the mouse, which is the reason
-    // mouse capture is enabled for the whole session.
+    // Mouse capture is enabled for the whole session because at least one effect
+    // wants it. There used to be exactly one -- the reason the sentence above
+    // could be "the only effect" -- and now there are two, `boids` having grown a
+    // click-to-scatter force. What matters is not the number but that the
+    // decision is being read from the table rather than hard-coded, because
+    // `main.rs` enables capture per *playlist* and so a playlist naming only
+    // `boids` would get no capture at all if this one were left at `false`.
     assert!(EffectId::Ink.needs_mouse());
+    assert!(EffectId::Boids.needs_mouse());
 }
 
 #[test]

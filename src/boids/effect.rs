@@ -18,6 +18,7 @@
 use crate::buffer::{Buffer, Cell};
 use crate::common::{DEFAULT_SEED, TerminalEffect, seeded_rng};
 use crate::render::palette::{Palette, lerp};
+use crate::runtime::{InputEvent, PointerPhase};
 use crossterm::style;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -335,6 +336,197 @@ mod gain {
     pub const DRIVE: f32 = 0.05;
 }
 
+/// The click-to-scatter force, and every number that shapes it.
+///
+/// A click drops a wavefront on the flock. Boids inside a narrow band around the
+/// front are pushed radially away from where the click landed, and the band is
+/// drawn, so what is on screen is exactly what is being hit.
+///
+/// A wave rather than a single impulse for two reasons, both of them about what
+/// the user sees. An impulse on one boid is invisible: a single boid leaving a
+/// flock of three hundred reads as a boid leaving, which is something that
+/// happens anyway. And a wave is *local*, so it reads as the flock opening up
+/// here rather than as the whole simulation being jolted, which is the
+/// difference between a screensaver reacting to you and a screensaver glitching.
+///
+/// The force is computed in [`Boids::shock_force`] and added in
+/// [`Boids::apply_rules`] alongside the three rules and the border, so it is
+/// damped by the same blend and clamped by the same `max_speed` as everything
+/// else. That is the point of putting it there rather than writing to velocities
+/// afterwards: a scatter *cannot* fling a boid faster than the simulation allows,
+/// so it is a disturbance rather than an escape hatch.
+mod shock {
+    /// Peak outward acceleration, at the centre of a wave's band.
+    ///
+    /// Measured against the force table in [`Boids::apply_rules`], which puts
+    /// separation at 1.50, cohesion at 0.92, border at 0.70 and alignment at
+    /// 0.78. Four times separation, so a click visibly out-shouts the rule whose
+    /// entire job is keeping boids apart. Under that it would not read at all:
+    /// separation is already the largest force in the effect and it is applied
+    /// every frame to every boid with a neighbour, where a wave touches each boid
+    /// for about eight frames and then never again.
+    pub const PUSH: f32 = 6.0;
+
+    /// Half-width of the band, in cells, so the band is `2 * BAND` across.
+    ///
+    /// `3.0`, which is exactly `separation_distance`, and two fifths of the
+    /// fifteen-cell perception radius the alignment and cohesion rules use. So a
+    /// wave hits everything the flock already considers a close encounter, and
+    /// leaves the group's sense of itself -- cohesion and alignment, which reach
+    /// fifteen cells -- intact to pull it back together afterwards. That is the
+    /// arc the effect wants: it blooms and closes.
+    pub const BAND: f32 = 3.0;
+
+    /// How fast the front travels, in cells per second.
+    ///
+    /// A boid at `max_speed` covers `0.6 * 60 = 36` cells a second, so this
+    /// outruns the flock: a wave that the boids outrun would look like it was
+    /// chasing them rather than displacing them.
+    ///
+    /// **Not normalised by screen size**, which is the usual answer in this file
+    /// -- see [`BORDER_MARGIN`] -- and is wrong here. Normalising gives every
+    /// terminal the same interaction *duration*, but on a 400x200 screen the
+    /// reachable area is 283 cells, so a one-second crossing is 283 cells a
+    /// second: nearly eight cells a frame, which makes the drawn ring strobe
+    /// rather than travel, and a wave moving seven times faster than the boids it
+    /// is displacing barely interacts with any of them. Constant cells per second
+    /// keeps the ring smooth at every size. What it costs is real and is the
+    /// trade: a click's disturbance lasts about 0.8 seconds on an 80x24 terminal
+    /// and about six on a 400x200 one.
+    pub const SPEED: f32 = 45.0;
+
+    /// What a wave's strength is multiplied by each step.
+    ///
+    /// Raised to the power of `scale`, like [`TRAIL_DECAY`], so the wave fades
+    /// over the same stretch of *time* whether the frame rate is 30 or 144. A
+    /// half-life of about 27 steps, so a wave on an ordinary terminal spends most
+    /// of its life below the strength where a scatter reads.
+    pub const DECAY: f32 = 0.975;
+
+    /// Below this, a wave is dropped rather than drawn or applied.
+    ///
+    /// Not zero, for the reason [`TRAIL_FLOOR`] is not zero: a force that has
+    /// decayed to nothing still costs a distance computation per boid per wave,
+    /// and the ring drawn from it is a dim line that reads as a second flock.
+    pub const FLOOR: f32 = 0.04;
+
+    /// How long a wave may live, in seconds.
+    ///
+    /// A second bound on top of reaching the far side, and it exists for the
+    /// screen sizes where reaching the far side is not soon. On a 400x200
+    /// terminal a wave at [`SPEED`] needs over six seconds to cross, and four of
+    /// them alive that long is four extra passes over the flock for six seconds
+    /// after a click.
+    pub const MAX_AGE: f32 = 2.5;
+
+    /// Live waves at once. Older ones are dropped past this.
+    ///
+    /// Two bounds in one number. The cost: `apply_rules` gains a loop over the
+    /// waves for each of its boids, and this caps it. The behaviour, which is the
+    /// one that matters: a drag can ask for a wave every [`DRAG_SPACING`] cells
+    /// of travel, and without a cap a fast drag across a large terminal stacks
+    /// dozens of bands on top of each other, every boid inside one of them is
+    /// pushed by several at once, and the whole flock pins to `max_speed` -- the
+    /// exact failure the force table above was written to undo, where the speed
+    /// stops carrying any information because everything is at the cap.
+    pub const MAX_WAVES: usize = 4;
+
+    /// How far the pointer must travel before a drag drops another wave.
+    ///
+    /// `BAND * 2`, so consecutive waves along a drag are touching rather than
+    /// leaving gaps: the result is a continuous ripple rather than a dotted line
+    /// of separate bursts.
+    pub const DRAG_SPACING: f32 = 6.0;
+
+    /// Cell height divided by cell width.
+    ///
+    /// The wave's distance is measured as `hypot(dx, dy * CELL_ASPECT)` so the
+    /// band is a circle in *pixels* and the drawn ring is round. Without it the
+    /// metric is isotropic in cells, and a cell is about twice as tall as it is
+    /// wide, so the ring comes out twice as tall as it is wide.
+    ///
+    /// `2.0` is the usual approximation and it is the same one the sub-cell
+    /// renderers in [`crate::render`] assume, with the same caveat recorded
+    /// there: DejaVu Sans Mono is nearer 1:1.2, so a ring is a little too tall on
+    /// a font that is not twice as tall as it is wide. It is a property of the
+    /// technique. What matters is that the *drawn* ring and the *applied* band are
+    /// measured the same way, or the feedback would be showing the user a shape
+    /// that is not the shape being hit.
+    pub const CELL_ASPECT: f32 = 2.0;
+}
+
+/// A difference between two points, as a distance in the metric the waves use.
+///
+/// Takes a difference rather than two points because the difference is not always
+/// a straight line between two places: the force wraps, via
+/// [`Boids::toroidal_diff`], and the drag spacing must not -- a pointer leaving
+/// the right edge and reappearing on the left has crossed most of a screen even
+/// though those two positions are a cell apart. Deciding that at each call site
+/// keeps the two cases from being confused for one another.
+///
+/// The vertical is scaled by [`shock::CELL_ASPECT`] so that a circle in this
+/// metric is a circle on screen. Without it the metric is isotropic in cells, and
+/// a cell is about twice as tall as it is wide, so every wave would be an ellipse
+/// twice as tall as it is wide.
+fn shock_distance(diff: (f32, f32)) -> f32 {
+    diff.0.hypot(diff.1 * shock::CELL_ASPECT)
+}
+
+/// `column` as a signed offset from `origin`, wrapped into `-width/2..=width/2`.
+///
+/// The wrapping is the point. A wave centred on column 50 of a sixty-wide screen
+/// draws an arc at columns 0 and 3, and a test that read those as 0 and 3 would
+/// conclude the ring was 47 columns to the *left* of where it was clicked -- which
+/// is true of the arithmetic and not of the picture. The same wrap is what
+/// [`Boids::paint_waves`] uses to put those arcs there in the first place.
+fn wrapped_column(column: usize, origin: f32, width: f32) -> f32 {
+    let half = width / 2.0;
+    ((column as f32 - origin + half).rem_euclid(width)) - half
+}
+
+/// One click's worth of spreading, still travelling.
+///
+/// Spawned on a press and on a drag's worth of travel, and dropped by
+/// [`Boids::advance_waves`] once it has decayed, aged out, or reached as far as
+/// anything can be from where it started.
+#[derive(Debug, Clone, Copy)]
+struct Shockwave {
+    /// Where the click landed, in cell coordinates.
+    origin: (f32, f32),
+    /// How far the front has travelled, in cells. Grows by [`shock::SPEED`].
+    radius: f32,
+    /// `PUSH` at birth, multiplied by [`shock::DECAY`] every step. This is both
+    /// the force scale and how the drawn ring dims, so a wave fades as one thing
+    /// rather than as a force that weakens behind a ring that does not.
+    strength: f32,
+    /// Seconds this wave has existed. Bounds its life on a large terminal, where
+    /// crossing the screen takes longer than [`shock::MAX_AGE`].
+    age: f32,
+}
+
+/// The ring's colour, before it is dimmed by how much of the wave is left.
+///
+/// Amber against a flock that runs dark blue to white: the two ends of the
+/// speed ramp are nowhere near it in hue, so a boid crossing the ring cannot be
+/// mistaken for the ring. Dimmed toward [`TRAIL_BACKGROUND`] rather than given
+/// its own bright end, so a wave reads as an event happening to the flock rather
+/// than as a second flock.
+const SHOCK_COLOR: style::Color = style::Color::Rgb {
+    r: 255,
+    g: 140,
+    b: 40,
+};
+
+/// The glyph a wave's ring is drawn with.
+///
+/// One glyph rather than a ramp, because the ring is a shape and not a value:
+/// there is no scalar here being encoded, so a ramp would be a way of spelling
+/// "one" in nine characters. `+` is ASCII, so it is single-width in every
+/// terminal ever shipped, and it sits in the middle of the cell both ways, which
+/// a `.` does not -- a ring of full stops sits on the baseline and reads as
+/// lopsided rather than as a circle.
+const SHOCK_GLYPH: char = '+';
+
 pub struct Boids {
     options: BoidsOptions,
     boids: Vec<Boid>,
@@ -363,6 +555,34 @@ pub struct Boids {
     /// Lives across frames so a boid that has left a cell still fades it out
     /// rather than snapping it to blank the instant it moves on.
     trail: HashMap<(usize, usize), TrailMark>,
+    /// The waves currently travelling, oldest first.
+    ///
+    /// A `VecDeque` rather than a `Vec` because [`shock::MAX_WAVES`] drops the
+    /// oldest when a new one arrives, which is a pop from the front and a `Vec`
+    /// would make that a shift of everything behind it. At four entries the shift
+    /// is free either way; the deque says what the code means.
+    ///
+    /// A click is one wave and a drag is several, so this is empty on almost every
+    /// frame of a run nobody is touching, and the cost of an empty one is a loop
+    /// that does not run.
+    waves: VecDeque<Shockwave>,
+    /// Whether a pointer button is down, latched from the events themselves.
+    ///
+    /// Latched rather than read from `InputState`, because the effect is handed
+    /// events and not the aggregate: `PointerPhase::Moved` covers both a drag
+    /// *and* a hover with no button down, and the runtime reports the two
+    /// identically -- `translate_mouse` gives a buttonless `MouseEventKind::Moved`
+    /// the `Left` button, which is also what a left-drag gets. A drag that scatters
+    /// and a hover that does not cannot be told apart from one event, so the only
+    /// way to tell them apart is to have been watching for the press.
+    pointer_down: bool,
+    /// Where the last wave was dropped from, for [`shock::DRAG_SPACING`].
+    ///
+    /// A wave's spawn point rather than the pointer's own last position, because
+    /// it is the wave that has to be spaced, not the pointer: two clicks at the
+    /// same spot should both land, and a drag that wanders back over its own path
+    /// should not be able to stack waves on top of each other from one spot.
+    last_wave_at: (f32, f32),
 }
 
 impl Boid {
@@ -445,6 +665,27 @@ impl TerminalEffect for Boids {
         self.step((seconds * 60.0) as f32);
     }
 
+    /// Drops a wave where the pointer went down, and another every
+    /// [`shock::DRAG_SPACING`] cells of travel while the button is held.
+    ///
+    /// Matched exhaustively rather than with a catch-all, for the reason `ink`
+    /// does the same: a new variant of [`InputEvent`] then fails to compile here
+    /// instead of being silently ignored, and a pointer event that quietly stopped
+    /// arriving would leave an effect that looks interactive and is not.
+    fn handle_input(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::Pointer {
+                position,
+                phase,
+                button: _,
+            } => self.handle_pointer(*position, *phase),
+            InputEvent::Key { .. } => {}
+            InputEvent::Resize { .. } => {}
+            InputEvent::FocusGained | InputEvent::FocusLost => {}
+            InputEvent::Quit | InputEvent::Ignored => {}
+        }
+    }
+
     fn update_size(&mut self, width: u16, height: u16) {
         let changed = self.options.screen_size != (width.max(1), height.max(1));
         self.options.screen_size = (width.max(1), height.max(1));
@@ -470,8 +711,113 @@ impl Boids {
     /// Advances the flock by `scale`, a multiple of the nominal frame.
     fn step(&mut self, scale: f32) {
         self.apply_rules(scale);
+        // After `apply_rules` and not before, so a wave dropped by a click in this
+        // frame is applied at the radius it was born at -- zero, which is where
+        // the pointer is -- rather than a step further out than the user asked
+        // for. It still travels this frame; it just travels after it has hit.
+        self.advance_waves(scale);
         self.update_positions(scale);
         self.fade_trail(scale);
+    }
+
+    /// Where a click puts a wave, and when one is due.
+    ///
+    /// The three pointer phases mean three different things, and the third is the
+    /// one that needs the latch:
+    ///
+    /// - **Pressed** always drops a wave. Not "if far enough from the last one":
+    ///   two deliberate clicks at the same spot are two clicks, and treating the
+    ///   second as a repeat would make the effect feel like it was ignoring you.
+    /// - **Released** clears the latch and nothing else. A release drops no wave,
+    ///   so letting go of the button mid-drag is not itself a disturbance.
+    /// - **Moved** drops one only if the button is *down*. This is the whole
+    ///   reason [`Boids::pointer_down`] exists: the runtime reports a hover and a
+    ///   drag with no difference at all, so a `Moved` on its own is a cursor
+    ///   drifting across the screen and must do nothing to the flock.
+    ///
+    /// Drag spacing is measured in the same corrected metric as the waves
+    /// themselves, so a drag is spaced by how far it looks like it went rather
+    /// than by how many cells of the screen it crossed -- which differ by a
+    /// factor of two on the vertical.
+    fn handle_pointer(&mut self, position: (u16, u16), phase: PointerPhase) {
+        let (x, y) = (position.0 as f32, position.1 as f32);
+
+        match phase {
+            PointerPhase::Pressed => {
+                self.pointer_down = true;
+                self.drop_wave((x, y));
+            }
+            PointerPhase::Released => self.pointer_down = false,
+            PointerPhase::Moved => {
+                if !self.pointer_down {
+                    return;
+                }
+                let travelled = shock_distance((
+                    x - self.last_wave_at.0,
+                    y - self.last_wave_at.1,
+                ));
+                if travelled >= shock::DRAG_SPACING {
+                    self.drop_wave((x, y));
+                }
+            }
+            // Scrolling past a flock is not touching it.
+            PointerPhase::WheelUp
+            | PointerPhase::WheelDown
+            | PointerPhase::WheelLeft
+            | PointerPhase::WheelRight => {}
+        }
+    }
+
+    /// Adds a wave at `origin`, dropping the oldest if there are too many.
+    fn drop_wave(&mut self, origin: (f32, f32)) {
+        while self.waves.len() >= shock::MAX_WAVES {
+            self.waves.pop_front();
+        }
+        self.waves.push_back(Shockwave {
+            origin,
+            radius: 0.0,
+            strength: shock::PUSH,
+            age: 0.0,
+        });
+        self.last_wave_at = origin;
+    }
+
+    /// Moves every wave along and drops the ones that are finished.
+    ///
+    /// Two independent ends, and both are needed. The age bound stops a wave
+    /// outliving its usefulness on a terminal where crossing the screen takes
+    /// longer than [`shock::MAX_AGE`]. The reach bound is the honest one: a wave
+    /// whose front is past the furthest anything can be from where it landed can
+    /// never touch another boid, so keeping it costs a distance computation per
+    /// boid and draws a ring out in the empty margin.
+    fn advance_waves(&mut self, scale: f32) {
+        let decay = shock::DECAY.powf(scale.max(0.0));
+        let reach = self.reach();
+
+        for wave in &mut self.waves {
+            wave.radius += shock::SPEED * scale / 60.0;
+            wave.strength *= decay;
+            wave.age += scale / 60.0;
+        }
+        self.waves.retain(|wave| {
+            wave.strength >= shock::FLOOR
+                && wave.age < shock::MAX_AGE
+                && wave.radius < reach
+        });
+    }
+
+    /// The furthest a boid can be from a wave's origin, in cells.
+    ///
+    /// Derived rather than guessed, because `toroidal_diff` is what decides which
+    /// boids a wave reaches and it is bounded: each axis comes back in
+    /// `-extent/2..=extent/2`, and nothing is further than half of each. So the
+    /// furthest is `hypot(width / 2, height / 2 * CELL_ASPECT)` -- half the width
+    /// across and half the height *in cells*, which is why the aspect is in there
+    /// and why it is the same metric the force uses.
+    fn reach(&self) -> f32 {
+        let width = self.options.screen_size.0 as f32;
+        let height = self.options.screen_size.1 as f32;
+        (width / 2.0).hypot(height / 2.0 * shock::CELL_ASPECT)
     }
 
     /// How many boids a screen of this size gets.
@@ -532,6 +878,10 @@ impl Boids {
             frame: Buffer::new(width, height),
             shown: Buffer::new(width, height),
             trail: HashMap::new(),
+            // A flock starts with nobody having clicked it.
+            waves: VecDeque::new(),
+            pointer_down: false,
+            last_wave_at: (0.0, 0.0),
         };
 
         flock.stamp();
@@ -742,6 +1092,19 @@ impl Boids {
             border_adjustments[i] = self.border_force(self.boids[i].position);
         }
 
+        // The click force, over the whole flock at once.
+        //
+        // Outside the O(n^2) double loop above even though it is a force like the
+        // other four, because it does not involve pairs. A wave asks "how far is
+        // this boid from one point", which is one question per boid per wave
+        // rather than one per pair, and folding it into the pair loop would have
+        // been a way of making the simulation quadratic for the sake of symmetry.
+        let mut shock_adjustments = vec![(0.0, 0.0); num_boids];
+        for (i, adjustment) in shock_adjustments.iter_mut().enumerate() {
+            let boid = &self.boids[i];
+            *adjustment = self.shock_force(boid.position, boid.velocity);
+        }
+
         // Apply all forces to boids
         for i in 0..num_boids {
             // Get current velocity
@@ -762,6 +1125,17 @@ impl Boids {
 
             new_vx += border_adjustments[i].0 * scale;
             new_vy += border_adjustments[i].1 * scale;
+
+            // And the click. Scaled like the rules, so a wave is felt over the
+            // same stretch of time whatever the frame rate, and so that `--speed`
+            // makes the scatter as much stronger as it makes everything else
+            // faster rather than leaving the one interactive force on its own
+            // clock. It is added before the damping and the speed clamp below for
+            // the same reason the rules are: a scatter should not be able to
+            // launch a boid past `max_speed`, or the click would be a way out of
+            // the simulation's own contract rather than a disturbance inside it.
+            new_vx += shock_adjustments[i].0 * scale;
+            new_vy += shock_adjustments[i].1 * scale;
 
             // Apply drive factor
             let speed = new_vx.hypot(new_vy);
@@ -842,6 +1216,72 @@ impl Boids {
 
         let push = self.options.border_factor * depth;
         (push * dx / length, push * dy / length)
+    }
+
+    /// The outward push from every live wave, for one boid.
+    ///
+    /// A pure function of `self.waves`, so it is testable without running the
+    /// loop -- the same reason [`Boids::border_force`] is a method rather than
+    /// inlined into [`Boids::apply_rules`]. A free-standing force that can only be
+    /// observed through a 300-boid simulation is a force that can only be tested
+    /// by looking at it.
+    ///
+    /// `heading` is the boid's own velocity, and only matters in the one case
+    /// where there is no outward direction to use: a boid exactly on the origin
+    /// has nothing to be pushed away *from*. See below.
+    fn shock_force(&self, position: (f32, f32), heading: (f32, f32)) -> (f32, f32) {
+        let mut total = (0.0f32, 0.0f32);
+
+        for wave in &self.waves {
+            // Wrapped, because the flock is wrapped. A click on the left of the
+            // screen has to reach a boid on the right of it, or a boid a hundred
+            // cells away round the torus would be treated as a hundred cells away
+            // on screen and the ring would visibly stop short of it.
+            let diff = self.toroidal_diff(position, wave.origin);
+            let distance = shock_distance(diff);
+
+            // The band: a fixed width travelling outward, strongest on the front
+            // and nothing at its edges. Triangular rather than a flat plateau, so
+            // there is no discontinuity in the force at either edge of the band
+            // -- a boid entering or leaving the band would otherwise be handed a
+            // step change in acceleration, which shows up as a boid flinching as
+            // the wave passes rather than being carried by it.
+            let offset = (distance - wave.radius).abs();
+            if offset >= shock::BAND {
+                continue;
+            }
+            let falloff = 1.0 - offset / shock::BAND;
+
+            // Away from the origin. The degenerate case is a boid sitting exactly
+            // on it, where the direction is undefined and dividing by a zero
+            // length would put a `NaN` into a velocity -- which does not panic,
+            // it silently teleports the boid to cell zero, because `NaN as isize`
+            // is zero, and a flock with one boid stuck in a corner is a flock
+            // that never recovers. It is reachable whenever a boid's position
+            // lands on an exact integer, which the rounding in `Boid::cell` is
+            // evidence happens.
+            //
+            // So the fallback is the boid's own heading: state that is known
+            // rather than something re-derived from a measurement of zero. A boid
+            // clicked exactly on the head is shoved onward, which is also what
+            // clicking a boid's face ought to do.
+            let (ux, uy) = if distance > f32::EPSILON {
+                (diff.0 / distance, diff.1 / distance)
+            } else {
+                let heading_length = heading.0.hypot(heading.1);
+                if heading_length > f32::EPSILON {
+                    (heading.0 / heading_length, heading.1 / heading_length)
+                } else {
+                    (1.0, 0.0)
+                }
+            };
+
+            let push = wave.strength * falloff;
+            total.0 += ux * push;
+            total.1 += uy * push;
+        }
+
+        total
     }
 
     fn update_positions(&mut self, scale: f32) {
@@ -982,11 +1422,142 @@ impl Boids {
             );
         }
 
+        // The waves go on last, over the trail rather than into it.
+        //
+        // Into the trail layer would mean they are stamped, faded and forgotten
+        // along with the boids, so a ring would leave a smear behind it that
+        // decayed on the trail's schedule rather than the wave's, and a wave
+        // crossing a boid's streak would fight it cell by cell. Over the top, the
+        // ring is a property of this frame and leaves when the wave does.
+        self.paint_waves();
+
         let cells = self.shown.diff(&self.frame);
         for (x, y, cell) in &cells {
             self.shown.set(*x, *y, *cell);
         }
         cells
+    }
+
+    /// Draws every live wave's band as a ring, into the frame being built.
+    ///
+    /// A ring rather than an annulus filled in, and a thin one, for the reason the
+    /// whole effect is legibility: what the user needs to see is *where the wave
+    /// is*, and a filled disc that grows would cover the flock it is meant to be
+    /// showing the effect of.
+    ///
+    /// Solved per column rather than per cell, because a circle is two points per
+    /// column and not one per cell. For a column at a horizontal distance `span`
+    /// from the origin, the row at which the circle at radius `r` crosses is
+    /// `sqrt(r^2 - span^2)` in the corrected metric, and that is the same
+    /// arithmetic [`Boids::shock_force`] does to decide whether the column is in
+    /// the band at all. Which is `O(width)` per wave instead of `O(area)`: at
+    /// 400x200 the difference is 80,000 distance computations a frame against
+    /// 400, and a screen-wide test would have made the cheapest interactive effect
+    /// in the crate the second most expensive one.
+    ///
+    /// Both edges of the band, so it is drawn as a ring rather than a disc. The
+    /// inner edge only exists while the front is further from the origin than the
+    /// band is wide; before that the band is a filled patch around the click and
+    /// there is no hole in the middle to draw.
+    ///
+    /// The offset is measured from the *wave's* column, not the screen's, and
+    /// wrapped when it comes back to a column index. Both are load-bearing. A
+    /// click near the right edge really does reach the boids near the left edge,
+    /// because the force is taken with `toroidal_diff`, so a ring that stopped at
+    /// the edge would be showing the user a smaller wave than the one acting on
+    /// their flock, and its other arc would appear from nowhere. Measuring the
+    /// offset from the screen's middle instead would draw a circle centred on the
+    /// middle of the terminal rather than on the click, which is a different
+    /// defect rather than a subtler version of this one.
+    fn paint_waves(&mut self) {
+        let (cols, rows) = (
+            self.options.screen_size.0 as usize,
+            self.options.screen_size.1 as usize,
+        );
+        if cols == 0 || rows == 0 {
+            return;
+        }
+
+        for wave in &self.waves {
+            // As a fraction of a full-strength wave, which is what dims it. A
+            // wave at birth is the brightest a ring ever is and it fades with the
+            // force behind it, so what is on screen and what is happening to the
+            // flock are the same thing fading together.
+            let fade = (wave.strength / shock::PUSH).clamp(0.0, 1.0);
+            let outer = wave.radius + shock::BAND;
+            let inner = (wave.radius - shock::BAND).max(0.0);
+
+            // Every column, as a signed offset from the origin's column. Going up
+            // to half the width either side is the whole of the reachable set: a
+            // column further off than that is closer to the origin the other way
+            // round, and is drawn on that pass.
+            for column in 0..cols {
+                // The signed distance from the origin to this column, wrapped.
+                let offset = wrapped_column(column, wave.origin.0, cols as f32);
+                let span = shock_distance((offset, 0.0));
+
+                if span >= outer {
+                    continue;
+                }
+                // How far into the band this column is, front to back. Drives the
+                // ring's own brightness so it has a soft edge, matching the force
+                // it is drawing rather than announcing a sharper boundary than
+                // there is.
+                let depth = if inner <= 0.0 {
+                    1.0
+                } else {
+                    ((outer - span) / (outer - inner)).clamp(0.0, 1.0)
+                };
+                let lit = lerp(TRAIL_BACKGROUND, SHOCK_COLOR, fade * depth);
+
+                // The rows this column's circles cross, in the corrected metric
+                // and then back into rows about the *origin's* row. Two circles
+                // and two crossings each, so four rows, which is a fixed-size
+                // array and not a `Vec` -- this runs once per column per wave and
+                // an allocation here would be the most expensive thing in the
+                // effect.
+                let mut edges = [0.0f32; 4];
+                let mut count = 0;
+                for radius in [outer, inner] {
+                    // `sqrt` of a negative number is `NaN`, and a `NaN` compared
+                    // against the row bounds passes every one of them and then
+                    // casts to zero -- which would drop a cell into the middle of
+                    // the screen on every column of the ring. Skipping the term
+                    // instead is the honest answer: a column past this circle's
+                    // radius does not cross it.
+                    let squared = radius * radius - span * span;
+                    if squared <= 0.0 {
+                        continue;
+                    }
+                    let half_rows = squared.sqrt() / shock::CELL_ASPECT;
+                    edges[count] = wave.origin.1 - half_rows;
+                    edges[count + 1] = wave.origin.1 + half_rows;
+                    count += 2;
+                }
+
+                let x = column;
+                for &edge in edges.iter().take(count) {
+                    let y = edge.round();
+                    if y < 0.0 || y >= rows as f32 {
+                        continue;
+                    }
+                    let y = y as usize;
+                    // Never over a lit cell. A boid under a ring should stay
+                    // visible: the ring passes over in a handful of frames, and
+                    // blanking a boid for those frames reads as the flock losing
+                    // members rather than as a ripple going by. The flock is five
+                    // percent of the cells, so this hides almost none of the ring.
+                    if self.trail.contains_key(&(x, y)) {
+                        continue;
+                    }
+                    self.frame.set(
+                        x,
+                        y,
+                        Cell::new(SHOCK_GLYPH, lit, style::Attribute::Reset),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1417,6 +1988,773 @@ mod tests {
             corner <= maximum + f32::EPSILON,
             "the border rule can add {corner:.2} to a velocity capped at {top_speed}"
         );
+    }
+
+    // --- the click force ----------------------------------------------------
+
+    /// A wave pushes a boid away from where it was dropped.
+    ///
+    /// The heart of the interaction, asserted on the force itself rather than
+    /// through a 300-boid run, because a click that pushed boids *together* or
+    /// sideways would still produce a flock that moved, and a test that only
+    /// watched the flock move would pass. So this checks the direction, on a
+    /// flock of one.
+    #[test]
+    fn a_wave_pushes_a_boid_away_from_where_it_was_dropped() {
+        let mut flock = Boids::new(BoidsOptions {
+            screen_size: (80, 24),
+            boid_count: 1,
+            ..Default::default()
+        });
+        flock.drop_wave((40.0, 12.0));
+
+        // One cell out horizontally, and `1 / CELL_ASPECT` rows out vertically,
+        // so all four are at the same *distance* under the metric the force uses.
+        // That is not incidental bookkeeping: the vertical offsets are divided by
+        // the aspect because a cell is about twice as tall as it is wide, so a
+        // naive "two rows away" would be testing a point four units from the wave
+        // and would pass or fail for the wrong reason.
+        for (target, away) in [
+            ((41.0, 12.0), (1.0, 0.0)),
+            ((40.0, 12.0 + 1.0 / shock::CELL_ASPECT), (0.0, 1.0)),
+            ((39.0, 12.0), (-1.0, 0.0)),
+            ((40.0, 12.0 - 1.0 / shock::CELL_ASPECT), (0.0, -1.0)),
+        ] {
+            let (fx, fy) = flock.shock_force(target, (1.0, 0.0));
+
+            assert!(
+                fx.hypot(fy) > 0.0,
+                "a wave dropped at (40, 12) does not reach the boid at {target:?}"
+            );
+            assert!(
+                fx * away.0 + fy * away.1 > 0.0,
+                "a wave dropped at (40, 12) pushes the boid at {target:?} by \
+                 ({fx:.2}, {fy:.2}), which is not directly away from it"
+            );
+        }
+    }
+
+    /// The band is a band: nothing outside it, most inside it.
+    ///
+    /// Without the outer bound a wave would keep pushing the whole screen for as
+    /// long as it lived and the effect would be a kick rather than a ripple.
+    #[test]
+    fn a_wave_only_reaches_a_band_around_its_front() {
+        let mut flock = Boids::new(BoidsOptions {
+            screen_size: (80, 24),
+            boid_count: 1,
+            ..Default::default()
+        });
+        flock.drop_wave((40.0, 12.0));
+        // A front ten cells out, and the band three either side of it, so the
+        // band covers distances 7 to 13 from the origin.
+        flock.waves[0].radius = 10.0;
+
+        // Measured horizontally, where a cell's distance is its distance: the
+        // vertical would have to be divided by the aspect to mean the same thing.
+        let push = |distance: f32| {
+            flock.shock_force((40.0 + distance, 12.0), (1.0, 0.0)).0
+        };
+
+        let front = push(10.0);
+        let inside = push(7.5);
+        let outside = push(6.5);
+        let far_outside = push(20.0);
+
+        assert!(
+            front > 0.0 && inside > 0.0,
+            "a wave's own front ({front:.2}) and its trailing edge ({inside:.2}) \
+             should both be inside the band"
+        );
+        assert!(
+            outside < 0.001,
+            "a boid half a cell outside the band was pushed {outside:.4}"
+        );
+        assert!(
+            far_outside < 0.001,
+            "a boid ten cells clear of the band was pushed {far_outside:.4}, so a \
+             wave is a kick rather than a travelling band"
+        );
+        // The front is the strongest part, so a boid is carried by the wave
+        // rather than shouldered aside by its leading edge.
+        assert!(
+            front > inside,
+            "the front of a wave ({front:.2}) is weaker than its trailing edge \
+             ({inside:.2})"
+        );
+        assert!(
+            front <= shock::PUSH + f32::EPSILON,
+            "a wave pushes by {front:.2}, past the {} it is meant to peak at",
+            shock::PUSH
+        );
+    }
+
+    /// A boid is not glued to a wave's band by a step change in force.
+    ///
+    /// A flat plateau inside the band and nothing outside it hands a boid a
+    /// discontinuity in acceleration as the front passes it, which reads as the
+    /// boid flinching rather than being carried. So the force is measured either
+    /// side of the boundary and has to approach zero.
+    #[test]
+    fn the_force_tapers_to_nothing_at_the_bands_edge() {
+        let mut flock = Boids::new(BoidsOptions {
+            screen_size: (80, 24),
+            boid_count: 1,
+            ..Default::default()
+        });
+        flock.drop_wave((40.0, 12.0));
+        flock.waves[0].radius = 10.0;
+        // The trailing edge of the band, as a distance from the origin, sampled a
+        // hundredth of a cell either side of it and again at the front.
+        let edge = shock::BAND;
+        let push = |distance: f32| {
+            flock.shock_force((40.0 + distance, 12.0), (1.0, 0.0)).0
+        };
+
+        let just_inside = push(10.0 - edge + 0.01);
+        let just_outside = push(10.0 - edge - 0.01);
+        let middle = push(10.0);
+
+        assert!(
+            just_outside < 0.001,
+            "the band does not end: a boid 0.01 cells past its trailing edge is \
+             still pushed {just_outside:.4}"
+        );
+        assert!(
+            just_inside < middle,
+            "the force does not taper: {just_inside:.4} at the edge of the band \
+             against {middle:.4} at its middle"
+        );
+    }
+
+    /// A boid exactly where the click landed is pushed, and stays a number.
+    ///
+    /// The direction away from an origin is undefined at the origin, and dividing
+    /// by a zero-length vector puts a `NaN` into a velocity. It does not panic: it
+    /// teleports the boid to cell zero, because `NaN as isize` is zero, and one
+    /// boid stuck in a corner is a flock that never recovers. Reachable whenever a
+    /// boid's position lands on an exact integer, which the rounding in
+    /// `Boid::cell` is evidence happens.
+    ///
+    /// So the boid is shoved along its own heading, and this is the test that says
+    /// so -- a position exactly equal to the origin, not merely near it.
+    #[test]
+    fn a_boid_clicked_exactly_on_the_head_is_pushed_onward_and_stays_finite() {
+        let mut flock = Boids::new(BoidsOptions {
+            screen_size: (80, 24),
+            boid_count: 1,
+            ..Default::default()
+        });
+        // Both the position and the wave's origin exactly equal, so the
+        // difference is exactly zero rather than merely small.
+        flock.boids[0].position = (40.0, 12.0);
+        flock.boids[0].velocity = (0.0, -0.4);
+        flock.drop_wave((40.0, 12.0));
+
+        let (fx, fy) = flock.shock_force((40.0, 12.0), (0.0, -0.4));
+
+        assert!(
+            fx.is_finite() && fy.is_finite(),
+            "clicking a boid on the head produced ({fx}, {fy})"
+        );
+        assert!(
+            fy < 0.0,
+            "a boid clicked on the head is pushed ({fx:.2}, {fy:.2}) rather than \
+             onward along the (-0.4) heading it was already travelling"
+        );
+        assert!(
+            fx.abs() < f32::EPSILON,
+            "a boid with a purely vertical heading picked up {fx:.4} of sideways \
+             force from being clicked on the head"
+        );
+
+        // And through the whole loop, not just the force: a `NaN` here would
+        // poison the position, and the position is what everything else reads.
+        run(&mut flock, 30);
+        for boid in &flock.boids {
+            assert!(
+                boid.position.0.is_finite() && boid.position.1.is_finite(),
+                "a boid's position went to {:?} after being clicked on the head",
+                boid.position
+            );
+        }
+    }
+
+    /// A wave reaches across the wrap, because the flock does.
+    ///
+    /// The distance is taken with `toroidal_diff` like every other rule, so a
+    /// click at the left of the screen reaches a boid at the right of it. Were it
+    /// taken straight, those two boids would be seventy cells apart and the ring
+    /// would visibly stop short of a boid it was already pushing.
+    #[test]
+    fn a_wave_reaches_across_the_wrap() {
+        let mut flock = Boids::new(BoidsOptions {
+            screen_size: (80, 24),
+            boid_count: 1,
+            ..Default::default()
+        });
+        // Column 1, because the band's edge is at `BAND` cells and an origin at
+        // column 2 puts the wrapped side exactly on it: at column 2 the nearest
+        // wrapped column is 79, three cells away, and the band excludes its own
+        // edge, so there would be no boid on the far side for the test to find.
+        flock.drop_wave((1.0, 12.0));
+
+        // Column 79 is two cells the *other* way round from column 1 -- the
+        // straight-line distance is 78 -- so it is inside the band and only the
+        // wrap can put it there. Column 40 is as far away again in the ordinary
+        // direction and is out of the band entirely.
+        let across = flock.shock_force((79.0, 12.0), (1.0, 0.0));
+        let straight = flock.shock_force((40.0, 12.0), (1.0, 0.0));
+
+        assert!(
+            across.0 < 0.0,
+            "a wave dropped at column 1 pushed a boid at column 79 to the right \
+             by {:.2}, so it did not reach across the wrap",
+            across.0
+        );
+        assert!(
+            straight.0 < 0.001,
+            "the same wave reached a boid 39 cells away in the ordinary direction \
+             by {:.4}, so the wrap is not what carried it",
+            straight.0
+        );
+    }
+
+    /// A drag scatters. A hover does not.
+    ///
+    /// The runtime cannot tell those two apart: `translate_mouse` gives a
+    /// buttonless `MouseEventKind::Moved` the `Left` button, which is exactly what
+    /// a left-drag gets, so both arrive as `PointerPhase::Moved` and only a
+    /// remembered press separates them. Which is why the effect latches
+    /// `pointer_down` rather than asking.
+    ///
+    /// If the latch were dropped and `Moved` were taken at face value, the flock
+    /// would scatter whenever a cursor drifted across the screen -- in a screensaver,
+    /// which is a thing nobody is touching, that is a bug that looks like the
+    /// effect misfiring on its own.
+    #[test]
+    fn a_drag_scatters_but_a_hover_does_not() {
+        let pointer = (40u16, 12u16);
+        let move_to = |flock: &mut Boids, position: (u16, u16)| {
+            flock.handle_input(&InputEvent::Pointer {
+                position,
+                phase: PointerPhase::Moved,
+                button: crate::runtime::PointerButton::Left,
+            });
+        };
+
+        // A drag: a press, then travel. The drag has to cross the whole screen
+        // because a wave is only dropped every `DRAG_SPACING` cells.
+        let mut dragged = flock((80, 24));
+        dragged.handle_input(&InputEvent::Pointer {
+            position: pointer,
+            phase: PointerPhase::Pressed,
+            button: crate::runtime::PointerButton::Left,
+        });
+        for x in 0..80u16 {
+            move_to(&mut dragged, (x, 12));
+        }
+        assert!(
+            dragged.waves.len() > 1,
+            "dragging across a whole screen dropped {} wave(s), so the drag is not \
+             scattering as it goes",
+            dragged.waves.len()
+        );
+
+        // A hover: the same travel, with no press. Not one wave.
+        let mut hovered = flock((80, 24));
+        for x in 0..80u16 {
+            move_to(&mut hovered, (x, 12));
+        }
+        assert!(
+            hovered.waves.is_empty(),
+            "a cursor drifting across the screen without a button down dropped {} \
+             wave(s), so moving the mouse is enough to disturb the flock",
+            hovered.waves.len()
+        );
+
+        // And releasing stops the drag, rather than leaving the latch set so the
+        // next stray movement continues it.
+        dragged.handle_input(&InputEvent::Pointer {
+            position: (0, 12),
+            phase: PointerPhase::Released,
+            button: crate::runtime::PointerButton::Left,
+        });
+        let before = dragged.waves.len();
+        for x in 0..80u16 {
+            move_to(&mut dragged, (x, 12));
+        }
+        assert_eq!(
+            dragged.waves.len(),
+            before,
+            "the flock kept scattering after the button was released"
+        );
+    }
+
+    /// Waves stop, and the flock is a flock again.
+    ///
+    /// A wave that never ended would be a permanent fourth force on every boid,
+    /// which is not a transient the user caused but a rule the effect now has. It
+    /// would also be a leak: `apply_rules` costs a distance computation per boid
+    /// per wave, forever.
+    #[test]
+    fn waves_end_and_the_flock_closes_again() {
+        let size = (80u16, 24u16);
+        let mut flock = flock(size);
+        flock.handle_input(&InputEvent::Pointer {
+            position: (40, 12),
+            phase: PointerPhase::Pressed,
+            button: crate::runtime::PointerButton::Left,
+        });
+        assert_eq!(
+            flock.waves.len(),
+            1,
+            "a click dropped no wave to begin with"
+        );
+
+        // Well past both the age bound and the time to cross this screen.
+        run(&mut flock, 900);
+
+        assert!(
+            flock.waves.is_empty(),
+            "{} wave(s) were still alive fifteen seconds after one click",
+            flock.waves.len()
+        );
+    }
+
+    /// Clicking opens the flock up, and it closes again afterwards.
+    ///
+    /// The claim the effect exists to make, measured the way the clustering test
+    /// above measures its own: the mean distance to the nearest neighbour of a
+    /// flock that was clicked, against a twin that was not, over the same number
+    /// of frames on the same seed. The twin is what makes it a measurement rather
+    /// than an observation -- a flock's spacing drifts on its own, so "the spacing
+    /// went up" would be true of an unclicked flock too.
+    ///
+    /// The middle of the screen, because a click near an edge is partly the border
+    /// rule's doing and would not isolate anything.
+    #[test]
+    fn clicking_spreads_the_flock_and_it_closes_again() {
+        const SEEDS: [u64; 4] = [11, 22, 33, 44];
+        const SETTLE: u32 = 180;
+        const SETTLED: u32 = 30;
+        let size = (60u16, 30u16);
+        let centre = (30u16, 15u16);
+
+        let after_click = |seed: u64| {
+            let mut flock = flock_with_seed(size, seed);
+            // Let it form a flock first, so what is measured is a flock being
+            // disturbed rather than a gas being stirred.
+            run(&mut flock, SETTLE);
+            flock.handle_input(&InputEvent::Pointer {
+                position: centre,
+                phase: PointerPhase::Pressed,
+                button: crate::runtime::PointerButton::Left,
+            });
+            run(&mut flock, SETTLED);
+            mean_nearest_neighbour(&flock)
+        };
+        let untouched = |seed: u64| {
+            let mut flock = flock_with_seed(size, seed);
+            run(&mut flock, SETTLE);
+            run(&mut flock, SETTLED);
+            mean_nearest_neighbour(&flock)
+        };
+
+        let opened: f32 = SEEDS.iter().map(|s| after_click(*s)).sum();
+        let closed: f32 = SEEDS.iter().map(|s| untouched(*s)).sum();
+        let opened = opened / SEEDS.len() as f32;
+        let closed = closed / SEEDS.len() as f32;
+
+        assert!(
+            opened > closed * 1.1,
+            "clicking the middle of the flock left the mean nearest-neighbour \
+             distance at {opened:.2} against {closed:.2} for a flock left alone. \
+             A click that does not visibly open the flock up is not doing anything."
+        );
+    }
+
+    /// The metric the waves use counts a cell's height as more than its width.
+    ///
+    /// This is the aspect correction, and it is tested on the metric rather than
+    /// on the ring, which is deliberate. Asking "is the ring round?" cannot fail
+    /// for the reason that matters: a ring drawn with an uncorrected metric is
+    /// perfectly round *in that metric*, it just comes out twice as tall as it is
+    /// wide on a screen where a cell is twice as tall as it is wide. Asking the
+    /// question of the drawing measures consistency rather than correctness, and
+    /// so passes against a ring that is the wrong shape.
+    ///
+    /// **What this cannot see:** whether `2.0` is the right number. That depends
+    /// on the user's font, and it is a property of the technique rather than
+    /// something to fix -- the sub-cell renderers in `crate::render` assume the
+    /// same and record the same caveat. What is testable is that the assumption
+    /// is made in one place and applied to both the force and the drawing, which
+    /// is the part that can silently drift apart.
+    #[test]
+    fn the_wave_metric_corrects_for_a_tall_cell() {
+        let across = shock_distance((3.0, 0.0));
+        let down = shock_distance((0.0, 3.0));
+
+        assert_eq!(across, 3.0, "a horizontal cell counts as one cell");
+        assert!(
+            down > across * 1.5,
+            "three cells down is {down:.2} units and three cells across is \
+             {across:.2}, so the metric is not correcting for a tall cell"
+        );
+        // And the force uses that metric rather than a raw difference, which is
+        // the part that can drift between the two callers. Distances are from the
+        // *origin*, since that is what a wave is centred on: a front ten cells
+        // out with a three-cell band covers corrected distances of 7 to 13.
+        //
+        // Six rows up is twelve corrected units, inside the band. Six and a half
+        // rows up is thirteen, and the band excludes its own edge. Uncorrected,
+        // both would be six and a half and comfortably inside -- which is the
+        // failure this is here to catch, since an uncorrected wave is an ellipse
+        // twice as tall as it is wide.
+        let mut flock = Boids::new(BoidsOptions {
+            screen_size: (80, 24),
+            boid_count: 1,
+            ..Default::default()
+        });
+        flock.drop_wave((40.0, 12.0));
+        flock.waves[0].radius = 10.0;
+
+        let beside = flock.shock_force((50.0, 12.0), (1.0, 0.0)).0;
+        let six_rows_up = flock.shock_force((40.0, 18.0), (1.0, 0.0)).1;
+        let six_and_a_half_rows_up = flock.shock_force((40.0, 18.5), (1.0, 0.0)).1;
+
+        assert!(
+            beside > 0.0,
+            "a boid ten cells beside a wave's front is not pushed"
+        );
+        assert!(
+            six_rows_up > 0.0,
+            "a boid six rows above a wave's origin is out of its band, but that is \
+             twelve corrected units and the band runs to thirteen"
+        );
+        assert_eq!(
+            six_and_a_half_rows_up, 0.0,
+            "a boid six and a half rows above a wave's origin is still within its \
+             band, so the vertical is not being scaled"
+        );
+    }
+
+    /// The ring is a ring: two edges, and nothing between them.
+    ///
+    /// Three claims about the same drawing, and each of them is a way the ring
+    /// came out wrong the first time.
+    ///
+    /// **Both edges exist.** The band's outer edge and its inner edge are separate
+    /// circles, and drawing only the outer one gives a thinner ring rather than a
+    /// broken one -- which is why this is checked by looking for cells at the
+    /// inner radius on the origin's own column, where the two circles cross it at
+    /// their extremes and are furthest apart.
+    ///
+    /// **Nothing in the body of the band.** The edges come from
+    /// `sqrt(r^2 - span^2)`, which is negative for every column past a circle's
+    /// radius. Clamping that to zero -- the obvious thing, since the row is wanted
+    /// as a height and cannot be negative -- draws a height-zero crossing on the
+    /// circle's own row for all of those columns, so the ring came out as an
+    /// annulus with a bar through it. The radius has to be *skipped* for those
+    /// columns, not its height clamped. Note where the bar lands: in the body of
+    /// the band, between the two edges, which is why the assertion is about that
+    /// annulus and not about the hole in the middle.
+    ///
+    /// **It goes all the way round**, or a ring that had collapsed to a dot would
+    /// satisfy the first two.
+    #[test]
+    fn the_ring_is_two_edges_with_nothing_between_them() {
+        let size = (60u16, 30u16);
+        let cols = size.0 as f32;
+        let (origin_x, origin_y) = (30usize, 15usize);
+
+        let mut flock = flock(size);
+        flock.get_diff();
+        flock.handle_input(&InputEvent::Pointer {
+            position: (origin_x as u16, origin_y as u16),
+            phase: PointerPhase::Pressed,
+            button: crate::runtime::PointerButton::Left,
+        });
+        // Twelve frames on: the front is nine cells out, the band three either
+        // side, so the outer circle is at twelve and the inner at six.
+        for _ in 0..12 {
+            flock.update();
+        }
+        let radius = flock.waves[0].radius;
+        assert!(
+            radius > shock::BAND,
+            "the wave has not travelled far enough for this test to mean anything: \
+             its front is at {radius:.2} and the band is {} wide",
+            shock::BAND
+        );
+        let inner = radius - shock::BAND;
+        let outer = radius + shock::BAND;
+
+        let drawn = flock.get_diff();
+        let ring: Vec<(usize, usize)> = drawn
+            .iter()
+            .filter(|(_, _, cell)| cell.symbol == SHOCK_GLYPH)
+            .map(|(x, y, _)| (*x, *y))
+            .collect();
+        assert!(
+            !ring.is_empty(),
+            "a wave that has travelled twelve frames drew nothing at all"
+        );
+
+        // Both edges, read off the origin's own column, where each circle is at
+        // its vertical extreme. Four crossings: two circles, two sides each.
+        let on_the_column: Vec<f32> = ring
+            .iter()
+            .filter(|(x, _)| *x == origin_x)
+            .map(|(_, y)| (*y as f32 - origin_y as f32).abs() * shock::CELL_ASPECT)
+            .collect();
+        let near =
+            |target: f32| on_the_column.iter().any(|v| (v - target).abs() <= 1.0);
+        assert!(
+            near(inner) && near(outer),
+            "the ring on its own column crosses at {on_the_column:?} corrected \
+             units from the origin, but the band's two edges are at {inner:.1} and \
+             {outer:.1}. Both edges have to be drawn or the band is not a band."
+        );
+
+        // And nothing in the body between them, which is where the clamped
+        // `sqrt` put its bar. Checked at the origin's own row, where the two
+        // edges' crossings are at a column offset of exactly inner and outer, so
+        // a cell between them is unambiguously in the band rather than in the
+        // hole or outside the wave.
+        let on_the_row: Vec<f32> = ring
+            .iter()
+            .filter(|(_, y)| *y == origin_y)
+            .map(|(x, _)| {
+                shock_distance((wrapped_column(*x, origin_x as f32, cols), 0.0))
+            })
+            .collect();
+        let in_the_body: Vec<f32> = on_the_row
+            .iter()
+            .copied()
+            .filter(|d| *d > inner - 1.0 && *d < outer - 1.0)
+            .collect();
+        assert!(
+            in_the_body.is_empty(),
+            "the ring is drawn across the body of its own band on the row through \
+             the origin, at {in_the_body:?} cells out where the band is \
+             {inner:.1} to {outer:.1}. A column past a circle's radius does not \
+             cross it, and clamping its height to zero instead of skipping it \
+             draws a bar through the band."
+        );
+        assert!(
+            !ring.contains(&(origin_x, origin_y)),
+            "the ring is drawn over the cell the wave came from"
+        );
+
+        // And it goes all the way round. Wrapped offsets, because a click near
+        // the right edge puts one arc at the left of the screen and an unwrapped
+        // comparison would read that as a hundred columns the wrong way.
+        let (leftmost, rightmost) = ring
+            .iter()
+            .map(|(x, _)| wrapped_column(*x, origin_x as f32, cols))
+            .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        assert!(
+            leftmost <= -outer + 1.0 && rightmost >= outer - 1.0,
+            "the ring reaches {leftmost:.1} to {rightmost:.1} either side of the \
+             origin, but the band's outer edge is at {outer:.1}, so it is an arc \
+             rather than a ring"
+        );
+    }
+
+    /// The ring is centred on the click, wherever the click was.
+    ///
+    /// Asserted as "no drawn cell is further from the click than the wave
+    /// reaches", in wrapped offsets -- not as a midpoint, which is the obvious way
+    /// to say "centred on" and cannot work here. A ring crosses its own centre
+    /// line symmetrically by construction, so the mean of its two extremes is the
+    /// origin *at any radius and any origin*, and the check would pass against a
+    /// ring drawn entirely in the wrong place. The reach test has no such
+    /// symmetry to hide behind.
+    #[test]
+    fn the_ring_is_centred_where_the_click_was() {
+        let size = (60u16, 30u16);
+        let cols = size.0 as f32;
+
+        // Well away from the middle, so a ring drawn at the middle instead of at
+        // the click is twenty columns out and cannot pass.
+        for click in [(10u16, 15u16), (50u16, 15u16), (30u16, 8u16)] {
+            let mut flock = flock(size);
+            flock.get_diff();
+            flock.handle_input(&InputEvent::Pointer {
+                position: click,
+                phase: PointerPhase::Pressed,
+                button: crate::runtime::PointerButton::Left,
+            });
+            for _ in 0..12 {
+                flock.update();
+            }
+            let drawn = flock.get_diff();
+            let ring: Vec<(usize, usize)> = drawn
+                .iter()
+                .filter(|(_, _, cell)| cell.symbol == SHOCK_GLYPH)
+                .map(|(x, y, _)| (*x, *y))
+                .collect();
+            assert!(
+                !ring.is_empty(),
+                "no ring was drawn for a click at {click:?}"
+            );
+
+            let reach = flock.waves[0].radius + shock::BAND;
+            let furthest = ring
+                .iter()
+                .map(|(x, y)| {
+                    shock_distance((
+                        wrapped_column(*x, click.0 as f32, cols),
+                        *y as f32 - click.1 as f32,
+                    ))
+                })
+                .fold(0.0f32, f32::max);
+
+            assert!(
+                furthest <= reach + 1.0,
+                "a click at {click:?} drew a ring cell {furthest:.1} cells from it, \
+                 but the wave only reaches {reach:.1}, so part of that ring is not \
+                 around the click"
+            );
+        }
+    }
+    /// The ring never paints over a boid.
+    ///
+    /// The boid is *placed* on a cell the ring is certain to draw, taken from the
+    /// ring's own output rather than computed from the geometry. A test that works
+    /// out where the ring ought to be re-derives the thing under test, and gets it
+    /// wrong in the same direction as the code when the code is wrong -- which is
+    /// what happened twice here, in a version that placed the boid by arithmetic
+    /// and then asserted it was not covered. The ring is read out of the diff and
+    /// a boid is put on one of its cells; if the ring is somewhere else, there is
+    /// nothing to place the boid on and the test says so.
+    ///
+    /// Why it matters: blanking a boid for the handful of frames a wave takes to
+    /// pass reads as the flock losing members, which is the one thing an effect
+    /// that is supposed to be showing you a flock must not do.
+    #[test]
+    fn the_ring_does_not_paint_over_a_boid() {
+        let size = (60u16, 30u16);
+        let mut flock = flock(size);
+        flock.get_diff();
+        flock.handle_input(&InputEvent::Pointer {
+            position: (30, 15),
+            phase: PointerPhase::Pressed,
+            button: crate::runtime::PointerButton::Left,
+        });
+        for _ in 0..12 {
+            flock.update();
+        }
+
+        // Where the ring is, on this frame, from its own output.
+        let first_pass: Vec<(usize, usize)> = flock
+            .get_diff()
+            .iter()
+            .filter(|(_, _, cell)| cell.symbol == SHOCK_GLYPH)
+            .map(|(x, y, _)| (*x, *y))
+            .collect();
+        let (cell_x, cell_y) = *first_pass
+            .first()
+            .expect("a wave that has travelled twelve frames drew no ring at all");
+
+        // Put a boid on that cell. The wave has not been advanced, so the ring is
+        // still exactly where it was and this is the frame where they overlap --
+        // which means nothing is reported in the *diff*, since the cell already
+        // said `SHOCK_GLYPH` last frame and has not changed. So this reads the
+        // built frame rather than the diff, which is also the honest thing to
+        // read: the question is what is on the screen, not what changed.
+        flock.boids[0].position = (cell_x as f32, cell_y as f32);
+        flock.boids[0].history.clear();
+        flock.boids[0].history.push_back((cell_x, cell_y));
+        flock.stamp();
+        let boid_glyph = flock.boids[0].character;
+        flock.get_diff();
+
+        assert_eq!(
+            flock.frame.get(cell_x, cell_y).symbol,
+            boid_glyph,
+            "the ring painted over the boid at ({cell_x}, {cell_y}), which would \
+             make the flock appear to lose members every time a wave passed"
+        );
+
+        // And the ring is still there on the rest of itself, so "does not paint
+        // over a boid" is not quietly satisfied by a ring that stopped drawing.
+        let drawn: usize = (0..size.0 as usize)
+            .flat_map(|x| (0..size.1 as usize).map(move |y| (x, y)))
+            .filter(|&(x, y)| flock.frame.get(x, y).symbol == SHOCK_GLYPH)
+            .count();
+        assert!(
+            drawn > 0,
+            "the ring drew nothing at all once a boid was on one of its cells"
+        );
+    }
+
+    /// Spam cannot build a pile of waves.
+    ///
+    /// Each live wave is another pass over the flock, and — the part that matters
+    /// — another band a boid can be inside at once. Unbounded, a fast drag
+    /// across a large terminal would stack dozens on top of each other, and every
+    /// boid inside the pile would be pinned to `max_speed`: the exact failure the
+    /// force table in `apply_rules` was written to undo, where nothing carries
+    /// speed any more because everything is at the cap.
+    #[test]
+    fn waves_are_capped_however_fast_they_are_dropped() {
+        let mut flock = flock((80, 24));
+        for i in 0..200u16 {
+            flock.handle_input(&InputEvent::Pointer {
+                position: (i % 80, 12),
+                phase: PointerPhase::Pressed,
+                button: crate::runtime::PointerButton::Left,
+            });
+        }
+        assert_eq!(
+            flock.waves.len(),
+            shock::MAX_WAVES,
+            "200 clicks left {} waves alive",
+            flock.waves.len()
+        );
+
+        // And the flock does not end up with every boid at the speed cap, which
+        // is the failure the cap exists to prevent.
+        run(&mut flock, 10);
+        let pinned = flock
+            .boids
+            .iter()
+            .filter(|boid| boid.speed() >= flock.options.max_speed * 0.999)
+            .count();
+        assert!(
+            pinned < flock.boids.len() / 2,
+            "{pinned} of {} boids were at the speed cap after a pile of waves, so \
+             the cap is not holding",
+            flock.boids.len()
+        );
+    }
+
+    /// A wave is gone after a reset, because a reset is a new flock.
+    ///
+    /// `reset` rebuilds the struct wholesale, so this is free — and free is exactly
+    /// why it needs pinning. The day someone makes `reset` preserve a field to
+    /// keep a setting, a wave left in it would appear on a flock that was never
+    /// clicked, from a click that has not happened yet.
+    #[test]
+    fn reset_drops_the_waves() {
+        let mut flock = flock((80, 24));
+        flock.handle_input(&InputEvent::Pointer {
+            position: (40, 12),
+            phase: PointerPhase::Pressed,
+            button: crate::runtime::PointerButton::Left,
+        });
+        assert_eq!(flock.waves.len(), 1);
+
+        flock.reset();
+
+        assert!(
+            flock.waves.is_empty(),
+            "a reset flock came back with {} wave(s) still travelling",
+            flock.waves.len()
+        );
+        assert!(!flock.pointer_down, "a reset flock thinks a button is down");
     }
 
     /// The middle of the screen is not pushed at all.

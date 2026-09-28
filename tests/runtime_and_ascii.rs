@@ -1377,6 +1377,8 @@ fn dvd_is_registered_with_a_distinct_name() {
     let dvd = EffectId::Dvd.as_str();
     assert_eq!(dvd, "dvd");
     assert!(EffectId::all().any(|id| id == EffectId::Dvd));
+    // A bouncing logo has nothing to click, which is the case that shows the
+    // flag means something rather than being set everywhere.
     assert!(!EffectId::Dvd.needs_mouse());
     assert!(EffectId::Ink.needs_mouse());
 }
