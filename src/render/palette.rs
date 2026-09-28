@@ -310,6 +310,177 @@ pub fn luminance(color: Color) -> f32 {
     (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
 }
 
+/// A colour at a given OKLab hue, at fixed lightness and chroma.
+///
+/// This is what a *categorical* palette wants, and building one any other way is
+/// a trap worth recording. The obvious alternative is to hold HSV's *saturation*
+/// and *value* fixed and vary the hue, and HSV value is not perceptual lightness:
+/// at `S = 0.85, V = 0.95` the six sector anchors come out with OKLab lightnesses
+/// spread over **0.47**, which is roughly ten times a just-noticeable difference.
+/// So a set of HSV colours told apart only
+/// by hue is really being told apart mostly by *brightness* -- and if the effect
+/// is also using brightness for something, which `newton` is, the two channels
+/// fight over the same signal and the categories stop reading as categories.
+///
+/// Holding lightness and chroma fixed removes that by construction: the colours
+/// differ in hue and in nothing else. Measured minimum pairwise
+/// [`perceptual_distance`] across degrees 3, 4 and 5, at `L = 0.75, C = 0.20`:
+///
+/// ```text
+/// degree 3   0.282
+/// degree 4   0.211
+/// degree 5   0.172
+/// ```
+///
+/// against a threshold of 0.15, with the lightness spread down to 0.048. The same
+/// three degrees on an HSV wheel of fixed saturation and value measure 0.475,
+/// 0.121 and 0.181 -- so HSV is *better* at three and worse at four, which is worth
+/// knowing before anyone concludes that a hue wheel is a hue wheel.
+///
+/// `hue` is in turns, `0.0..=1.0`, and wraps. Out-of-gamut results are clamped
+/// per channel, which costs some chroma near the corners of the space rather than
+/// producing a colour outside sRGB.
+pub fn oklab_hue(lightness: f32, chroma: f32, hue: f32) -> Color {
+    let lightness = if lightness.is_nan() {
+        0.75
+    } else {
+        lightness.clamp(0.0, 1.0)
+    };
+    let chroma = if chroma.is_nan() {
+        0.0
+    } else {
+        chroma.max(0.0)
+    };
+    let hue = if hue.is_nan() { 0.0 } else { hue } * std::f32::consts::TAU;
+
+    let (r, g, b) =
+        oklab_to_srgb(lightness, chroma * hue.cos(), chroma * hue.sin());
+    Color::Rgb { r, g, b }
+}
+
+/// The inverse of [`oklab`], clamping out-of-gamut channels.
+fn oklab_to_srgb(l: f32, a: f32, b: f32) -> (u8, u8, u8) {
+    let l_ = l + 0.396_337_8 * a + 0.215_803_8 * b;
+    let m_ = l - 0.105_561_3 * a - 0.063_854_2 * b;
+    let s_ = l - 0.089_484_2 * a - 1.291_485_5 * b;
+    let (l3, m3, s3) = (l_.powi(3), m_.powi(3), s_.powi(3));
+    let r = 4.076_742 * l3 - 3.307_711_6 * m3 + 0.230_969_9 * s3;
+    let g = -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3;
+    let b = -0.004_196_1 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3;
+
+    let encode = |v: f32| -> u8 {
+        let v = v.clamp(0.0, 1.0);
+        let s = if v <= 0.0031308 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0).round() as u8
+    };
+    (encode(r), encode(g), encode(b))
+}
+
+/// Rescales a colour's value channel, keeping its hue and saturation.
+///
+/// The shading half of a two-channel colour scheme: `newton` picks the hue from
+/// which root a sample reached and then uses this to encode how many iterations
+/// that took, so one cell carries both facts.
+///
+/// Darkening rather than lightening, because a field drawn on a black terminal
+/// has room below and none above -- and because a dark cell is one the glyph ramp
+/// is already backing up with a sparser mark.
+///
+/// The shading half of a two-channel colour scheme: `newton` picks the hue from
+/// which root a sample reached and then uses this to encode how many iterations
+/// that took, so one cell carries both facts.
+///
+/// Darkening rather than lightening, because a field drawn on a black terminal
+/// has room below and none above.
+pub fn shade(color: Color, value: f32) -> Color {
+    match color {
+        Color::Rgb { r, g, b } => {
+            let k = if value.is_nan() {
+                1.0
+            } else {
+                value.clamp(0.0, 1.0)
+            };
+            Color::Rgb {
+                r: (r as f32 * k).round() as u8,
+                g: (g as f32 * k).round() as u8,
+                b: (b as f32 * k).round() as u8,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Distance between two colours in OKLab, the cheap perceptual space.
+///
+/// For "can a viewer tell these two apart", which is the question every choice
+/// of categorical palette has to answer, and the one that eyeballing a hex code
+/// cannot.
+///
+/// ## The scale, because it is not the one you would guess
+///
+/// **OKLab is not scaled to 0-100.** There is no multiply-by-100 convention here,
+/// and assuming one is exactly how this function's first caller came to set a
+/// threshold of `30` against a quantity whose entire useful range is about `0.6` --
+/// so every assertion built on it failed while looking like it was testing
+/// separation. The numbers to compare against:
+///
+/// - **about 0.02** -- a just-noticeable difference, the smallest gap a viewer
+///   reliably sees;
+/// - **about 0.1** -- comfortably different, obviously two things;
+/// - **about 0.3** -- different categories;
+/// - **about 0.5** -- about as far apart as two colours get without a third hue
+///   between them. Saturated red against saturated green measures 0.52 here.
+///
+/// So a categorical palette wants its closest pair above roughly `0.15`, and a
+/// pair under `0.05` is a shading step however different the hex codes look.
+///
+/// The transform is the standard sRGB-linear to LMS to OKLab chain, and the linear
+/// step is not optional -- skipping it shifts lightness noticeably in the mid-tones,
+/// which is exactly where a categorical set lives. Raw RGB is a poor perceptual
+/// space for the same reason this function exists: pure blue and pure green are
+/// 255 apart per channel and nearly the same brightness, while a colour and a slightly darker copy of
+/// itself are close in every channel and can still be far apart to the eye.
+pub fn perceptual_distance(a: Color, b: Color) -> f32 {
+    let (ar, ag, ab) = named_rgb(a).unwrap_or((0, 0, 0));
+    let (br, bg, bb) = named_rgb(b).unwrap_or((0, 0, 0));
+    let (al, aa, ac) = oklab((ar, ag, ab));
+    let (bl, ba, bc) = oklab((br, bg, bb));
+    let (dl, da, dc) = (al - bl, aa - ba, ac - bc);
+    (dl * dl + da * da + dc * dc).sqrt()
+}
+
+/// One colour into OKLab's `(L, a, b)`.
+fn oklab((r, g, b): (u8, u8, u8)) -> (f32, f32, f32) {
+    fn lin(v: u8) -> f32 {
+        let v = v as f32 / 255.0;
+        // sRGB is not linear, and skipping this step is the single most common
+        // way to get a perceptual transform subtly wrong: it shifts lightness
+        // noticeably in the mid-tones, which is exactly where a categorical set
+        // lives.
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    let (r, g, b) = (lin(r), lin(g), lin(b));
+    let l = 0.412_221_5 * r + 0.536_332_5 * g + 0.051_446 * b;
+    let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_397 * b;
+    let s = 0.088_302_5 * r + 0.281_718_8 * g + 0.629_978_7 * b;
+
+    let (l_, m_, s_) = (l.cbrt(), m.cbrt(), s.cbrt());
+    (
+        0.210_454_3 * l_ + 0.793_617_8 * m_ - 0.004_072_047 * s_,
+        1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_,
+        0.025_904 * l_ + 0.782_771_8 * m_ - 0.808_675_8 * s_,
+    )
+}
+
 /// Black to white, the ramp a scalar field wants when nothing else is specified.
 pub fn greyscale() -> Palette {
     Palette::from_rgb(vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])

@@ -92,6 +92,29 @@ pub mod presets {
     /// [`is_ambiguous_or_narrow`] allows it.
     pub const FLAME: &str = " ▁▂▃▄▅▆▇█";
 
+    /// [`SHADE`] with its leading space removed, for a *filled region* whose
+    /// lowest value is still part of the picture.
+    ///
+    /// Every other set here starts with a space, and for most effects that is
+    /// right: "no value" should be "no ink". But a space is a hole in a filled
+    /// region, and this module's docs carry the rule -- the sparsest step lands on
+    /// the part of the region with the lowest value, and a space there makes that
+    /// part invisible against whatever is behind it.
+    ///
+    /// `newton` is the caller, and it is the worst possible case. Its regions are
+    /// Newton's basins, coloured by which root a sample converged to, and the
+    /// lowest ink step covers the samples that converged *fastest* -- which are
+    /// the ones nearest a root, and so the largest smooth area of each basin. A
+    /// space there would delete the middle of every basin and leave only the
+    /// fractal filigree, which is the part of the picture meant to be the detail.
+    ///
+    /// The ordering is [`SHADE`]'s, including its not-quite-monotonic stretch in
+    /// the middle. That is tolerable as texture and wrong as a value carrier, which
+    /// is what [`BLOCKS`] exists for -- but this set's job is to be *present*
+    /// everywhere, and five uneven steps the eye can rank beat four steps of
+    /// nothing at the bottom.
+    pub const INKED: &str = ".:-=+*#%@";
+
     /// Every set above, for `--help` and the docs.
     pub const ALL: &[(&str, &str)] = &[
         ("shade", SHADE),
@@ -99,6 +122,7 @@ pub mod presets {
         ("dots", DOTS),
         ("blocks", BLOCKS),
         ("flame", FLAME),
+        ("inked", INKED),
     ];
 
     /// Looks a set up by name, case-insensitively.
