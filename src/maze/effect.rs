@@ -232,12 +232,23 @@ impl TerminalEffect for Maze {
         // keep mottling behind the finished maze, so the picture is alive rather
         // than a freeze-frame, and the diff is only the cells that actually
         // changed.
+        //
+        // `return self.draw()` and *not* `self.draw(); return
+        // self.canvas.commit()`. `draw` ends in a commit, so the second version
+        // committed twice: the first commit's diff was discarded and the second
+        // diffed the frame-with-maze against the frame-from-before-it. That is an
+        // **erase**, emitted for every frame of the hold -- so the finished maze
+        // was blanked from the screen and never shown at all, which is the one
+        // thing the hold exists for.
+        //
+        // The test that was meant to catch it asserted only that the diff was
+        // non-empty, and a full-screen erase is non-empty. It now asserts that
+        // the drawn cells are the maze.
         if self.maze_complete
             && let Some(completed_at) = self.completed_at
             && self.elapsed_at(completed_at) < self.options.hold_seconds
         {
-            self.draw();
-            return self.canvas.commit();
+            return self.draw();
         }
         if self.maze_complete {
             self.reset();
@@ -570,23 +581,62 @@ mod tests {
     /// the result is on screen there is nothing to look at.
     #[test]
     fn a_finished_maze_is_left_on_screen_before_it_regenerates() {
-        let mut maze = finished_maze();
+        let (width, height) = (40usize, 20usize);
+        let mut maze = Maze::new(MazeOptions::default(), (40, 20));
+        for _ in 0..4_000 {
+            maze.update_with_context(&frame_after(0.05));
+            if maze.maze_complete {
+                break;
+            }
+        }
+        assert!(maze.maze_complete(), "the maze never finished carving");
+        let path = maze.paths().clone();
+
+        // Replay the diff into what the terminal is showing, because a diff is
+        // not a picture. `terminal` is the screen.
+        //
+        // The old version of this asserted only `!diff.is_empty()`, and a
+        // full-screen *erase* is not empty -- so it passed while the finished
+        // maze was being blanked from the screen every frame of the hold. That
+        // is the whole defect: an assertion on the shape of the change rather
+        // than on the result.
+        let mut terminal = Buffer::new(width, height);
+        let commit = |maze: &mut Maze, terminal: &mut Buffer| {
+            for (x, y, cell) in maze.get_diff() {
+                if x < width && y < height {
+                    terminal.set(x, y, cell);
+                }
+            }
+        };
 
         // The frame that notices completion must still draw the maze.
-        let drawn = maze.get_diff();
+        commit(&mut maze, &mut terminal);
         assert!(
-            !drawn.is_empty(),
-            "the frame a maze completes on drew nothing, so the finished maze is \
-             never visible"
+            path.iter().all(|(x, y)| terminal.get(*x, *y).symbol == '█'),
+            "the frame a maze completed on did not put the carved path on the \
+             screen: {}/{} path cells are showing something else",
+            path.iter()
+                .filter(|(x, y)| terminal.get(*x, *y).symbol != '█')
+                .count(),
+            path.len()
         );
 
-        // And it must stay drawn, not just appear once.
-        let held = maze.get_diff();
-        assert!(
-            !held.is_empty(),
-            "a completed maze was torn down on the very next frame, so it is on \
-             screen for exactly one frame"
-        );
+        // And it must *stay* drawn, not just appear once. Held over several
+        // frames, because one frame is not a hold.
+        for frame in 0..12 {
+            commit(&mut maze, &mut terminal);
+            let missing = path
+                .iter()
+                .filter(|(x, y)| terminal.get(*x, *y).symbol != '█')
+                .count();
+            assert_eq!(
+                missing,
+                0,
+                "held frame {frame} of the maze took {missing} of {} path cells \
+                 off the screen, so the result is not being held",
+                path.len()
+            );
+        }
     }
 
     /// The hold has to end, or the effect becomes `blank`.
