@@ -128,7 +128,7 @@ fn main() -> Result<(), error::TermzzzError> {
     // Both entry points below share this, so the focus policy is decided once and
     // cannot drift between running a single effect and running a playlist.
     let runtime_options = common::RuntimeOptions::new(speed).with_focus_policy(
-        config.global.pause_when_unfocused,
+        config.global.throttle_when_unfocused,
         config.global.idle_fps,
     );
 

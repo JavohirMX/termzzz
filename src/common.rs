@@ -87,8 +87,8 @@ pub fn normalize_effect_size(size: (u16, u16)) -> (u16, u16) {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RuntimeOptions {
     pub speed: f32,
-    /// Whether to slow down while the terminal window is unfocused.
-    pub pause_when_unfocused: bool,
+    /// Whether to reduce the frame rate while the terminal window is unfocused.
+    pub throttle_when_unfocused: bool,
     /// Frames per second while unfocused. Clamped by [`MIN_IDLE_FPS`] and
     /// [`MAX_IDLE_FPS`], because zero means "stop" and a large value means "do
     /// nothing", and both are worse than the plain reading of the number.
@@ -99,7 +99,7 @@ impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             speed: 1.0,
-            pause_when_unfocused: true,
+            throttle_when_unfocused: true,
             idle_fps: 4.0,
         }
     }
@@ -116,10 +116,10 @@ impl RuntimeOptions {
     /// Sets what to do while the terminal is unfocused.
     pub fn with_focus_policy(
         mut self,
-        pause_when_unfocused: bool,
+        throttle_when_unfocused: bool,
         idle_fps: f32,
     ) -> Self {
-        self.pause_when_unfocused = pause_when_unfocused;
+        self.throttle_when_unfocused = throttle_when_unfocused;
         self.idle_fps = idle_fps.clamp(MIN_IDLE_FPS, MAX_IDLE_FPS);
         self
     }
@@ -600,10 +600,6 @@ where
     let idle_frame_duration = Duration::from_secs_f64(
         1.0 / f64::from(options.idle_fps.clamp(MIN_IDLE_FPS, MAX_IDLE_FPS)),
     );
-    // Tracks the previous frame's focus, so the transition into focus can reset
-    // the frame clock. Initialised to `true` because `InputState` starts focused,
-    // and a spurious reset on frame one would cost a single frame of delta.
-    let mut was_focused = true;
     // When the next frame is due, advanced by a fixed step each time rather than
     // measured from the end of the last one. Sleeping for "the remainder of the
     // last frame" cannot repay an oversleep, so the period drifts and the delta
@@ -639,17 +635,16 @@ where
         }
 
         // Resolved after the poll, because a focus change arrives as an event.
-        let focused = !options.pause_when_unfocused || input.is_focused();
-        if focused && !was_focused {
-            // Coming back. The wall clock ran on without the simulation, and
-            // handing the effect the whole absence as one delta would teleport it
-            // forward -- a visible jump on the first frame after an alt-tab. So
-            // the absence is discarded and the effect carries on from where it
-            // stopped, one frame at a time.
-            previous_frame = frame_started_at;
-            next_frame_at = frame_started_at;
-        }
-        was_focused = focused;
+        //
+        // There used to be a resume branch here that reset `previous_frame` and
+        // `next_frame_at` on regaining focus, to stop the wall-clock time spent
+        // away being handed to the effect as one delta. It was doing nothing,
+        // twice over: the delta is clamped to `MAX_FRAME_DELTA` at the top of the
+        // loop, so a long absence could never have been handed over in one piece
+        // anyway, and with the freeze gone the simulation advances while away, so
+        // there is no absence left to discard. Resetting the clock on resume
+        // would now *drop* a frame's worth of real time for no reason.
+        let focused = !options.throttle_when_unfocused || input.is_focused();
 
         let context = FrameContext::new(size, frame, elapsed, delta, input.clone());
         let mut diff = target.effect().get_diff_with_context(&context);
@@ -660,25 +655,32 @@ where
         write_cells(&mut buffered_stdout, size, &diff)?;
         buffered_stdout.flush()?;
 
-        if focused {
-            if (speed - 1.0).abs() < f32::EPSILON {
-                target.effect().update_with_context(&context);
-            } else {
-                let steps = tick_clock.advance(delta, speed);
-                let mut tick_context = context.clone();
-                tick_context.delta =
-                    Duration::from_secs_f64(TickClock::QUANTUM as f64);
-                for _ in 0..steps {
-                    target.effect().update_with_context(&tick_context);
-                }
+        // The simulation advances whether or not the window has focus.
+        //
+        // It used to be inside `if focused`, and the report was "when I put it
+        // on my second monitor and work on my first, it stops". It was worse
+        // than a slowdown, because **no bytes reached the terminal at all**:
+        // every effect renders from state that only `update` advances, so an
+        // un-updated frame re-renders byte-identically, `Canvas::commit` diffs
+        // it to nothing, and `write_cells` writes an empty frame four times a
+        // second. The loop was spinning to produce silence.
+        //
+        // The justification for freezing was that at four frames a second a real
+        // delta is 250 ms, which `MAX_FRAME_DELTA` clamps to 50, so an effect
+        // would run at a fifth of its speed. That is true and it is a *consequence
+        // of `idle_fps`*, not a reason to stop: a frozen screen is worse than a
+        // slow one, and `pause_when_unfocused` is now the knob that says which
+        // of the two you would rather have.
+        if (speed - 1.0).abs() < f32::EPSILON {
+            target.effect().update_with_context(&context);
+        } else {
+            let steps = tick_clock.advance(delta, speed);
+            let mut tick_context = context.clone();
+            tick_context.delta = Duration::from_secs_f64(TickClock::QUANTUM as f64);
+            for _ in 0..steps {
+                target.effect().update_with_context(&tick_context);
             }
         }
-        // While unfocused the simulation is frozen rather than fed a coarser
-        // delta. At four frames a second a real delta is 250 ms, which
-        // `MAX_FRAME_DELTA` would clamp to 50, so the effect would run at a fifth
-        // of its speed and *stay* there -- and a playlist would stall rather than
-        // keep time. Freezing also means the accumulated time is simply
-        // discarded on resume instead of being paid out in one lurch.
 
         // Fixed-cadence pacing. A frame that overruns its slot pushes the next
         // one out rather than compounding the overshoot, and a frame that

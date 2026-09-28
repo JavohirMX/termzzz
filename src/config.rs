@@ -49,18 +49,39 @@ fn config_path() -> PathBuf {
 #[serde(default)]
 pub struct GlobalOptions {
     pub speed: f32,
-    /// Whether to slow down when the terminal window does not have focus.
+    /// Whether to reduce the frame rate when the terminal does not have focus.
     ///
-    /// A screensaver nobody is looking at should not be costing a core. It
-    /// throttles rather than stops, deliberately: a terminal that never reports
-    /// a focus change would otherwise leave the program frozen with no way to
-    /// wake it, whereas this degrades to a quietly slow screensaver.
-    pub pause_when_unfocused: bool,
-    /// Frames per second while unfocused, when `pause_when_unfocused` is set.
+    /// A screensaver nobody is looking at should not be costing a core, so this
+    /// drops to [`idle_fps`](Self::idle_fps) instead. It throttles rather than
+    /// stops, and it always has on paper: the report was "when I put it on my
+    /// second monitor and work on my first, it stops", and the code froze the
+    /// *simulation* rather than the frame rate. Freezing is invisible twice over
+    /// -- no effect renders from a wall clock, so an un-updated frame diffs to
+    /// nothing and the loop wrote **zero bytes** four times a second.
+    ///
+    /// Renamed from `pause_when_unfocused`, which never described it: nothing
+    /// was ever paused, the process ran throughout. The old name is still
+    /// accepted so existing configs keep working.
+    #[serde(alias = "pause_when_unfocused")]
+    pub throttle_when_unfocused: bool,
+    /// Frames per second while unfocused, when
+    /// [`throttle_when_unfocused`](Self::throttle_when_unfocused) is set.
     ///
     /// Not zero. Stopping outright is the cheapest option and the most dangerous
-    /// one, for the reason above. Four is a fifteenth of the work and still
-    /// visibly alive if you alt-tab back and watch for a moment.
+    /// one, for the reason above.
+    ///
+    /// **Twenty, and the number is a threshold rather than a taste.** The loop
+    /// clamps a frame's delta to `MAX_FRAME_DELTA`, 50 ms, so the effect
+    /// advances at most 50 ms per drawn frame. At `N` frames a second that is
+    /// `N * 50 ms` of simulation per second, which reaches real time at
+    /// **20 fps** and is a fraction of it below that. So this knob quietly
+    /// controls the *speed* as well as the smoothness, and the two cannot be
+    /// pulled apart without sub-stepping: at the old default of 4, an unfocused
+    /// effect would run at a fifth speed as well as at a quarter frame rate.
+    ///
+    /// 20 fps of a screensaver is smooth enough to read as motion and is a third
+    /// of the render and encode work. Below 20 you are choosing to spend less
+    /// and see less.
     pub idle_fps: f32,
     /// The terminal's own background colour, for the whole session.
     ///
@@ -101,8 +122,8 @@ impl Default for GlobalOptions {
     fn default() -> Self {
         Self {
             speed: 1.0,
-            pause_when_unfocused: true,
-            idle_fps: 4.0,
+            throttle_when_unfocused: true,
+            idle_fps: 20.0,
             // `Reset` is not "no colour", it is "whatever the terminal profile
             // says", which is exactly the pre-existing behaviour. Defaulting to
             // `Black` instead would silently repaint every user's terminal.

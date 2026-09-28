@@ -372,6 +372,204 @@ fn the_frame_loop_never_blocks_waiting_for_input() {
     );
 }
 
+/// An effect that advances and draws something different every update.
+///
+/// Two counters, because the two questions need different observables: `updates`
+/// says whether the *simulation* ran, and the drawn cell says whether the frame
+/// *changed*. A frame buffer alone cannot tell "rendered the same thing twice"
+/// from "never re-rendered", which is exactly the confusion the unfocused freeze
+/// was built on.
+#[derive(Default)]
+struct MovingEffect {
+    updates: u32,
+}
+
+impl TerminalEffect for MovingEffect {
+    fn get_diff(&mut self) -> Vec<(usize, usize, Cell)> {
+        Vec::new()
+    }
+
+    fn update(&mut self) {
+        self.updates += 1;
+    }
+
+    fn update_size(&mut self, _width: u16, _height: u16) {}
+
+    fn reset(&mut self) {}
+
+    fn get_diff_with_context(
+        &mut self,
+        _context: &FrameContext,
+    ) -> Vec<(usize, usize, Cell)> {
+        // A cell whose glyph depends on the update count, so an un-updated frame
+        // diffs to nothing -- which is the mechanism being tested.
+        vec![(
+            (self.updates as usize) % 6,
+            0,
+            Cell::new(
+                char::from(b'0' + (self.updates % 10) as u8),
+                crossterm::style::Color::White,
+                crossterm::style::Attribute::Reset,
+            ),
+        )]
+    }
+}
+
+/// An unfocused run of a *real* effect still puts bytes on the wire.
+///
+/// I wrote in this file's own comments that the unfocused path had no tests. That
+/// was wrong, and wrong in the way worth catching: it had **three**, and all
+/// three pinned the freeze as a deliberate contract. One was literally named
+/// `an_unfocused_effect_is_frozen_rather_than_slowed` and explained, in a
+/// confident paragraph, why the effect must not be advanced at all.
+///
+/// The failure was invisible rather than subtle. The loop called `get_diff` every
+/// frame but skipped `update_with_context`, and since no effect in the crate
+/// renders from a wall clock, an un-updated frame re-renders byte-identically.
+/// The diff therefore comes back **empty** and the loop writes nothing at all.
+///
+/// The test has to use a real effect for that to be visible, and the first
+/// version did not. It used a hand-written double that returned one cell per
+/// frame, and the loop faithfully wrote it every time -- 600 bytes focused and
+/// 600 unfocused, frozen or not, because the de-duplication that turns "wrote
+/// the same cell again" into "wrote nothing" lives in `Canvas::commit`, not in
+/// the loop. A double that skips the `Canvas` cannot see this bug at all.
+///
+/// `plasma` is used because it is a per-cell `Canvas` effect with no input
+/// handling, so the only variable is whether time advanced.
+#[test]
+fn an_unfocused_run_of_a_real_effect_still_writes_frames() {
+    let bytes_written = |focused: bool| -> usize {
+        let mut source = ScriptedInput {
+            events: if focused {
+                Vec::new()
+            } else {
+                vec![InputEvent::FocusLost]
+            },
+        };
+        let mut effect = termzzz::registry::AnyEffect::build(
+            EffectId::Plasma,
+            &Config::default(),
+            (40, 12),
+        );
+        let mut sink: Vec<u8> = Vec::new();
+        termzzz::common::run_loop_with_source_and_size_and_target(
+            &mut sink,
+            &mut termzzz::common::SingleEffect::new(&mut effect),
+            Some(30),
+            &mut source,
+            (40, 12),
+            termzzz::common::RuntimeOptions {
+                throttle_when_unfocused: true,
+                // Only the frame *rate* is under test here. A low value would
+                // make the test spend its own wall clock sleeping, and the rate
+                // has its own test below.
+                idle_fps: 30.0,
+                ..Default::default()
+            },
+        )
+        .expect("the loop runs without a terminal");
+        sink.len()
+    };
+
+    let focused = bytes_written(true);
+    let unfocused = bytes_written(false);
+    assert!(
+        unfocused > focused / 2,
+        "a focused run of plasma wrote {focused} bytes in 30 frames and an \
+         unfocused one {unfocused}, so the second monitor is showing a frozen \
+         picture -- which is the whole of the report"
+    );
+}
+
+/// The simulation advances while unfocused, not just the frame rate.
+///
+/// The distinction is the bug. Throttling the *frame rate* is a cost decision;
+/// freezing the *simulation* is what makes the picture stop, and the two were
+/// the same line of code. A drawable effect's own state is the observable here,
+/// because a frame buffer cannot tell "rendered the same thing twice" from
+/// "never re-rendered".
+#[test]
+fn an_unfocused_run_still_advances_the_simulation() {
+    let updates = |focused: bool| -> u32 {
+        let mut source = ScriptedInput {
+            events: if focused {
+                Vec::new()
+            } else {
+                vec![InputEvent::FocusLost]
+            },
+        };
+        let mut effect = MovingEffect::default();
+        termzzz::common::run_loop_with_source_and_size_and_target(
+            &mut Vec::new(),
+            &mut termzzz::common::SingleEffect::new(&mut effect),
+            Some(24),
+            &mut source,
+            (20, 6),
+            termzzz::common::RuntimeOptions {
+                throttle_when_unfocused: true,
+                idle_fps: 30.0,
+                ..Default::default()
+            },
+        )
+        .expect("the loop runs without a terminal");
+        effect.updates
+    };
+    let focused = updates(true);
+    let unfocused = updates(false);
+    assert!(
+        unfocused > focused / 2,
+        "a focused run advanced the effect {focused} times and an unfocused one \
+         {unfocused}, so the simulation is being frozen rather than throttled"
+    );
+}
+
+/// `idle_fps` controls the animation's *speed* as well as its smoothness.
+///
+/// This is not obvious and the old default of 4 hid it. The loop clamps a
+/// frame's delta to `MAX_FRAME_DELTA`, 50 ms, so an effect advances at most
+/// 50 ms per drawn frame: at `N` fps that is `N * 50 ms` of simulation per
+/// second, which reaches real time at exactly 20 and is a fraction of it below.
+///
+/// So the old default meant an unfocused effect ran at *a fifth speed* as well as
+/// at a quarter frame rate — and the freeze was hiding that, because a frozen
+/// effect's speed is zero and nobody could tell the clamp was there.
+#[test]
+fn the_default_idle_fps_is_where_the_delta_clamp_stops_costing_speed() {
+    let options = Config::default();
+    // 1/50 s of simulation per drawn frame reaches one second of simulation per
+    // second of wall clock at 20 fps exactly.
+    const FULL_SPEED_FPS: f32 = 20.0;
+    assert!(
+        (options.global.idle_fps - FULL_SPEED_FPS).abs() < 0.01,
+        "the default idle_fps is {}, and below {:.0} the 50 ms delta clamp makes \
+         an unfocused effect run slow as well as choppy",
+        options.global.idle_fps,
+        FULL_SPEED_FPS
+    );
+}
+
+/// The old key still works, and the new one says what it does.
+///
+/// A rename that silently dropped the old spelling would reset every existing
+/// config to the new default, which is the same class of bug as `--print-config`
+/// pinning defaults: an upgrade that changes behaviour without saying so.
+#[test]
+fn throttle_when_unfocused_accepts_the_old_pause_key() {
+    let new_spelling: Config =
+        toml::from_str("[global]\nthrottle_when_unfocused = false\n")
+            .expect("the new key parses");
+    let old_spelling: Config =
+        toml::from_str("[global]\npause_when_unfocused = false\n")
+            .expect("the old key still parses");
+    assert!(!new_spelling.global.throttle_when_unfocused);
+    assert!(
+        !old_spelling.global.throttle_when_unfocused,
+        "the old key parsed but did nothing, so an existing config that set it \
+         silently gets the default instead"
+    );
+}
+
 /// Polling without a timeout must not cost input delivery.
 ///
 /// The obvious risk of making the poll non-blocking is that events arriving while
@@ -667,8 +865,8 @@ fn measure(pending: Vec<InputEvent>, policy: bool, idle_fps: f32) -> Measured {
 /// unfocused window has to run at a small fraction of the focused rate.
 #[test]
 fn an_unfocused_terminal_runs_at_a_fraction_of_the_frame_rate() {
-    let focused = measure(Vec::new(), true, 4.0);
-    let idle = measure(vec![InputEvent::FocusLost], true, 4.0);
+    let focused = measure(Vec::new(), true, 20.0);
+    let idle = measure(vec![InputEvent::FocusLost], true, 20.0);
 
     assert!(
         focused.frames > 20,
@@ -690,38 +888,70 @@ fn an_unfocused_terminal_runs_at_a_fraction_of_the_frame_rate() {
         focused_fps > 40.0,
         "the focused loop only managed {focused_fps:.1} fps"
     );
+    // Three times, not five. The old bound was a fifth, which was a fifth
+    // because `idle_fps` was 4 against a 60 Hz loop; at 20 it is a third, and
+    // pretending otherwise would be asserting a saving the default does not
+    // make. The trade is deliberate: a third of the render and encode work for an
+    // animation that is still correctly paced, rather than a fifteenth for one
+    // that is a fifth of speed *and* a quarter frame rate.
     assert!(
-        idle_fps < focused_fps / 5.0,
+        idle_fps < focused_fps / 2.5,
         "unfocused ran at {idle_fps:.1} fps against {focused_fps:.1} focused, \
          which is not the saving it is supposed to be"
     );
+    // A band rather than a point: the loop paces with `Instant`, so the
+    // achieved rate depends on the machine. It used to be 2..=7 against a
+    // configured 4, and is now 9..=30 against a configured 20 -- which is the
+    // rate at which the 50 ms delta clamp stops costing the effect speed.
     assert!(
-        (2.0..=7.0).contains(&idle_fps),
-        "unfocused ran at {idle_fps:.1} fps, nowhere near the configured 4"
+        (9.0..=30.0).contains(&idle_fps),
+        "unfocused ran at {idle_fps:.1} fps, nowhere near the configured 20"
     );
 }
 
-/// The frames it does draw cost nothing to simulate.
+/// The simulation keeps running while unfocused.
 ///
-/// The simulation is frozen rather than fed a coarser delta. At four frames a
-/// second a real delta is 250 ms, which the frame-delta clamp would cut to 50,
-/// so the effect would run at a fifth of its speed and stay there.
+/// **This test asserted the exact opposite for most of the time it existed**, and
+/// that is the interesting part. It was called
+/// `an_unfocused_effect_is_frozen_rather_than_slowed` and read:
+///
+/// > The simulation is frozen rather than fed a coarser delta. At four frames a
+/// > second a real delta is 250 ms, which the frame-delta clamp would cut to 50,
+/// > so the effect would run at a fifth of its speed and stay there.
+///
+/// Every sentence in that is true, and the conclusion drawn from it was wrong. It
+/// weighed "an unfocused effect runs at a fifth speed" against the alternative and
+/// chose the freeze -- without noticing that freezing does not just slow the
+/// effect down, it stops it *visibly*. No effect in the crate renders from a wall
+/// clock, so an un-updated frame re-renders byte-identically, `Canvas::commit`
+/// diffs it to nothing, and the loop wrote **zero bytes** four times a second.
+/// The report was "when I put it on my second monitor and work on my first, it
+/// stops".
+///
+/// So the unfocused path was not untested; it was *wrongly* tested, which is
+/// worse. A missing test can be noticed by reading the code. A test that pins a
+/// bad decision with a plausible justification makes the next reader conclude the
+/// behaviour is intended, and two other tests in this file did exactly that.
 #[test]
-fn an_unfocused_effect_is_frozen_rather_than_slowed() {
-    let idle = measure(vec![InputEvent::FocusLost], true, 4.0);
+fn an_unfocused_effect_keeps_advancing() {
+    let idle = measure(vec![InputEvent::FocusLost], true, 20.0);
     assert!(
-        idle.deltas.is_empty(),
-        "the effect was advanced {} times while unfocused, each with a delta of \
-         {:?}; it should not be advanced at all",
-        idle.deltas.len(),
-        idle.deltas.first()
+        !idle.deltas.is_empty(),
+        "the effect was not advanced at all while unfocused, so the second \
+         monitor shows a frozen picture -- which is the whole of the report"
+    );
+    assert!(
+        idle.deltas.iter().all(|d| *d > Duration::ZERO),
+        "some unfocused updates carried a zero delta, which is the same freeze by \
+         another route: {:?}",
+        idle.deltas
     );
 
-    let focused = measure(Vec::new(), true, 4.0);
+    let focused = measure(Vec::new(), true, 20.0);
     assert!(
         focused.deltas.len() > 20,
-        "a focused run only advanced the effect {} times, so the freeze is not \
-         being distinguished from a broken loop",
+        "a focused run only advanced the effect {} times, so an unfocused run \
+         cannot be distinguished from a broken loop",
         focused.deltas.len()
     );
 }
