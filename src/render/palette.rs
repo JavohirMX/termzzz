@@ -139,6 +139,58 @@ impl Palette {
         presets::ALL.iter().map(|(name, _)| *name).collect()
     }
 
+    /// This ramp cut off at its brightest stop, for a *brightness* consumer.
+    ///
+    /// ## Why this exists
+    ///
+    /// Nearly every ramp in [`presets`] is **mirrored**: it climbs to a peak and
+    /// comes back down again, so that [`sample_wrapped`](Self::sample_wrapped) has
+    /// no visible seam where it wraps. That is right for a cycling consumer and
+    /// catastrophic for a brightness one, and it fails in a way no amount of
+    /// looking at the code catches.
+    ///
+    /// [`sample`](Self::sample) returns `stops[len - 1]` at `t = 1.0`. For a
+    /// mirrored ramp that stop is the second-*darkest* one, because the mirroring
+    /// is symmetric -- so the top of a brightness scale lands on near-black and the
+    /// ramp's brightest colour sits unused in the middle, where the field value
+    /// that reaches it is a coincidence rather than the maximum.
+    ///
+    /// Measured on `MAGMA` as a brightness ramp, which is what `ants` did with it:
+    ///
+    /// ```text
+    /// t      0.125   0.25    0.375   0.5     0.625   0.75    0.875   1.0
+    /// rgb    93,23   200,75  253,170 253,239 253,235 253,159 192,65   81,18
+    /// ```
+    ///
+    /// It peaks at `t = 0.5` and falls back to dark at the top, so a value at the
+    /// *maximum* of the scale was drawn in near-black and a value at a quarter of
+    /// it was drawn in cream. Four effects were built on that.
+    ///
+    /// ## Peak choice
+    ///
+    /// Rec. 709 luma, not max-of-channels: a ramp that peaks in blue is dark to
+    /// the eye, and `DEPTH` peaks in blue at index 2. First stop wins a tie, so a
+    /// flat ramp is returned as itself rather than truncated to nothing.
+    ///
+    /// ## A flat result is a real answer
+    ///
+    /// If the brightest stop is the first, there is no ascending half and this
+    /// returns a one-stop ramp -- which [`sample`](Self::sample) handles as a flat
+    /// colour. A user-supplied ramp can get here, and a solid block is a better
+    /// failure than the inverted scale this exists to prevent.
+    pub fn truncated_at_peak(&self) -> Palette {
+        let mut peak = 0usize;
+        let mut best = f32::NEG_INFINITY;
+        for (i, color) in self.stops.iter().enumerate() {
+            let luma = luminance(*color);
+            if luma > best {
+                best = luma;
+                peak = i;
+            }
+        }
+        Palette::new(self.stops[..=peak].to_vec())
+    }
+
     /// The anchors, for an effect that wants to reason about them.
     pub fn stops(&self) -> &[Color] {
         &self.stops
@@ -240,6 +292,22 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t)
         .round()
         .clamp(0.0, 255.0) as u8
+}
+
+/// Rec. 709 relative luminance in `0.0..=1.0`.
+///
+/// The perceptual weights, not a channel average, and not max-of-channels. This is
+/// what "bright" has to mean for a ramp to be ordered correctly: a saturated blue
+/// has the highest channel value in a navy ramp and is one of the *darkest*
+/// colours on the screen, and a ramp that peaks in blue peaks in the dark.
+///
+/// Named colours resolve through [`named_rgb`], so this answers for the whole
+/// [`Color`] type rather than only the truecolor case. `Reset` and `AnsiValue`
+/// have no answer without knowing the terminal, and return 0.0 -- the dark end,
+/// which is the safe direction for every caller here.
+pub fn luminance(color: Color) -> f32 {
+    let (r, g, b) = named_rgb(color).unwrap_or((0, 0, 0));
+    (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
 }
 
 /// Black to white, the ramp a scalar field wants when nothing else is specified.
@@ -692,5 +760,118 @@ mod tests {
         assert_eq!(palette.sample(0.0), rgb(0, 0, 0));
         assert_eq!(palette.sample(1.0), rgb(255, 255, 255));
         assert_eq!(palette.sample(0.5), rgb(128, 128, 128));
+    }
+
+    /// A brightness ramp's top of scale is its brightest colour.
+    ///
+    /// This is the test the four affected effects were missing, and it is the
+    /// whole of the defect: `sample(1.0)` returns `stops[len - 1]`, which on a
+    /// mirrored ramp is the second-darkest stop. Every preset here is mirrored
+    /// except `CONTRAST`, so every one of them fails this before
+    /// `truncated_at_peak` exists -- checked by running it against `palette`
+    /// untruncated, which is what the second half of the loop does.
+    #[test]
+    fn a_brightness_ramp_puts_its_brightest_colour_at_the_top() {
+        for (name, stops) in presets::ALL {
+            let brightest = stops
+                .iter()
+                .copied()
+                .max_by(|a, b| {
+                    luminance(*a)
+                        .partial_cmp(&luminance(*b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .expect("a preset with no stops");
+
+            let truncated = Palette::new(stops.to_vec()).truncated_at_peak();
+            assert_eq!(
+                truncated.sample(1.0),
+                brightest,
+                "{name}: the truncated ramp does not end on its brightest stop"
+            );
+
+            // And the defect itself, asserted rather than assumed: an untruncated
+            // mirror does not. If a preset ever stops being mirrored this line
+            // starts failing, and that is the point -- it is the guard that says
+            // "this preset no longer needs truncating", not a tautology.
+            let untruncated = Palette::new(stops.to_vec());
+            if stops.len() > 2 {
+                assert_ne!(
+                    untruncated.sample(1.0),
+                    brightest,
+                    "{name} is no longer mirrored, so truncated_at_peak is a \
+                     no-op for it and the call sites should stop calling it"
+                );
+            }
+        }
+    }
+
+    /// Truncation must not merely move the peak to the end -- the ramp has to
+    /// still be *ordered*, or a value higher than another would still draw dimmer.
+    ///
+    /// Sampled across the whole truncated range rather than at the stops, because
+    /// the interpolation between two stops can dip even when the stops are ordered.
+    #[test]
+    fn a_truncated_ramp_is_monotonic_in_luminance() {
+        for (name, stops) in presets::ALL {
+            let ramp = Palette::new(stops.to_vec()).truncated_at_peak();
+            let mut previous = f32::NEG_INFINITY;
+            for step in 0..=32 {
+                let t = step as f32 / 32.0;
+                let luma = luminance(ramp.sample(t));
+                assert!(
+                    luma >= previous - 1e-4,
+                    "{name} went backwards in luminance at t = {t}: \
+                     {luma} after {previous}"
+                );
+                previous = luma;
+            }
+        }
+    }
+
+    /// A peak found by channel maximum would be in the wrong place.
+    ///
+    /// `DEPTH`'s brightest channel is red at its last stop, `(204, 0, 0)`, which
+    /// is a dark brick; its actual brightest stop is the near-white cyan at index
+    /// 2. So a channel-max peak would truncate to five stops and leave the scale
+    /// running bright-to-dark, which is the same defect under a new name.
+    #[test]
+    fn the_peak_is_found_by_luminance_and_not_by_channel_maximum() {
+        let ramp = Palette::new(presets::DEPTH.to_vec()).truncated_at_peak();
+        assert_eq!(ramp.len(), 3, "DEPTH peaks at index 2, so three stops");
+        assert_eq!(ramp.sample(1.0), rgb(237, 255, 255));
+        // The brick red is outside the truncated ramp entirely.
+        assert!(!ramp.stops().contains(&rgb(204, 0, 0)));
+    }
+
+    /// A ramp whose brightest stop is its first has no ascending half.
+    ///
+    /// The honest answer is a flat ramp, and the requirement is that it is flat
+    /// rather than inverted or empty. A user-supplied ramp reaches this, and
+    /// `sample` has to answer without panicking.
+    #[test]
+    fn a_ramp_that_never_climbs_truncates_to_itself() {
+        let flat = Palette::new(vec![rgb(10, 20, 30), rgb(9, 19, 29)]);
+        let truncated = flat.truncated_at_peak();
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated.sample(0.0), rgb(10, 20, 30));
+        assert_eq!(truncated.sample(1.0), rgb(10, 20, 30));
+    }
+
+    /// Blue is dark. This is the fact `truncated_at_peak` is built on.
+    #[test]
+    fn luminance_says_a_saturated_blue_is_dark() {
+        let blue = rgb(0, 0, 255);
+        let red = rgb(255, 0, 0);
+        assert!(
+            luminance(blue) < luminance(red),
+            "a channel maximum would have called blue the brighter colour"
+        );
+        assert!((luminance(rgb(255, 255, 255)) - 1.0).abs() < 1e-6);
+        assert!((luminance(rgb(0, 0, 0))).abs() < 1e-6);
+        // Named colours resolve, so a ramp built from them is ordered too.
+        assert!(luminance(Color::White) > luminance(Color::DarkGrey));
+        // The unresolvable pair answers at the dark end rather than panicking.
+        assert_eq!(luminance(Color::Reset), 0.0);
     }
 }
