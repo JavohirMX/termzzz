@@ -252,7 +252,13 @@ fn measure_encode(
 
         let mut sink: Vec<u8> = Vec::with_capacity(diff.len() * 16);
         let started = Instant::now();
-        write_cells(&mut sink, size, &diff).expect("writing to a Vec cannot fail");
+        write_cells(
+            &mut sink,
+            size,
+            &diff,
+            termzzz::session::SessionColors::default(),
+        )
+        .expect("writing to a Vec cannot fail");
         total += started.elapsed();
 
         bytes += sink.len();

@@ -3,6 +3,7 @@ use crate::runtime::{
     CrosstermInput, FrameContext, InputEvent, InputSource, InputState, Key,
     KeyPhase,
 };
+use crate::session::SessionColors;
 use crossterm::{QueueableCommand, cursor, style, terminal};
 use std::{
     io::{BufWriter, Result, Write},
@@ -24,6 +25,55 @@ pub const SPEED_STEP: f32 = 0.1;
 /// one.
 pub const MIN_IDLE_FPS: f32 = 1.0;
 pub const MAX_IDLE_FPS: f32 = 30.0;
+
+/// The frames per second an unfocused run uses when the config does not say.
+///
+/// One number in two places, and they disagreed: the config's default was 20 and
+/// `RuntimeOptions::default` said 4, and 4 is the value the config's own
+/// documentation identifies as a bug -- at that rate the frame-delta clamp costs
+/// an unfocused effect four fifths of its *speed* as well as three quarters of
+/// its frame rate. Every run from `main` passes the config through
+/// `with_focus_policy`, so this default only reaches library users -- but a
+/// library user should not get the worse of the two.
+pub const DEFAULT_IDLE_FPS: f32 = 20.0;
+
+/// A float that came from a config file, put inside its bounds.
+///
+/// **`f32::clamp` does not remove `NaN`,** which is the whole reason this is a
+/// function rather than a `clamp` call. `Ord::clamp` is
+/// `if self < min { min } else if self > max { max } else { self }`, and for
+/// `NaN` *both* comparisons are false, so it returns `NaN` unchanged. (`f32::max`
+/// and `f32::min` do discard `NaN`; `clamp` does not. That difference is the
+/// bug.)
+///
+/// A config can produce `NaN`, because TOML 1.0 defines `nan` and `inf` as float
+/// literals and the `toml` crate parses them. Both of these were reachable and
+/// both failed quietly:
+///
+/// * `idle_fps = nan` reached `Duration::from_secs_f64`, which panics on a `NaN`
+///   argument -- *after* the session had already put the terminal into raw mode
+///   on the alternate screen with the cursor hidden.
+/// * `speed = nan` reached `TickClock::advance`, whose accumulator went `NaN`
+///   and stayed there. `accumulator + f32::EPSILON >= QUANTUM` is false for
+///   `NaN` on every frame, so `advance` returned zero steps for ever. The effect
+///   was never stepped, the loop kept running at 60 Hz, and `write_cells` was
+///   handed an empty diff every frame. The result was a completely silent frozen
+///   screensaver burning a core: no error, no output, nothing to show that
+///   anything had gone wrong.
+///
+/// A non-finite value is not a request for an extreme one -- nobody types `nan`
+/// meaning "as fast as possible" -- so it is treated as absent and the default
+/// is used. The command line already refused these: `--speed nan` is rejected by
+/// an `is_finite` check in `parse_args_from`. Only the config file let them
+/// through, which is how two entry points ended up disagreeing about a value
+/// that means the same thing in both.
+pub fn bounded_f32(value: f32, default: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    }
+}
 
 /// The most a single frame's delta is allowed to claim.
 ///
@@ -93,6 +143,13 @@ pub struct RuntimeOptions {
     /// [`MAX_IDLE_FPS`], because zero means "stop" and a large value means "do
     /// nothing", and both are worse than the plain reading of the number.
     pub idle_fps: f32,
+    /// The colours the session installed for the whole run.
+    ///
+    /// Carried here rather than read from a global because the output path has
+    /// to re-assert them after every SGR reset, and SGR 0 clears the background.
+    /// See [`write_cells`]. Defaults to pinning nothing, which is the pre-existing
+    /// behaviour and the overwhelmingly common one.
+    pub colors: SessionColors,
 }
 
 impl Default for RuntimeOptions {
@@ -100,7 +157,8 @@ impl Default for RuntimeOptions {
         Self {
             speed: 1.0,
             throttle_when_unfocused: true,
-            idle_fps: 4.0,
+            idle_fps: DEFAULT_IDLE_FPS,
+            colors: SessionColors::default(),
         }
     }
 }
@@ -108,7 +166,7 @@ impl Default for RuntimeOptions {
 impl RuntimeOptions {
     pub fn new(speed: f32) -> Self {
         Self {
-            speed: speed.clamp(MIN_SPEED, MAX_SPEED),
+            speed: bounded_f32(speed, 1.0, MIN_SPEED, MAX_SPEED),
             ..Self::default()
         }
     }
@@ -120,7 +178,15 @@ impl RuntimeOptions {
         idle_fps: f32,
     ) -> Self {
         self.throttle_when_unfocused = throttle_when_unfocused;
-        self.idle_fps = idle_fps.clamp(MIN_IDLE_FPS, MAX_IDLE_FPS);
+        self.idle_fps =
+            bounded_f32(idle_fps, DEFAULT_IDLE_FPS, MIN_IDLE_FPS, MAX_IDLE_FPS);
+        self
+    }
+
+    /// Records the colours the session installed, so the encoder can put them
+    /// back after each reset.
+    pub fn with_colors(mut self, colors: SessionColors) -> Self {
+        self.colors = colors;
         self
     }
 }
@@ -135,7 +201,16 @@ impl TickClock {
     pub const MAX_STEPS: usize = 4;
 
     pub fn advance(&mut self, delta: Duration, speed: f32) -> usize {
-        self.accumulator += delta.as_secs_f32() * speed.clamp(MIN_SPEED, MAX_SPEED);
+        // Bounded rather than clamped, and this is the backstop that matters.
+        // Once the accumulator is `NaN` it is poisoned for good: the loop's test
+        // is `accumulator + EPSILON >= QUANTUM`, which is *false* for `NaN` on
+        // every frame, so a single bad speed turns "return some steps" into
+        // "return zero steps" permanently and silently. The accumulator is a
+        // `f32` field with no way to recover it, so the value that reaches it
+        // has to be finite. This method is public, so it cannot rely on every
+        // caller having gone through `RuntimeOptions` first.
+        self.accumulator +=
+            delta.as_secs_f32() * bounded_f32(speed, 1.0, MIN_SPEED, MAX_SPEED);
         let mut steps = 0;
         while self.accumulator + f32::EPSILON >= Self::QUANTUM
             && steps < Self::MAX_STEPS
@@ -288,6 +363,47 @@ impl Default for ActiveStyle {
     }
 }
 
+/// The style the terminal is in at the start of a frame.
+///
+/// Not [`ActiveStyle::default`] when the session pins its colours, because
+/// `session.rs` set them and nothing has reset them since. Identical to
+/// `ActiveStyle::default` when it pins nothing, which is the default and the
+/// overwhelmingly common case.
+fn session_style(colors: SessionColors) -> ActiveStyle {
+    ActiveStyle {
+        fg: colors.foreground,
+        bg: colors.background,
+        attributes: AttributesOn::default(),
+    }
+}
+
+/// A cell colour, with `Reset` read as "whatever the session pinned".
+///
+/// The identity function when nothing is pinned, which is what keeps this from
+/// changing a single byte of the default path.
+fn resolve(cell: style::Color, session: style::Color) -> style::Color {
+    if cell == style::Color::Reset {
+        session
+    } else {
+        cell
+    }
+}
+
+/// Puts the session's colours back after an SGR 0 took them away.
+///
+/// Emits nothing at all in the default case, so the common run is unaffected.
+fn reassert_session_colors<W: Write>(
+    out: &mut W,
+    colors: SessionColors,
+) -> Result<()> {
+    if colors.is_default() {
+        return Ok(());
+    }
+    out.queue(style::SetForegroundColor(colors.foreground))?;
+    out.queue(style::SetBackgroundColor(colors.background))?;
+    Ok(())
+}
+
 /// Writes changed cells to the terminal.
 ///
 /// Cells outside `size` are skipped: a diff is compared against the previous
@@ -324,10 +440,33 @@ impl Default for ActiveStyle {
 ///
 /// This is a free function rather than an inline loop so the output path can be
 /// measured and tested without running a whole frame loop.
+///
+/// # The session's own colours
+///
+/// `colors` is the pair [`crate::session::TerminalSession`] installed for the
+/// whole session, and it is here because **SGR 0 clears the background.** The
+/// session pins the background with one `SetBackgroundColor` at startup, and
+/// this function emits `ResetColor` three times per frame -- the first-cell
+/// baseline, an attribute change mid-run, and the end-of-frame reset. Every one
+/// of them took the pinned background with it, on frame one and on every frame
+/// after, so `global.background` was a setting that did nothing.
+///
+/// So a cell carrying `Color::Reset` in its background now means *the session's
+/// background* rather than *the terminal's default*, and the session colours are
+/// re-asserted after each reset. That distinction is invisible in the default
+/// case and is the whole of the fix: with `colors` at its default, `Reset`
+/// resolves to `Reset`, the re-assert emits nothing, and the bytes on the wire
+/// are identical to what they were before. `the_default_session_costs_nothing_
+/// extra` is the test that holds that line.
+///
+/// The attribute-change case is the same defect one level down. `ResetColor`
+/// there also clears the colours, so the comparison against `previous` has to be
+/// against a terminal that is no longer wearing them -- see the comment inside.
 pub fn write_cells<W: Write>(
     out: &mut W,
     size: (u16, u16),
     cells: &[(usize, usize, Cell)],
+    colors: SessionColors,
 ) -> Result<()> {
     let (max_x, max_y) = (size.0 as usize, size.1 as usize);
 
@@ -348,8 +487,8 @@ pub fn write_cells<W: Write>(
         }
 
         let wanted = ActiveStyle {
-            fg: cell.color,
-            bg: cell.bg,
+            fg: resolve(cell.color, colors.foreground),
+            bg: resolve(cell.bg, colors.background),
             attributes: AttributesOn::of(cell.attr),
         };
 
@@ -360,13 +499,16 @@ pub fn write_cells<W: Write>(
             // asks for the default colours would otherwise inherit them. Once
             // per frame, so it costs nothing.
             out.queue(style::ResetColor)?;
+            // ...and put the session's own colours back, which SGR 0 just took
+            // with it. Two sequences a frame, and only when they are pinned.
+            reassert_session_colors(out, colors)?;
         }
 
         if active != Some(wanted) {
             // Start from what is in effect, not from a hardcoded default: the
             // first cell of a frame may be continuing the terminal's real state
             // rather than the reset state, and a diff can begin mid-screen.
-            let previous = active.unwrap_or_default();
+            let mut previous = active.unwrap_or_else(|| session_style(colors));
 
             if previous.attributes != wanted.attributes {
                 // SGR has no cheap "turn bold off and leave the colour alone",
@@ -378,6 +520,18 @@ pub fn write_cells<W: Write>(
                 if wanted.attributes.bold {
                     out.queue(style::SetAttribute(style::Attribute::Bold))?;
                 }
+                // SGR 0 cleared the colours too, so from here on the terminal is
+                // *not* wearing `previous`'s colours -- it is wearing whatever
+                // `reassert_session_colors` just put back, which is the session's
+                // own. Without this the two comparisons below compare against a
+                // state the terminal left several sequences ago: a bold cell
+                // followed by a non-bold cell of the same colour compared equal,
+                // emitted nothing, and drew that cell -- and every cell after it,
+                // because `active` went on to record a style the terminal did
+                // not have -- in whatever the terminal's default foreground
+                // happened to be.
+                previous = session_style(colors);
+                reassert_session_colors(out, colors)?;
             }
             if previous.fg != wanted.fg {
                 out.queue(style::SetForegroundColor(wanted.fg))?;
@@ -394,12 +548,15 @@ pub fn write_cells<W: Write>(
         cursor = Some((column + 1, row));
     }
 
-    // Leave the terminal in the state `ActiveStyle::default` describes, so the
-    // next frame's assumption holds and the shell the user returns to is not
-    // left wearing whatever colour the last cell happened to be. Once per frame,
-    // so it costs nothing.
+    // Leave the terminal in the state `session_style` describes, so the next
+    // frame's assumption holds and the shell the user returns to is not left
+    // wearing whatever colour the last cell happened to be. Once per frame, so
+    // it costs nothing. The re-assert is the same three-sites-one-defect as the
+    // baseline above: without it the session's background is gone by the time
+    // the first cell of the next frame is drawn.
     if active.is_some() {
         out.queue(style::ResetColor)?;
+        reassert_session_colors(out, colors)?;
     }
 
     Ok(())
@@ -594,11 +751,16 @@ where
     let mut frame = 0u64;
     let mut is_running = true;
     let mut frames_per_second = 0.0;
-    let mut speed = options.speed.clamp(MIN_SPEED, MAX_SPEED);
+    let mut speed = bounded_f32(options.speed, 1.0, MIN_SPEED, MAX_SPEED);
     let mut tick_clock = TickClock::default();
     let active_frame_duration = Duration::from_secs_f64(1.0 / 60.0);
     let idle_frame_duration = Duration::from_secs_f64(
-        1.0 / f64::from(options.idle_fps.clamp(MIN_IDLE_FPS, MAX_IDLE_FPS)),
+        1.0 / f64::from(bounded_f32(
+            options.idle_fps,
+            DEFAULT_IDLE_FPS,
+            MIN_IDLE_FPS,
+            MAX_IDLE_FPS,
+        )),
     );
     // When the next frame is due, advanced by a fixed step each time rather than
     // measured from the end of the last one. Sleeping for "the remainder of the
@@ -652,7 +814,7 @@ where
         // Before anything is written, so a transition can reach the cells.
         target.on_frame(delta, &mut diff);
 
-        write_cells(&mut buffered_stdout, size, &diff)?;
+        write_cells(&mut buffered_stdout, size, &diff, options.colors)?;
         buffered_stdout.flush()?;
 
         // The simulation advances whether or not the window has focus.
@@ -808,8 +970,19 @@ mod tests {
     }
 
     fn encoded(size: (u16, u16), cells: &[(usize, usize, Cell)]) -> String {
+        encoded_with(size, cells, SessionColors::default())
+    }
+
+    /// [`encoded`] against a session that pins its own colours, which is the
+    /// case the pin is about and the one most of these tests do not exercise.
+    fn encoded_with(
+        size: (u16, u16),
+        cells: &[(usize, usize, Cell)],
+        colors: SessionColors,
+    ) -> String {
         let mut out: Vec<u8> = Vec::new();
-        write_cells(&mut out, size, cells).expect("writing to a Vec cannot fail");
+        write_cells(&mut out, size, cells, colors)
+            .expect("writing to a Vec cannot fail");
         String::from_utf8(out).expect("crossterm emits utf8")
     }
 
@@ -972,6 +1145,19 @@ mod tests {
 
         fn at(&self, x: usize, y: usize) -> Painted {
             self.painted[y * self.width + x]
+        }
+
+        /// A terminal already sitting in a session's colours.
+        ///
+        /// `session.rs` emits the pinned pair once at startup, so a frame does
+        /// not begin from a reset state -- it begins from these. Modelling the
+        /// start any other way is what let the pin be defeated by the encoder's
+        /// own SGR 0 without a single test noticing.
+        fn in_session(width: usize, height: usize, colors: SessionColors) -> Self {
+            let mut terminal = Self::new(width, height);
+            terminal.fg = colors.foreground;
+            terminal.bg = colors.background;
+            terminal
         }
     }
 
@@ -1177,6 +1363,170 @@ mod tests {
         assert_eq!(terminal.at(1, 0).bg, Color::Reset, "a background leaked");
     }
 
+    /// A session that pins its background keeps it, across a whole frame.
+    ///
+    /// This is the test for `global.background` doing anything at all. The pin is
+    /// one `SetBackgroundColor` at startup, and the encoder emits SGR 0 three
+    /// times a frame -- the first-cell baseline, an attribute change, and the
+    /// end-of-frame reset -- and SGR 0 clears the background along with
+    /// everything else. So the pin survived until the first frame and no longer,
+    /// for every effect that writes a cell.
+    ///
+    /// The first cell of the frame is a plain coloured glyph with no background,
+    /// which is what almost every effect emits for most of its cells, and
+    /// `solarsystem` emits it for the *whole screen*.
+    #[test]
+    fn a_pinned_background_survives_a_frame() {
+        let pinned = SessionColors {
+            background: Color::Rgb { r: 0, g: 0, b: 0 },
+            foreground: Color::Rgb {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xdd,
+            },
+        };
+        let cells = [
+            (
+                0usize,
+                0usize,
+                Cell::new('*', rgb(255, 255, 255), style::Attribute::Reset),
+            ),
+            // An attribute change partway through, because that is the third SGR 0
+            // site and it is the one a single-cell frame cannot reach.
+            (
+                1,
+                0,
+                Cell::new('*', rgb(255, 255, 255), style::Attribute::Bold),
+            ),
+            (
+                2,
+                0,
+                Cell::new('*', rgb(255, 255, 255), style::Attribute::Reset),
+            ),
+            // And a cell that paints its own background, which must still win.
+            (
+                3,
+                0,
+                Cell::with_bg(
+                    'x',
+                    rgb(1, 2, 3),
+                    rgb(200, 30, 30),
+                    style::Attribute::Reset,
+                ),
+            ),
+        ];
+
+        let mut out: Vec<u8> = Vec::new();
+        write_cells(&mut out, (4, 1), &cells, pinned)
+            .expect("writing to a Vec cannot fail");
+        let encoded = String::from_utf8(out).expect("crossterm emits utf8");
+
+        let mut terminal = Terminal::in_session(4, 1, pinned);
+        terminal.replay(&encoded);
+
+        for x in 0..3 {
+            assert_eq!(
+                terminal.at(x, 0).bg,
+                pinned.background,
+                "the pinned background was gone at ({x}, 0), so a cell that asked \
+                 for no background of its own was drawn in the terminal's default"
+            );
+        }
+        assert_eq!(
+            terminal.at(3, 0).bg,
+            rgb(200, 30, 30),
+            "a cell's own background was overridden by the session pin"
+        );
+    }
+
+    /// The default session is byte-for-byte what it always was.
+    ///
+    /// The whole fix is a reinterpretation of `Color::Reset` and a re-assert
+    /// after each reset. With nothing pinned, `Reset` resolves to `Reset` and the
+    /// re-assert emits nothing -- so if this test ever fails, the change has
+    /// started costing bytes on the overwhelmingly common run, and every encoder
+    /// test below is measuring something the user does not get.
+    #[test]
+    fn the_default_session_costs_nothing_extra() {
+        // No cell carries a background of its own, so a default session has
+        // nothing to re-assert and nothing to resolve. That is what makes this a
+        // byte-level comparison against the pre-existing output rather than a
+        // test of the new behaviour.
+        let cells = [
+            (
+                0usize,
+                0usize,
+                Cell::new('a', Color::Red, style::Attribute::Bold),
+            ),
+            (1, 0, Cell::new('b', Color::Red, style::Attribute::Reset)),
+            (2, 0, Cell::new('c', Color::Blue, style::Attribute::Reset)),
+        ];
+
+        let mut out: Vec<u8> = Vec::new();
+        write_cells(&mut out, (3, 1), &cells, SessionColors::default())
+            .expect("writing to a Vec cannot fail");
+        let encoded = String::from_utf8(out).expect("crossterm emits utf8");
+
+        // The re-assert would emit SGR 39 and 49. With nothing pinned it must
+        // emit neither, which is the whole of the no-op claim.
+        assert!(
+            !encoded.contains("39m") && !encoded.contains("49m"),
+            "a default session emitted a colour reset, so the re-assert is not a \
+             no-op: {encoded:?}"
+        );
+        // The first-cell baseline, two attribute changes (bold on, bold off),
+        // and the end-of-frame reset. Exactly what it emitted before.
+        assert_eq!(
+            count_resets(&encoded),
+            4,
+            "expected the baseline, both attribute changes and the end-of-frame \
+             reset and nothing else: {encoded:?}"
+        );
+    }
+
+    /// A colour survives an attribute change that does not change it.
+    ///
+    /// The third SGR 0 site, and the one that was wrong on its own terms rather
+    /// than only in combination with a session pin. SGR has no cheap "turn bold
+    /// off and leave the colour alone", so an attribute change costs a reset --
+    /// and a reset takes the colour with it. The encoder then compared the
+    /// wanted colour against the *pre-reset* one, found them equal, emitted
+    /// nothing, and drew the cell in whatever the terminal's default foreground
+    /// happened to be. `active` went on to record a style the terminal did not
+    /// have, so every cell after it in the run was wrong too.
+    ///
+    /// The existing test for this (`leaving_bold_does_not_take_the_colour_with_it`)
+    /// used three *different* colours, so the colour was re-emitted for an
+    /// unrelated reason and the assertion passed against the defect. This one
+    /// holds the colour fixed across the boundary, which is the only shape that
+    /// reaches it.
+    #[test]
+    fn a_colour_is_not_dropped_when_only_the_attribute_changes() {
+        let ink = Color::Rgb { r: 1, g: 2, b: 3 };
+        let cells = [
+            (0usize, 0usize, Cell::new('x', ink, style::Attribute::Bold)),
+            (1, 0, Cell::new('y', ink, style::Attribute::Reset)),
+            (2, 0, Cell::new('z', ink, style::Attribute::Reset)),
+        ];
+
+        let mut out: Vec<u8> = Vec::new();
+        write_cells(&mut out, (3, 1), &cells, SessionColors::default())
+            .expect("writing to a Vec cannot fail");
+        let encoded = String::from_utf8(out).expect("crossterm emits utf8");
+
+        let mut terminal = Terminal::new(3, 1);
+        terminal.replay(&encoded);
+
+        for x in 0..3 {
+            assert_eq!(
+                terminal.at(x, 0).fg,
+                ink,
+                "cell {x} lost its colour across the attribute change, so it was \
+                 drawn in the terminal's default foreground"
+            );
+        }
+    }
+
     /// Every kind of cell the crate can produce, in one go, checked against the
     /// diff that produced it.
     #[test]
@@ -1243,8 +1593,10 @@ mod tests {
             vec![(4, 0, Cell::new('@', rgb(9, 9, 9), style::Attribute::Bold))];
 
         let mut out = Vec::new();
-        write_cells(&mut out, (20, 3), &first).expect("vec write");
-        write_cells(&mut out, (20, 3), &second).expect("vec write");
+        write_cells(&mut out, (20, 3), &first, SessionColors::default())
+            .expect("vec write");
+        write_cells(&mut out, (20, 3), &second, SessionColors::default())
+            .expect("vec write");
 
         let mut terminal = Terminal::new(20, 3);
         terminal.replay(&String::from_utf8(out).expect("utf8"));

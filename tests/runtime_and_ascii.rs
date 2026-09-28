@@ -1084,11 +1084,31 @@ fn quitting_works_while_unfocused() {
 /// never reports a focus change would leave the program frozen with no way back.
 #[test]
 fn the_unfocused_rate_is_clamped_away_from_stopping() {
-    for (requested, expected_floor) in
-        [(0.0f32, 1.0f32), (-5.0, 1.0), (0.001, 1.0), (1000.0, 30.0)]
-    {
+    // Four ordinary out-of-range values, and then the three that are not merely
+    // out of range. Those three were the gap: `f32::clamp` is
+    // `if self < min {min} else if self > max {max} else {self}`, and for `NaN`
+    // *both* comparisons are false, so a clamp returns `NaN` unchanged. `inf`
+    // clamps correctly and `-inf` clamps correctly, but they are here because
+    // the point of the list is "everything a config file can contain", not
+    // "everything that happens to be wrong today".
+    for (requested, expected_floor) in [
+        (0.0f32, 1.0f32),
+        (-5.0, 1.0),
+        (0.001, 1.0),
+        (1000.0, 30.0),
+        (f32::NAN, 1.0),
+        (f32::INFINITY, 1.0),
+        (f32::NEG_INFINITY, 1.0),
+    ] {
         let options = termzzz::common::RuntimeOptions::default()
             .with_focus_policy(true, requested);
+        assert!(
+            options.idle_fps.is_finite(),
+            "asked for {requested} fps unfocused and got {}, which is not a number \
+             -- the loop divides by this and hands it to \
+             `Duration::from_secs_f64`, which panics on a `NaN` argument",
+            options.idle_fps
+        );
         assert!(
             (termzzz::common::MIN_IDLE_FPS..=termzzz::common::MAX_IDLE_FPS)
                 .contains(&options.idle_fps),
@@ -1101,6 +1121,101 @@ fn the_unfocused_rate_is_clamped_away_from_stopping() {
             options.idle_fps
         );
     }
+}
+
+/// A `NaN` in the config file must not stop the effect from ever stepping again.
+///
+/// This is the silent half, and it is worse than the panic. `f32::clamp` returns
+/// `NaN` unchanged, so `speed = nan` reached `TickClock::advance`, whose
+/// accumulator went `NaN` and stayed there. The loop's step test is
+/// `accumulator + EPSILON >= QUANTUM`, which is false for `NaN` on every frame
+/// for ever, so `advance` returned zero steps from then on. The effect froze
+/// while the loop kept running at 60 Hz, handing `write_cells` an empty diff
+/// every frame: no output, no error, nothing on screen to indicate that anything
+/// had gone wrong.
+///
+/// Asserted on the property rather than on the absence of `NaN`, because
+/// "the value is finite" is the guard and "the simulation still runs" is the
+/// thing that was broken.
+#[test]
+fn a_non_finite_speed_does_not_stop_the_simulation_advancing() {
+    for speed in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut clock = termzzz::common::TickClock::default();
+        let mut steps = 0;
+        for _ in 0..600 {
+            steps += clock.advance(Duration::from_micros(16_666), speed);
+        }
+        assert!(
+            steps > 0,
+            "speed {speed} produced {steps} steps in ten seconds, so the \
+             simulation never advanced: the accumulator is not a number and its \
+             comparison with the quantum is false for ever"
+        );
+    }
+}
+
+/// The whole way round, from the TOML a user would actually write.
+///
+/// The unit-level guards above could all be in place and this could still
+/// regress, because the value's journey has three hops: parsed from the file,
+/// read off `Config`, bounded on its way into `RuntimeOptions`. TOML 1.0 defines
+/// `nan` and `inf` as float literals, so this is reachable by typing four
+/// characters, and the panic it used to cause happened with the terminal already
+/// in raw mode on the alternate screen.
+#[test]
+fn a_config_of_nan_and_inf_still_produces_a_usable_run() {
+    let config: termzzz::config::Config =
+        toml::from_str("[global]\nspeed = nan\nidle_fps = inf\n")
+            .expect("TOML's nan and inf literals parse, which is the point");
+
+    let options = termzzz::common::RuntimeOptions::new(config.global.speed)
+        .with_focus_policy(
+            config.global.throttle_when_unfocused,
+            config.global.idle_fps,
+        );
+
+    assert!(
+        options.speed.is_finite() && options.idle_fps.is_finite(),
+        "a config of nan and inf produced speed {} and idle_fps {}",
+        options.speed,
+        options.idle_fps
+    );
+    assert!(
+        (termzzz::common::MIN_SPEED..=termzzz::common::MAX_SPEED)
+            .contains(&options.speed),
+        "speed came out as {}, outside the usable range",
+        options.speed
+    );
+    assert!(
+        (termzzz::common::MIN_IDLE_FPS..=termzzz::common::MAX_IDLE_FPS)
+            .contains(&options.idle_fps),
+        "idle_fps came out as {}, outside the usable range",
+        options.idle_fps
+    );
+}
+
+/// The unfocused default is the one the config documents, not the one that used
+/// to be here.
+///
+/// `RuntimeOptions::default` said 4 fps and `GlobalOptions` said 20, and 4 is
+/// precisely the value the `idle_fps` documentation calls a bug: at 4 fps the
+/// frame-delta clamp costs an unfocused effect four fifths of its *speed* on top
+/// of three quarters of its frame rate. Nothing from `main` reached the 4 --
+/// every run goes through `with_focus_policy` -- so the drift was invisible to
+/// every test, and a library user building `RuntimeOptions::new` was the one
+/// person who could get it.
+#[test]
+fn the_unfocused_default_is_the_documented_one() {
+    assert_eq!(
+        termzzz::common::RuntimeOptions::default().idle_fps,
+        termzzz::common::DEFAULT_IDLE_FPS,
+        "the struct's default is not the shared constant"
+    );
+    assert_eq!(
+        termzzz::config::Config::default().global.idle_fps,
+        termzzz::common::DEFAULT_IDLE_FPS,
+        "the config default and the struct default have drifted apart again"
+    );
 }
 
 struct ResizeEffect {

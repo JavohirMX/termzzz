@@ -120,17 +120,29 @@ fn main() -> Result<(), error::TermzzzError> {
         // because a flag that used to do something should not start erroring.
         None => config.randomise_seeds(),
     }
-    let speed = args
-        .speed
-        .unwrap_or(config.global.speed)
-        .clamp(common::MIN_SPEED, common::MAX_SPEED);
+    // Bounded rather than clamped: a `nan` in the config file is a value no
+    // user meant, and `clamp` passes it straight through, where it either panics
+    // or silently stops the effect stepping. `--speed` was already refused for
+    // being non-finite at parse time; this is the config half of the same guard.
+    let speed = common::bounded_f32(
+        args.speed.unwrap_or(config.global.speed),
+        1.0,
+        common::MIN_SPEED,
+        common::MAX_SPEED,
+    );
 
     // Both entry points below share this, so the focus policy is decided once and
     // cannot drift between running a single effect and running a playlist.
-    let runtime_options = common::RuntimeOptions::new(speed).with_focus_policy(
-        config.global.throttle_when_unfocused,
-        config.global.idle_fps,
-    );
+    let runtime_options = common::RuntimeOptions::new(speed)
+        .with_focus_policy(
+            config.global.throttle_when_unfocused,
+            config.global.idle_fps,
+        )
+        // The session pins its background with one escape sequence at startup,
+        // and SGR 0 -- which the encoder emits three times a frame -- clears it
+        // again. The loop has to know the pair so it can put them back, or
+        // `global.background` silently does nothing.
+        .with_colors(session_colors(&config));
 
     if args.check {
         let effect = check_effect(&args);

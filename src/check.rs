@@ -42,7 +42,12 @@ pub fn test_effect<T: TerminalEffect>(
     let size = crate::common::normalize_effect_size(terminal::size()?);
     let mut input = InputState::default();
     input.set_size(size);
-    let speed = speed.clamp(crate::common::MIN_SPEED, crate::common::MAX_SPEED);
+    let speed = crate::common::bounded_f32(
+        speed,
+        1.0,
+        crate::common::MIN_SPEED,
+        crate::common::MAX_SPEED,
+    );
     let delta = Duration::from_secs_f64(1.0 / 60.0 * speed as f64);
 
     for frame in 1..=frames {
@@ -56,7 +61,7 @@ pub fn test_effect<T: TerminalEffect>(
         // drops the background colour entirely and resets the style after every
         // glyph -- so check mode and the real loop showed different colours for
         // the same frame.
-        crate::common::write_cells(session.stdout(), size, &diff)?;
+        crate::common::write_cells(session.stdout(), size, &diff, colors)?;
         execute!(
             session.stdout(),
             cursor::MoveTo(0, 0),

@@ -2119,8 +2119,13 @@ mod tests {
             let mut dvd = Dvd::new(DvdOptions::default(), size);
             let opening = {
                 let mut out: Vec<u8> = Vec::new();
-                crate::common::write_cells(&mut out, size, &dvd.get_diff())
-                    .expect("writing to a Vec cannot fail");
+                crate::common::write_cells(
+                    &mut out,
+                    size,
+                    &dvd.get_diff(),
+                    crate::session::SessionColors::default(),
+                )
+                .expect("writing to a Vec cannot fail");
                 out.len()
             };
 
@@ -2128,8 +2133,13 @@ mod tests {
             for _ in 0..120 {
                 dvd.update();
                 let mut out: Vec<u8> = Vec::new();
-                crate::common::write_cells(&mut out, size, &dvd.get_diff())
-                    .expect("writing to a Vec cannot fail");
+                crate::common::write_cells(
+                    &mut out,
+                    size,
+                    &dvd.get_diff(),
+                    crate::session::SessionColors::default(),
+                )
+                .expect("writing to a Vec cannot fail");
                 total += out.len();
             }
             (opening, total / 120)
