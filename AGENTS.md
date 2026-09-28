@@ -397,6 +397,178 @@ bug found most cheaply in this project was a `Buffer::diff` coordinate bug, and 
 reason it was found cheaply is that `tests/effect_contracts.rs` was written before
 the fixes rather than after them.
 
+### A mirrored ramp is not a brightness ramp
+
+Nearly every ramp in `palette::presets` is **mirrored** — it climbs to a peak and
+comes back down — so that `sample_wrapped` has no visible seam. `Palette::sample`
+returns `stops[len - 1]` at `t = 1.0`, and on a mirrored ramp that is the
+*second-darkest* stop, because the mirroring is symmetric. So any effect that
+takes a preset whole and treats it as a brightness scale puts its **top of scale
+in near-black**, with the ramp's brightest colour sitting unused in the middle
+where the value that reaches it is a coincidence.
+
+Four effects were built on that. `ants` with `MAGMA` measured out as:
+
+| flips | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| rgb | 93,23,124 | 200,75,115 | 253,170,129 | **253,239,186** | 253,235,185 | 253,159,119 | 192,65,118 | **81,18,124** |
+
+It peaks at `t = 0.5` and falls back to dark. `physarum` and `ripple` did it with
+`OCEAN` (top of scale `0,10,50`, a near-black navy) and `flyover` with `DEPTH`
+(`16,8,40`). `mandelbrot` and `donut` are correct and are the reason the bug
+survived so long: they use the *cycling* sampler on purpose.
+
+`Palette::truncated_at_peak` is the fix — cut the ramp at its brightest stop, by
+Rec. 709 luma rather than by channel maximum, because `DEPTH` peaks in blue and a
+channel max would find the brick red at its end. Truncate **before** `expand`, or
+the ascending half's stops end up spread over the first half of the quantised
+table and the descending half's over the second.
+
+**A byte count cannot predict which way this moves.** Measured at 400x200:
+
+| effect | before | after | |
+|---|---|---|---|
+| flyover | 350,808 | 207,428 | **−41%** |
+| physarum | 74,814 | 74,362 | −0.6% |
+| ants | 1,105 | 1,097 | flat |
+| ripple | 73,083 | 85,733 | **+24%** |
+
+Ripple got *more* expensive: its top of scale is now a pale colour that genuinely
+differs from its neighbour, so more cells count as changed. This is the
+bandwidth note below in its purest form — **how many colours a frame uses is a
+bandwidth setting, not a quality one** — and it is why a fixed palette is never
+obviously the cheap one.
+
+### The corner of the DVD logo is a float accident
+
+`ColorChange::Corner` is documented as the easter egg the reference's README jokes
+about, "it could hit the corner if you look at it long enough", and
+`DvdOptions::color_change` works out that this is about every 95 seconds at 80x24.
+**That figure is wrong by an order of magnitude.** A corner is defined as both
+axes reversing on the same frame, the bounce periods are `2*max_x/vx` and
+`2*max_y/vy`, and with the shipped 30-cell wordmark those are 8.3 and 5.7 seconds —
+a ratio of 25:17 whose least common alignment is 142 seconds away, *and* float
+accumulation means the two walls are then crossed on adjacent frames rather than
+the same one. Measured over 1,000 seconds of real simulation:
+
+```text
+terminal   x-hits  y-hits  corners
+80x24        240     350       1
+200x50        70     139       0
+400x200       32      31       0
+```
+
+So the corner is not a rare easter egg, it is **effectively unreachable**, and
+`ColorChange::Corner` ships a mode that a user will never see fire. Two things
+were tried to fix it by construction and both failed, which is worth knowing
+because both were confident:
+
+- **Locking the periods into a rational ratio** by solving `vy` for
+  `T_x/T_y = (n+1)/n`. Larger `n`, which should be *closer* to alignment, made
+  corners monotonically **rarer** — n=4 gave one per 17s at 80x24, n=32 and n=64
+  gave none in 1,000s. Approximate commensurability is not commensurability.
+- **A proximity window**, calling a corner any two wall hits within N frames.
+  This does work and it is a real option: at 80x24, slack 3 gives one per 100s and
+  slack 10 one per 34s. It does *not* rescue a large terminal — 400x200 is still
+  zero at slack 10, because the two periods differ by 2.66s per cycle so the
+  phase walks through a full cycle every ~25 minutes.
+
+What *does* produce corners reliably is a small logo on a large terminal, where
+`logo_height` is one cell and the two periods come out equal (66.3s each,
+measured) so every bounce is a corner. `dvd`'s test suite uses that as its
+corner-rich fixture, and the reason is written down at the fixture rather than
+left as a magic screen size.
+
+The wave rides on this. `DvdOptions::corner_wave` is independent of
+`color_change` — `Never` still throws waves — because tying it to
+`ColorChange::Corner` would mean most configurations never see it. And a wave is
+drawn by **walking the ring parametrically**, not by scanning the annulus's
+bounding box: at radius 200 the box is the whole 400x200 screen, which is 80,000
+`hypot`s to draw about 1,250 cells, and the cost grows with the square of the
+radius. One sample per cell of *arc* is O(circumference) and the ring stays
+connected at any radius.
+
+### Physarum does not converge, and "stable" is satisfiable by nothing
+
+`DECAY = 0.90` is a steady state statistically and never a fixed point: the
+diffusion erodes veins the agents keep rebuilding, slightly elsewhere each time.
+Churn — the fraction of marked cells whose marked-state changed in 30 steps — at
+4,000 steps, seed 3:
+
+| decay | 60x20 | 200x50 | 400x200 |
+|---|---|---|---|
+| 0.90 | 0.35 | 0.41 | 1.40 |
+| 0.96 | 0.25 | 0.25 | 0.55 |
+| 0.99 | 0.03 | 0.07 | 0.14 |
+
+0.35 is a picture redrawing a third of itself twice a second, which is not
+stability and does not look like it. Raising decay fixes it and costs coverage —
+at 0.99 permanently the 60x20 board is 46% covered, past the 25% that
+`the_agents_build_veins_rather_than_a_slab` rejects. So the anneal is a *phase*,
+not a new default: grow at the configured decay, ramp to 0.995 over 2,500 steps,
+hold, fade, re-seed. Measured, that reaches churn 0.067–0.109 across board sizes
+and keeps coverage under the slab threshold. `CHURN_SETTLED` is 0.15 because that
+is inside the measured gap between 0.11 and 0.35 — **the threshold is a
+measurement, not a round number.**
+
+Two things about where this lives, both learned by getting them wrong:
+
+- **The cycle is in `advance`, not in `step`.** It was in `step` first, and it
+  broke three tests that drive `step` directly — including the edge-ratio
+  assertion, whose ratio fell to 0.10 because the anneal had thickened the field
+  into the very slab that test exists to reject. `step` is `pub` and is what
+  `examples/physarum_sweep.rs` drives, so it has to stay the model those were
+  written to measure. The effect's *behaviour over time* is the frame path's
+  business.
+- **Convergence has two ways to be satisfied by nothing, and both fired.** An
+  *empty* field has zero churn, so a churn-only detector declares victory the
+  instant the agents stop depositing and then holds a blank screen for ever —
+  hence the coverage floor. And a field that has **not started** is the same trap
+  from the other side: the five blobs `seed_trail` lays are stationary and
+  fully covered, so the detector fired on the first check at step 30 and held
+  five blobs for four seconds before growing anything. Hence
+  `age_steps >= ANNEAL_STEPS` before any verdict, with both incidents written at
+  the constants.
+
+The trail value above which a cell counts as carrying trail is `TRAIL_FLOOR`,
+absolute at 3.0, and it is the *same* floor the shape tests use. That is
+deliberate: "settled" has to be measured on the same set of cells "is a vein" is,
+or the effect can satisfy one and not the other.
+
+### Fire's ramp was miscalibrated before it was misordered
+
+The hand-written nine-arm `match` was not monotonic in ink — it ended
+`'@' -> '%'`, and a per-cent sign is sparser than an at-sign, so the hottest part
+of a flame was drawn in a *lighter* mark than the part below it. `FLAME`
+(`" ▁▂▃▄▅▆▇█"`) fixes that, and the lower eighth blocks are the right instrument:
+eight steps instead of three, one-eighth increments of the same bar, anchored to
+the bottom of the cell so a row's *height* is its value.
+
+That required widening `is_ambiguous_or_narrow` from `█` alone to the whole
+`U+2581..=U+2588` span. The old arm allowed the top of `BLOCKS` and rejected the
+seven characters directly below it, which was an oversight in the range list
+rather than a decision about them — all eight are East_Asian_Width = Ambiguous,
+the class the function already accepts. `no_preset_contains_a_character_that_
+would_shear_a_grid` is what notices when a preset reaches past the end of a range.
+
+Then the *calibration* turned out to matter more than the ordering. The glyph was
+indexed on the bitmap's full 0..255 while the colour was indexed on 0..`HOTTEST`,
+and the bitmap's distribution is heavily skewed to the cold end. Measured on a
+settled fire at 400x200: **75.7% of all cells are intensity 0–9 and 0.01% reach
+190.** So a 9-entry ramp spread over 0..255 put its first step at 16 and its last
+at 240 — a quarter of the *visible* flame drew as a single `▁`, and `▇` and `█`
+were never drawn at all on any terminal. One scale for both fixed it: the hottest
+cell in a settled fire measures 193, above `HOTTEST` at 187, so the top of the
+ramp is now reachable. **`flyover` has the same skewed-input problem and is
+already noted in this file as the most expensive effect in the crate.**
+
+The leading space in `FLAME` looks like the bug the glyph ramp documents — "a
+ramp for a filled region must not begin with a space, because the sparsest step
+lands on the row at the top of the region". A flame is not a filled region:
+intensity 0 is the gap between two tongues of flame and the empty air above them,
+and it is the majority of the frame. Said so at the call site, because the rule
+looks like it applies and does not.
+
 ### Tests that pass for the wrong reason
 
 A second pass, driven by watching the effects run rather than reading them,
@@ -465,6 +637,29 @@ that file.
 It is an explicit `airborne` flag now. **When the state is known, store it rather
 than re-deriving it from a measurement**, and be suspicious of any `if a < b` whose
 right-hand side is a function of time or position.
+
+Two more from the same year, and the second is the worse of the two because it
+looked right while being wrong.
+
+**An event rare enough that it happens ten times in twenty thousand frames is not
+something to ask about by measuring something else.** The DVD wave's tests needed
+to know whether a wave had been thrown on a given frame, and the obvious way to
+find out was to look for a wave with age zero in the list. But `step` ages the
+waves *after* it pushes, so a wave thrown on a given frame is already one step old
+by the time `step` returns — the probe found nothing, and when the counting was
+reworked to count *grew by one* frames it reported ten disagreements where the
+truth was ten corners and zero disagreements. `Dvd` now stores
+`corner_this_frame`. `Physarum` stores `last_churn` for the same reason: it costs
+a full pass over the field to measure, so a test that wanted to know how close the
+model was to settling would otherwise reimplement the measurement — and a
+reimplementation is a second place the definition lives.
+
+**A probe read after the call it was supposed to precede is a probe that cannot
+fail.** The same test counted wave-list growth with `let before = len` written
+*after* `update()`, so `grew` was identically `false` and the assertion it fed
+was comparing `true` against `false` on every corner. It produced a plausible
+disagreement count rather than a compile error. When a "before" value is captured,
+check that it is captured *before*.
 
 ### The crab's sprite width caps its relief
 
