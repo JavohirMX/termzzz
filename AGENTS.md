@@ -25,6 +25,7 @@ termzzz terrain     # A side-view landscape: two ridges, parallax, sky
 termzzz solarsystem # 3D orrery: tilted orbits, real periods
 termzzz dvd         # The real DVD wordmark, bouncing, in braille
 termzzz newton      # Newton's method basins, hue by which root, ink by iterations
+termzzz aquarium    # A side-view fish tank: shoaling fish, light from above
 termzzz blank       # Blank screen
 termzzz ink         # Interactive generative field you pour ink into
 
@@ -242,6 +243,51 @@ Open engineering work, in priority order:
    on azure and violet — so "the HSV wheel is fine" is not a thing to assume.
 
    Still on the list, unchanged: `starfield`, `flow`, and Gray-Scott.
+
+4. **`aquarium` shipped, and the number worth taking from it is 2,269 bytes.** A
+   side-view fish tank: a shoal that separates and wanders, three species of ASCII
+   sprite with a tail cycle, gravel, bubbles, and click-to-feed.
+
+   **The water is a static gradient in `Cell::bg`, and that is the whole trick.**
+   343.9 us of render and **2,269 bytes a frame at 400x200** — six times under
+   budget, and a hundred-and-seventieth of the mandelbrot's 383 KB. The gradient
+   is every cell of the screen, so written into the *glyph* it is re-sent sixty
+   times a second for a picture that never changes; written into the background it
+   is written once and the encoder, which emits a background only when it differs
+   from the last, never reports it again. What is left per frame is the fish, the
+   bubbles and the few shaft cells whose level moved.
+
+   **This is the exact inverse of `ripple` and `plasma`, and that is the point.**
+   Same crate, same terminal, same encoder, and there a continuously interpolated
+   field meant a colour change in every cell and 2.79 MB a frame. The difference
+   is *entirely* in what the value is stored in. **Before optimising a field
+   effect's bandwidth, ask whether the field has to be re-sent at all** — a value
+   that is static in time belongs somewhere the diff ignores, and `bg` is a channel
+   this crate had barely used (only the half-block's two colours in one glyph,
+   until this).
+
+   Five things were wrong before it was right, and **every one of them was
+   invisible in a still picture** — which is the terrain lesson arriving again, in
+   a different costume. They are in the module docs in full; the two most
+   transferable:
+
+   - **A categorical axis that has quietly become ordinal.** Each fish's depth was
+     jittered 0.22 around its species' band, and the bands are 0.29 apart, so they
+     did not overlap: every species occupied its own horizontal row and the tank
+     read as three stripes. **The spread of a value has to exceed the gap between
+     the categories, or the categories are not categories.** Same bug as the
+     mirrored palettes in `ants`, on the other axis.
+   - **Two sprites that touch are one sprite.** Separation as a *force* made
+     non-overlap likely; it took a *positional* resolve to make it a property, and
+     the resolve had to clamp inside its own loop — clamping afterwards undid it by
+     pushing two fish back onto the same floor row. **A constraint that is enforced
+     by a force is a tendency. If a test has to assert it, resolve it
+     positionally.**
+
+   And the art, which is where the time went: the fish read as horizontal bars
+   until the fin rows were made the same density as the body. A light dash stacked
+   on a dark one is two bars. `the_body_tapers_to_the_tail_and_not_the_head_end`
+   exists because that is not something to check by eye.
 
 The output path was rebuilt recently and is worth knowing before touching it. It
 does not use crossterm's `PrintStyledContent`, because that emits the attributes

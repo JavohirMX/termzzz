@@ -40,6 +40,50 @@ only genuinely new features here.
   crate could not draw before. At 200x50 it is 0.43 ms and at 80x24 it is 0.08 ms,
   so the ordinary sizes are free.
 
+- **`aquarium`** — a side-view fish tank. A shoal that separates, wanders and
+  holds its own depth band; three species of ASCII sprite with a two-pose tail
+  cycle; gravel on the floor; bubbles; and a click drops a flake of food the shoal
+  goes for.
+
+  Two decisions did the work, and both are the opposite of the obvious one.
+
+  **Depth is shading, not a draw order.** The prior art here is `asciiquarium`,
+  which is a considerably better piece of work than "fish in a box" deserves credit
+  for, and its z-depth decides only which entity paints over which. But the reason
+  an underwater photograph looks like one is aerial perspective: water absorbs red
+  first, so a fish at depth is not merely further away, it is *bluer and dimmer*.
+  Each fish carries a `z` and its colour is mixed toward the water's by it, with
+  the red channel falling off far faster than the blue — which is the physics, and
+  which is the whole difference between underwater and behind fog.
+  `depth_costs_red_first_and_so_reads_as_underwater_rather_than_fog` holds it.
+
+  **The water is in the background channel, and it is static.** 343.9 us of render
+  and **2,269 bytes a frame at 400x200** — six times under budget, and a
+  hundred-and-seventieth of the mandelbrot's 383 KB. The depth gradient is every
+  cell of the screen; written into the glyph it would be re-sent sixty times a
+  second, and written into `Cell::bg` it is written once and never reported again.
+  That is the exact inverse of `ripple`, where a continuously interpolated field
+  meant a colour change in every cell and 2.79 MB a frame: same crate, same
+  encoder, and the difference is entirely in what the value is stored in. It is
+  also the first effect in the crate to use `bg` for anything other than the
+  half-block's two colours in one glyph.
+
+  The light is a few wide beams from the surface rather than caustics, which is
+  what a real tank looks like and also the expensive per-cell field this crate has
+  been bitten by twice; beams cost a few dozen columns rather than 80,000 cells,
+  and cannot band. `the_shafts_fall_off_across_their_width` keeps them beams and
+  not bars.
+
+  Five things were wrong before it was right, all invisible in a still picture, and
+  all recorded in the module docs: the fish read as horizontal bars until the fin
+  rows were the same density as the body; the species formed three stripes until
+  the depth spread exceeded the gap between their bands; every fish of a species
+  swam at the same height because the depth pull used the species' nominal depth
+  rather than the fish's own; the bottom third of the tank was empty because
+  `row_for_depth` had a fudge factor on it; and two fish would merge into one
+  twenty-six-column fish until separation was resolved *positionally* and *inside*
+  the bounds.
+
 - **Four effects, chosen to fill gaps in the *catalogue* rather than in a
   renderer.** Sixteen effects had between them no world, no automaton other than
   Conway's, nothing that propagated across the screen, and nothing where agents

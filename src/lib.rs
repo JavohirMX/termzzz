@@ -6,6 +6,7 @@
 //! |----------|------------------------------------------|
 //! | `ink`    | Interactive generative field you pour ink into |
 //! | `ants`   | Langton's ants sharing one board         |
+//! | `aquarium`| A side-view fish tank: shoaling fish, light shafts, click to feed |
 //! | `blank`  | Blank screen — no-op placeholder         |
 //! | `boids`  | Boids flocking simulation                |
 //! | `buffer` | Terminal cell buffer for colored output  |
@@ -43,6 +44,7 @@
 //! because a second copy is a second thing to forget to update.
 
 pub mod ants;
+pub mod aquarium;
 pub mod blank;
 pub mod boids;
 pub mod buffer;
