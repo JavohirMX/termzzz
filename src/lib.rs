@@ -69,6 +69,7 @@ pub mod rain;
 pub mod registry;
 pub mod render;
 pub mod ripple;
+pub mod rule30;
 pub mod runtime;
 pub mod sandpile;
 pub mod session;

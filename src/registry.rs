@@ -19,6 +19,7 @@ use crate::pipes::Pipes;
 use crate::plasma::Plasma;
 use crate::rain::digital_rain::DigitalRain;
 use crate::ripple::Ripple;
+use crate::rule30::Rule30;
 use crate::runtime::{FrameContext, InputEvent};
 use crate::sandpile::Sandpile;
 use crate::solarsystem::SolarSystem;
@@ -51,6 +52,7 @@ pub enum EffectId {
     Flyover,
     Physarum,
     Ripple,
+    Rule30,
     Sandpile,
 }
 
@@ -266,6 +268,17 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         needs_mouse: false,
         config_section: "sandpile",
     },
+    EffectSpec {
+        id: EffectId::Rule30,
+        // "rule30" rather than "cellular": every one of the 256 elementary rules
+        // is this effect, and the shipped one is Wolfram's. Naming the number is
+        // what tells a user what they are looking at.
+        name: "rule30",
+        description: "Elementary cellular automaton as a space-time diagram",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "rule30",
+    },
 ];
 
 impl EffectId {
@@ -364,6 +377,7 @@ pub enum AnyEffect {
     Flyover(Flyover),
     Physarum(Physarum),
     Ripple(Ripple),
+    Rule30(Rule30),
     Sandpile(Sandpile),
 }
 
@@ -390,6 +404,7 @@ impl AnyEffect {
             Self::Flyover(_) => EffectId::Flyover,
             Self::Physarum(_) => EffectId::Physarum,
             Self::Ripple(_) => EffectId::Ripple,
+            Self::Rule30(_) => EffectId::Rule30,
             Self::Sandpile(_) => EffectId::Sandpile,
         }
     }
@@ -466,6 +481,9 @@ impl AnyEffect {
             )),
             EffectId::Ripple => {
                 Self::Ripple(Ripple::new(config.get_ripple_options(), screen_size))
+            }
+            EffectId::Rule30 => {
+                Self::Rule30(Rule30::new(config.get_rule30_options(), screen_size))
             }
             EffectId::Sandpile => Self::Sandpile(Sandpile::new(
                 config.get_sandpile_options(),
@@ -556,6 +574,7 @@ impl_terminal_effect_for_any!(
     Flyover,
     Physarum,
     Ripple,
+    Rule30,
     Sandpile,
 );
 
@@ -590,6 +609,7 @@ mod tests {
         EffectId::Flyover,
         EffectId::Physarum,
         EffectId::Ripple,
+        EffectId::Rule30,
         EffectId::Sandpile,
     ];
 

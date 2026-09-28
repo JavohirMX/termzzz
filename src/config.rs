@@ -20,6 +20,7 @@ use crate::{
     playlist::PlaylistOptions,
     rain::digital_rain::DigitalRainOptions,
     ripple::RippleOptions,
+    rule30::Rule30Options,
     sandpile::SandpileOptions,
     solarsystem::SolarSystemOptions,
     terrain::TerrainOptions,
@@ -191,6 +192,7 @@ pub struct Config {
     pub flyover: FlyoverOptions,
     pub physarum: PhysarumOptions,
     pub ripple: RippleOptions,
+    pub rule30: Rule30Options,
     pub sandpile: SandpileOptions,
     pub playlist: PlaylistOptions,
 }
@@ -372,6 +374,10 @@ impl Config {
         self.ripple.clone()
     }
 
+    pub fn get_rule30_options(&self) -> Rule30Options {
+        self.rule30.clone()
+    }
+
     pub fn get_sandpile_options(&self) -> SandpileOptions {
         self.sandpile.clone()
     }
@@ -413,6 +419,7 @@ impl Config {
         self.flyover.seed = seed;
         self.physarum.seed = seed;
         self.ripple.seed = seed;
+        self.rule30.seed = seed;
         self.sandpile.seed = seed;
         // The playlist order, not just the pictures. Without this,
         // `--seed N --shuffle` reproduced the effects and not their order.
@@ -513,6 +520,9 @@ impl Config {
         if self.ripple.seed == DEFAULT_SEED {
             self.ripple.seed = draw();
         }
+        if self.rule30.seed == DEFAULT_SEED {
+            self.rule30.seed = draw();
+        }
         if self.sandpile.seed == DEFAULT_SEED {
             self.sandpile.seed = draw();
         }
@@ -550,6 +560,7 @@ impl Default for Config {
             flyover: FlyoverOptions::default(),
             physarum: PhysarumOptions::default(),
             ripple: RippleOptions::default(),
+            rule30: Rule30Options::default(),
             sandpile: SandpileOptions::default(),
             playlist: PlaylistOptions::default(),
         }
