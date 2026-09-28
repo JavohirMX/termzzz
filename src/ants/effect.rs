@@ -2,7 +2,7 @@ use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crate::render::glyph_ramp::{GlyphRamp, presets as glyph_presets};
-use crate::render::palette::{Palette, presets as palette_presets};
+use crate::render::palette::{Palette, luminance, presets as palette_presets};
 use crate::runtime::FrameContext;
 use crossterm::style;
 use rand::RngExt;
@@ -19,6 +19,17 @@ use serde::{Deserialize, Serialize};
 /// show. Saturating at eight keeps the newest trail legible against the busiest
 /// region of the board.
 const SATURATION: f32 = 8.0;
+
+/// Relative luminance above which an ant is drawn dark rather than light.
+///
+/// 0.45, and the number is not a preference. It is the point at which
+/// [`luminance`](crate::render::palette::luminance) says a colour is closer to
+/// white than to black, which is the same place the eye puts it: below this a
+/// white mark is the higher-contrast choice and above it a black one is. Anything
+/// nearer 0.5 would put the crossover above the perceptual midpoint and make
+/// mid-tones worse to read; anything much below it flips the ant to black on
+/// trails that still read as dark.
+const TRAIL_LUMA_MIDPOINT: f32 = 0.45;
 
 /// Direction indices, in the order a right turn advances them.
 const NORTH: usize = 0;
@@ -95,6 +106,9 @@ pub struct AntsOptions {
     /// into a brief pause rather than a jump.
     pub max_steps_per_frame: u16,
 
+    /// A named ramp from [`crate::render::palette`], for the trails.
+    pub palette: String,
+
     pub seed: u64,
 }
 
@@ -110,6 +124,7 @@ impl Default for AntsOptions {
             ant_coeff: 1.0,
             steps_per_second: 240.0,
             max_steps_per_frame: 8,
+            palette: "magma".to_string(),
             seed: DEFAULT_SEED,
         }
     }
@@ -196,6 +211,35 @@ impl Ants {
         let screen_size = crate::common::normalize_effect_size(screen_size);
         let (width, height) = (screen_size.0 as usize, screen_size.1 as usize);
 
+        // Resolved before the struct literal, because `options` is moved into it
+        // and reading `options.palette` afterwards is a use of a moved value. The
+        // honest order is: read the name, build the ramp, store the options.
+        //
+        // `Magma` rather than `ember`: the trails are the *hot* thing in this
+        // effect and the untouched board is the cold part, and only this ramp puts
+        // a dark, near-black end at zero and a pale end at the top. A ramp that
+        // ends in white would make the oldest trails the brightest thing on
+        // screen, which is the ordering mistake the glyph ramp's own docs warn
+        // about.
+        //
+        // Named, so the user can pick, and truncated, because `MAGMA` is mirrored
+        // and `Palette::sample` returns the *last* stop at `t = 1.0` -- which on
+        // a mirrored ramp is the second-darkest one. Taken whole it drew a
+        // saturated trail in dark purple and a quarter-saturated one in cream, so
+        // the busiest part of the board was the dimmest thing on it and the `u8`
+        // flip count this whole renderer exists to show was invisible. See
+        // `Palette::truncated_at_peak`.
+        //
+        // A configured ramp goes through the same truncation, so pointing
+        // `palette` at a mirrored preset gets the same correct behaviour rather
+        // than depending on the user knowing which presets are.
+        let palette = Palette::new(
+            palette_presets::by_name(&options.palette)
+                .unwrap_or(palette_presets::MAGMA)
+                .to_vec(),
+        )
+        .truncated_at_peak();
+
         let mut ants = Self {
             screen_size,
             canvas: Canvas::new(screen_size.0, screen_size.1),
@@ -205,13 +249,7 @@ impl Ants {
             step_accumulator: 0.0,
             rng: seeded_rng(DEFAULT_SEED, "ants"),
             ramp: GlyphRamp::new_ascii(glyph_presets::SHADE.chars().collect()),
-            // `Magma` rather than `ember`: the trails are the *hot* thing in this
-            // effect and the untouched board is the cold part, and only this ramp
-            // puts a dark, near-black end at zero and a pale end at the top. A
-            // ramp that ends in white would make the oldest trails the brightest
-            // thing on screen, which is the ordering mistake the glyph ramp's own
-            // docs warn about.
-            palette: Palette::new(palette_presets::MAGMA.to_vec()),
+            palette,
         };
         ants.rng = seeded_rng(ants.options.seed, "ants");
         ants.spawn_colony();
@@ -346,12 +384,42 @@ impl Ants {
 
         // The ants on top of their own trails, so the colony is visible as
         // agents rather than inferrable from where the bright cells are.
+        //
+        // The colour is chosen *per ant*, against the trail under it, rather than
+        // fixed. A fixed white was a real defect: the ramp's hot end is pale
+        // cream, so an ant standing on the freshest and busiest trail -- which is
+        // where it spends most of its time -- was the same colour as its own
+        // background and disappeared. The one comparison below cannot be wrong at
+        // any point on any ramp, where a fixed colour is wrong at one end of
+        // every ramp.
+        //
+        // `Bold` is kept on both branches: the glyph is `@` or `o`, and a bold
+        // mark is a heavier mark, which is what makes it read as an agent rather
+        // than as part of the trail.
         for (i, ant) in self.colony.iter().enumerate() {
+            if ant.x >= width || ant.y >= height {
+                continue;
+            }
             let glyph = if i == 0 { '@' } else { 'o' };
+            let under = self.grid[ant.y * width + ant.x];
+            let background = if under == 0 {
+                // Off the board, so against the terminal's own background, which
+                // the crate does not know. White is the historical choice and the
+                // only one that is legible on the majority of profiles.
+                style::Color::White
+            } else {
+                let trail =
+                    self.palette.sample((under as f32 / SATURATION).min(1.0));
+                if luminance(trail) > TRAIL_LUMA_MIDPOINT {
+                    style::Color::Black
+                } else {
+                    style::Color::White
+                }
+            };
             self.canvas.set(
                 ant.x,
                 ant.y,
-                Cell::new(glyph, style::Color::White, style::Attribute::Bold),
+                Cell::new(glyph, background, style::Attribute::Bold),
             );
         }
     }
@@ -360,6 +428,7 @@ impl Ants {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::palette::luminance;
 
     fn small(seed: u64) -> Ants {
         // One ant: the multi-ant behaviour is tested separately, and a single ant
@@ -411,6 +480,215 @@ mod tests {
             }
         }
         best
+    }
+
+    /// The colour the renderer would give a cell flipped `flips` times.
+    ///
+    /// Straight at the renderer rather than at the palette, because the defect was
+    /// never in the palette's maths -- `sample(1.0)` returning the last stop is
+    /// correct. It was in which stops were handed to it.
+    fn colour_at(ants: &Ants, flips: u8) -> style::Color {
+        let t = (flips as f32 / SATURATION).min(1.0);
+        ants.palette.sample(t)
+    }
+
+    /// The oldest trail must be brighter than the newest one. Not the other way
+    /// round, and not "different".
+    ///
+    /// This is the assertion the effect's whole renderer exists to support: the
+    /// grid is a `u8` flip count rather than a bit *so that* a cell flipped once
+    /// and a cell flipped nine times look different. `SATURATION` is 8, so a
+    /// cell flipped once and a cell flipped eight times are the two ends of the
+    /// scale and the assertion is about exactly those two.
+    ///
+    /// It failed against the code as it stood, and not marginally: the ramp was
+    /// the mirrored `MAGMA` taken whole, which put `t = 1.0` on `(81, 18, 124)` --
+    /// dark purple -- and `t = 0.125` on `(93, 23, 124)`, a difference of about
+    /// 4%. Every cell on the board was within a hair of the same colour, so the
+    /// effect was a monochrome smudge. A "the colours differ" test passes against
+    /// that, which is why this one compares luminance and not equality.
+    #[test]
+    fn a_busier_cell_is_brighter_than_a_fresh_one() {
+        let ants = small(1);
+        let fresh = colour_at(&ants, 1);
+        let busy = colour_at(&ants, 8);
+        assert!(
+            luminance(busy) > luminance(fresh) + 0.2,
+            "a cell flipped eight times was drawn at {busy:?} (luma \
+             {:.3}) and a cell flipped once at {fresh:?} (luma {:.3})",
+            luminance(busy),
+            luminance(fresh)
+        );
+    }
+
+    /// And it must climb all the way, not just at the two ends.
+    ///
+    /// The two-end version above is satisfiable by a ramp that jumps at the top
+    /// and is otherwise flat, which is a different picture and still useless. The
+    /// mirror's failure mode is a peak in the *middle*, so the midpoint is the
+    /// value worth asserting: it is the one that was cream while both ends were
+    /// dark.
+    #[test]
+    fn the_trail_brightness_climbs_monotonically_with_the_flip_count() {
+        let ants = small(1);
+        let mut previous = f32::NEG_INFINITY;
+        for flips in 1..=8u8 {
+            let color = colour_at(&ants, flips);
+            let luma = luminance(color);
+            assert!(
+                luma >= previous - 1e-4,
+                "flip count {flips} drew at {color:?}, luma {luma:.3}, \
+                 after {previous:.3}"
+            );
+            previous = luma;
+        }
+    }
+
+    /// An ant is never drawn in a colour that matches its own trail.
+    ///
+    /// The defect was a fixed white, and the ramp's hot end is pale cream -- so an
+    /// ant standing on the freshest, busiest trail, which is where it spends most
+    /// of its time, was the same colour as the cell it was standing on. Every
+    /// other test in this file was happy: the picture was a correct gradient, the
+    /// board was a correct highway, and the ant was invisible on the part of it
+    /// that mattered.
+    ///
+    /// Checked as a *contrast ratio* per ant against the cell it covers, rather
+    /// than as "the colour is not white", because the requirement is legibility
+    /// and white is neither required nor forbidden -- it is the wrong answer on
+    /// half the ramp and the right one on the other half.
+    #[test]
+    fn an_ant_is_always_contrasted_against_its_own_trail() {
+        let mut ants = Ants::new(
+            AntsOptions {
+                seed: 5,
+                ants: 3,
+                ..AntsOptions::default()
+            },
+            (60, 20),
+        );
+        // Long enough for a highway to exist, so some ants are standing on busy
+        // cells and some are not -- both branches of the decision get exercised,
+        // and a test that only ever saw one of them would pass a half-fix.
+        for _ in 0..2_000 {
+            ants.step_once();
+        }
+        ants.draw();
+
+        let (width, _) = ants.size();
+        let mut checked = 0usize;
+        for ant in &ants.colony {
+            let under = ants.grid[ant.y * width + ant.x];
+            let drawn = ants.canvas.get(ant.x, ant.y);
+            let ant_luma = luminance(drawn.color);
+            let trail_luma = if under == 0 {
+                // Off the board. White on the terminal's background is the
+                // historical choice and there is no better one available.
+                0.0
+            } else {
+                luminance(colour_at(&ants, under))
+            };
+            assert!(
+                (ant_luma - trail_luma).abs() > 0.2,
+                "an ant at ({}, {}) is drawn at {ant_luma:.2} on a trail at \
+                 {trail_luma:.2}, so it is invisible",
+                ant.x,
+                ant.y
+            );
+            checked += 1;
+        }
+        assert!(checked >= 3, "the fixture produced {checked} ants");
+    }
+
+    /// Both branches of the contrast decision actually happen on this ramp.
+    ///
+    /// Without this the test above could pass on a board where every ant happened
+    /// to stand on a dark cell, having never asked the other half of the
+    /// question. It is a coverage test, written as one, and it is here because
+    /// the fix is a branch and a branch that is never taken is untested.
+    #[test]
+    fn the_ant_colour_actually_flips_across_the_ramp() {
+        let ants = small(1);
+        let dark_ant = if luminance(colour_at(&ants, 1)) > TRAIL_LUMA_MIDPOINT {
+            style::Color::Black
+        } else {
+            style::Color::White
+        };
+        let bright_trail = colour_at(&ants, 8);
+        let bright_ant = if luminance(bright_trail) > TRAIL_LUMA_MIDPOINT {
+            style::Color::Black
+        } else {
+            style::Color::White
+        };
+        assert_ne!(
+            dark_ant,
+            bright_ant,
+            "a fresh trail at {:?} and a busy one at {bright_trail:?} pick the same \
+             ant colour, so one of the two is invisible",
+            colour_at(&ants, 1)
+        );
+    }
+
+    /// The ramp is configurable, and a configured ramp is still truncated.
+    ///
+    /// The second half is the one that matters: a user pointing `palette` at
+    /// `ocean` should get the *same* correct behaviour as the default, not the
+    /// inverted scale this crate shipped for four effects. A test that only
+    /// checked the name round-tripped would pass against code that ignored the
+    /// user's choice entirely.
+    #[test]
+    fn a_configured_palette_is_honoured_and_still_truncated() {
+        let default_ants = Ants::new(
+            AntsOptions {
+                seed: 1,
+                ants: 1,
+                ..AntsOptions::default()
+            },
+            (60, 20),
+        );
+        let ocean = Ants::new(
+            AntsOptions {
+                seed: 1,
+                ants: 1,
+                palette: "ocean".to_string(),
+                ..AntsOptions::default()
+            },
+            (60, 20),
+        );
+        assert_ne!(
+            colour_at(&default_ants, 8),
+            colour_at(&ocean, 8),
+            "choosing ocean changed nothing, so the option is ignored"
+        );
+        // And the truncation held: the top of the scale is the brightest stop of
+        // the named ramp, not its second-darkest one.
+        let brightest = palette_presets::OCEAN
+            .iter()
+            .copied()
+            .max_by(|a, b| {
+                luminance(*a)
+                    .partial_cmp(&luminance(*b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap();
+        assert_eq!(colour_at(&ocean, 8), brightest);
+
+        // An unknown name falls back rather than panicking: a palette built from
+        // user configuration must not be able to crash a renderer.
+        let bogus = Ants::new(
+            AntsOptions {
+                seed: 1,
+                ants: 1,
+                palette: "not-a-ramp".to_string(),
+                ..AntsOptions::default()
+            },
+            (60, 20),
+        );
+        assert_eq!(
+            colour_at(&bogus, 8),
+            colour_at(&default_ants, 8),
+            "an unknown palette name did not fall back to the default"
+        );
     }
 
     #[test]
