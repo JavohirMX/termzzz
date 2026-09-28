@@ -162,6 +162,11 @@ fn a_seed_that_was_set_survives_randomisation() {
     config.override_seed(99);
     assert_eq!(config.life.seed, 99);
     assert_eq!(config.plasma.seed, 99, "a new effect missed override_seed");
+    assert_eq!(
+        config.playlist.seed, 99,
+        "the playlist order is not pinned by --seed, so --seed N --shuffle is \
+         not the reproducible run the flag promises"
+    );
 }
 
 /// `--print-config` used to be a trap: it wrote every default to disk, so a

@@ -327,6 +327,9 @@ impl Config {
         self.cube.seed = seed;
         self.donut.seed = seed;
         self.plasma.seed = seed;
+        // The playlist order, not just the pictures. Without this,
+        // `--seed N --shuffle` reproduced the effects and not their order.
+        self.playlist.seed = seed;
     }
 
     /// Gives every *unpinned* effect its own random seed.
@@ -410,6 +413,9 @@ impl Config {
         }
         if self.plasma.seed == DEFAULT_SEED {
             self.plasma.seed = draw();
+        }
+        if self.playlist.seed == DEFAULT_SEED {
+            self.playlist.seed = draw();
         }
     }
 }

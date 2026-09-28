@@ -1,5 +1,5 @@
 use crate::buffer::{Buffer, Cell};
-use crate::common::TerminalEffect;
+use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
 use crate::config::Config;
 use crate::registry::{AnyEffect, EffectId};
 use crate::render::wipe::blank_cell;
@@ -25,6 +25,15 @@ pub struct PlaylistOptions {
     pub shuffle: bool,
     /// Seconds of blank wipe between effects.
     pub transition: f32,
+    /// Seed for the shuffle order.
+    ///
+    /// Present because `--seed N` promises a reproducible run, and it was not
+    /// one: the bag drew from `rand::rng()`, which is OS entropy, so
+    /// `--seed 1234 --shuffle` gave a reproducible *picture* in a random
+    /// *order*. The same `DEFAULT_SEED` convention as every effect, so a
+    /// config pinning 42 means "shuffle it differently each launch" and
+    /// `--seed 42` pins the order too.
+    pub seed: u64,
 }
 
 impl Default for PlaylistOptions {
@@ -38,6 +47,7 @@ impl Default for PlaylistOptions {
             effects: Default::default(),
             shuffle: false,
             transition: 0.6,
+            seed: DEFAULT_SEED,
         }
     }
 }
@@ -63,6 +73,8 @@ pub struct Playlist {
     slots: Vec<Slot>,
     order: Vec<usize>,
     bag: Vec<usize>,
+    /// Held rather than re-seeded per refill -- see [`Playlist::refill`].
+    bag_rng: EffectRng,
     position: usize,
     elapsed: f32,
     phase: Phase,
@@ -148,9 +160,30 @@ impl Playlist {
     ) -> Self {
         let screen_size = (screen_size.0.max(1), screen_size.1.max(1));
         let slots = Self::build_slots(&options);
-        let order = (0..slots.len()).collect();
-        let position = 0;
-        let current = AnyEffect::build(slots[position].id, &config, screen_size);
+        let order: Vec<usize> = (0..slots.len()).collect();
+        // The opening effect is *drawn*, not assumed to be the first entry.
+        //
+        // It used to be `let position = 0`, and that is the whole of
+        // "every --shuffle starts from matrix": the bag is only consulted by
+        // `next_index`, which handles transitions, so the run always opened on
+        // slot 0. With no `--playlist`, `build_slots` falls back to
+        // `EffectId::all()`, whose first entry is `matrix` -- so a bare
+        // `--shuffle` looked like it did nothing at all.
+        //
+        // Drawn from the bag rather than by shuffling `order`, so the opening
+        // effect comes from the same distribution as every later one and the
+        // "never the same effect twice running" rule holds from the first
+        // transition instead of starting one step in.
+        let mut bag_rng = seeded_rng(options.seed, "playlist.shuffle");
+        let mut bag: Vec<usize> = Vec::new();
+        let position = if options.shuffle && order.len() > 1 {
+            bag = Self::refill(&order, &mut bag_rng);
+            bag.remove(0)
+        } else {
+            0
+        };
+        let current =
+            AnyEffect::build(slots[order[position]].id, &config, screen_size);
         let (width, height) = (screen_size.0 as usize, screen_size.1 as usize);
         let mut playlist = Self {
             config,
@@ -158,7 +191,8 @@ impl Playlist {
             options,
             slots,
             order,
-            bag: Vec::new(),
+            bag,
+            bag_rng,
             position,
             elapsed: 0.0,
             phase: Phase::Running,
@@ -318,6 +352,27 @@ impl Playlist {
         self.rebuild_buffers();
     }
 
+    /// A fresh, shuffled bag of every index in `order`, drawn from the
+    /// playlist's own generator.
+    ///
+    /// That generator is *held* rather than re-seeded per refill, and the
+    /// distinction is load-bearing: reseeding from the same value would produce
+    /// the same permutation every round, so a long shuffled playlist would cycle
+    /// through one order forever. Holding it means successive refills differ
+    /// while the whole sequence is still reproducible from the seed.
+    ///
+    /// The bag used to draw from `rand::rng()`, which is OS entropy, so
+    /// `--seed 1234 --shuffle` was not the reproducible run the flag promises:
+    /// the effects looked the same and arrived in a different order each time.
+    ///
+    /// One call site, used by both the opening draw and every refill, so the
+    /// opening effect is drawn the same way as every later one.
+    fn refill(order: &[usize], rng: &mut EffectRng) -> Vec<usize> {
+        let mut bag = order.to_vec();
+        bag.shuffle(rng);
+        bag
+    }
+
     /// Sequential order steps forward; shuffle order draws from a reshuffling bag.
     fn next_index(&mut self) -> usize {
         if !self.options.shuffle || self.order.len() < 2 {
@@ -325,9 +380,7 @@ impl Playlist {
         }
 
         if self.bag.is_empty() {
-            let mut bag = self.order.clone();
-            bag.shuffle(&mut rand::rng());
-            self.bag = bag;
+            self.bag = Self::refill(&self.order, &mut self.bag_rng);
         }
 
         let current = self.order[self.position];
@@ -410,7 +463,19 @@ mod tests {
         transition: f32,
         shuffle: bool,
     ) -> Playlist {
+        playlist_seeded(entries, transition, shuffle, DEFAULT_SEED)
+    }
+
+    /// [`playlist_with`] with the seed spelled out, for the tests where the
+    /// order itself is the subject.
+    fn playlist_seeded(
+        entries: &[(&str, Option<f32>)],
+        transition: f32,
+        shuffle: bool,
+        seed: u64,
+    ) -> Playlist {
         let options = PlaylistOptions {
+            seed,
             effects: entries
                 .iter()
                 .map(|(effect, duration)| PlaylistEntry {
@@ -422,6 +487,153 @@ mod tests {
             shuffle,
         };
         Playlist::new(options, Config::default(), (40, 12))
+    }
+
+    /// The opening effect is drawn, not assumed to be the first entry.
+    ///
+    /// This is the whole of "every `--shuffle` starts from matrix".
+    /// `Playlist::new` hardcoded `let position = 0`, and the bag is only
+    /// consulted for *transitions*, so a run always opened on slot 0. With no
+    /// `--playlist` that slot is `EffectId::all()[0]`, which is `matrix` — so a
+    /// bare `--shuffle` looked like it did nothing at all.
+    ///
+    /// Asserted as a distribution rather than as "not matrix", because "not
+    /// matrix" is satisfiable by an order that is biased some other way. Two
+    /// hundred seeds, and every effect has to turn up.
+    #[test]
+    fn a_shuffled_playlist_opens_on_a_drawn_effect() {
+        let entries: Vec<(&str, Option<f32>)> =
+            EffectId::all().map(|id| (id.as_str(), None)).collect();
+        let mut firsts: std::collections::BTreeMap<String, usize> =
+            Default::default();
+        for seed in 0..200u64 {
+            let playlist = playlist_seeded(&entries, 0.6, true, seed);
+            *firsts
+                .entry(playlist.current_id().as_str().to_string())
+                .or_default() += 1;
+        }
+
+        assert_eq!(
+            firsts.len(),
+            entries.len(),
+            "across 200 seeds only {} of the {} effects ever opened the playlist: \
+             {:?}",
+            firsts.len(),
+            entries.len(),
+            firsts
+        );
+        // And not one of them is doing all the work, which is what a shuffled
+        // *order* with a fixed *first* entry would look like from further away.
+        let busiest = firsts.values().copied().max().unwrap_or(0);
+        assert!(
+            busiest < 40,
+            "one effect opened {busiest} of 200 shuffled playlists, so the order \
+             is random but the opening effect is not"
+        );
+    }
+
+    /// `--seed N` pins the order, not only the pictures.
+    ///
+    /// The bag drew from `rand::rng()` — OS entropy — so `--seed 1234
+    /// --shuffle` was not the reproducible run the flag promises: the effects
+    /// looked the same and arrived in a different order. The generator is now
+    /// held rather than re-seeded per refill, because re-seeding from the same
+    /// value would repeat one permutation forever.
+    #[test]
+    fn a_seeded_shuffle_reproduces_its_whole_order() {
+        let entries: Vec<(&str, Option<f32>)> =
+            EffectId::all().map(|id| (id.as_str(), None)).collect();
+        let order_of = |seed: u64| -> Vec<String> {
+            let mut playlist = playlist_seeded(&entries, 0.0, true, seed);
+            let mut seen = vec![playlist.current_id().as_str().to_string()];
+            for _ in 0..entries.len() {
+                playlist.step_to_next();
+                seen.push(playlist.current_id().as_str().to_string());
+            }
+            seen
+        };
+        assert_eq!(
+            order_of(7),
+            order_of(7),
+            "two runs at the same seed produced different orders, so --seed does \
+             not pin the playlist"
+        );
+        assert_ne!(
+            order_of(7),
+            order_of(8),
+            "seeds 7 and 8 produced the same order, so the seed is not reaching \
+             the shuffle at all"
+        );
+    }
+
+    /// Successive refills differ, so a long shuffled playlist does not cycle
+    /// through one order forever.
+    ///
+    /// This is the failure a *held* generator was chosen over a per-refill
+    /// re-seed, and it is invisible in a test that only looks at the first few
+    /// entries.
+    #[test]
+    fn a_long_shuffled_playlist_does_not_repeat_one_order() {
+        let entries: Vec<(&str, Option<f32>)> =
+            EffectId::all().map(|id| (id.as_str(), None)).collect();
+        let count = entries.len();
+        let mut playlist = playlist_seeded(&entries, 0.0, true, 3);
+        let mut orders: std::collections::BTreeSet<Vec<usize>> = Default::default();
+        for _ in 0..6 {
+            let mut round: Vec<usize> = Vec::new();
+            for _ in 0..=count {
+                round.push(playlist.position);
+                playlist.step_to_next();
+            }
+            orders.insert(round);
+        }
+        assert!(
+            orders.len() >= 3,
+            "six full rounds of a shuffled playlist produced only {} distinct \
+             orders, so it is cycling rather than shuffling",
+            orders.len()
+        );
+    }
+
+    /// A playlist too short to shuffle still works.
+    ///
+    /// The opening draw is new code on a path that used to be a constant, and a
+    /// single-entry list is the case where an off-by-one in it would panic
+    /// rather than merely look wrong.
+    #[test]
+    fn a_single_effect_playlist_still_opens_on_that_effect() {
+        for shuffle in [false, true] {
+            let mut playlist = playlist_with(&[("matrix", None)], 0.0, shuffle);
+            assert_eq!(playlist.current_id().as_str(), "matrix");
+            playlist.step_to_next();
+            assert_eq!(
+                playlist.current_id().as_str(),
+                "matrix",
+                "a one-entry playlist moved to something else"
+            );
+        }
+    }
+
+    /// The opening effect is not repeated by the first transition.
+    ///
+    /// The bag's own rule is "keep drawing until something other than the
+    /// current effect comes up". It used to start one entry late, so the run
+    /// opened on slot 0 and could then draw slot 0 again immediately.
+    #[test]
+    fn the_first_transition_does_not_repeat_the_opening_effect() {
+        let entries: Vec<(&str, Option<f32>)> =
+            EffectId::all().map(|id| (id.as_str(), None)).collect();
+        for seed in 0..100u64 {
+            let mut playlist = playlist_seeded(&entries, 0.0, true, seed);
+            let first = playlist.current_id();
+            playlist.step_to_next();
+            assert_ne!(
+                playlist.current_id(),
+                first,
+                "seed {seed} opened on {} and then stayed on it",
+                first.as_str()
+            );
+        }
     }
 
     fn filled_buffer(width: usize, height: usize) -> Buffer {
