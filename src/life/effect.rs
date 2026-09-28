@@ -13,6 +13,7 @@
 use crate::buffer::Cell;
 use crate::canvas::Canvas;
 use crate::common::{DEFAULT_SEED, EffectRng, TerminalEffect, seeded_rng};
+use crate::life::rule::{LifeRule, deserialize_rule};
 use crate::render::Palette;
 use crossterm::style;
 use rand::RngExt;
@@ -183,6 +184,42 @@ fn color_for_age(age: u8) -> style::Color {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct ConwayLifeOptions {
+    /// Which rule of the Life family to run.
+    ///
+    /// A `B<births>/S<survivals>` specification, or one of the names in
+    /// [`crate::life::rule::NAMED_RULES`]. `B3/S23` and `life` are the same
+    /// rule, which is Conway's own.
+    ///
+    /// The whole family is one option rather than eighteen effects, because
+    /// every rule wants the seeding, the boundary handling, the glider injection
+    /// and the age-in-the-glyph that this effect already has, and a variant that
+    /// is a different pair of numbers does not need its own name in `--help` and
+    /// its own 1,200 lines in the crate.
+    ///
+    /// **Refused rather than defaulted**, which is the opposite of how the
+    /// `palette` options behave and for a specific reason. An unknown palette
+    /// falls back and the picture comes out the wrong colour, which is obvious.
+    /// An unknown *rule* falls back to Conway's Life and the picture comes out
+    /// as a perfectly plausible Game of Life, with nothing anywhere saying the
+    /// config was not read. So a bad value is an error, and the message names
+    /// the forms it accepted.
+    ///
+    /// Two famous rules are deliberately not available, because neither is
+    /// totalistic and neither can be written as a birth/survival pair: `Day &
+    /// Night` has eight states per cell, and `Replicator` is born from a
+    /// particular *arrangement* of neighbours rather than a count. See
+    /// [`crate::life::rule`] for the whole boundary.
+    ///
+    /// **The gliders ignore the rule.** This effect injects
+    /// [`GLIDERS_PER_GENERATION`] gliders into every generation, and those are
+    /// births that never consult the birth half of whatever rule is configured.
+    /// So a restrictive rule cannot empty the board, and `B3/-S23` -- a rule with
+    /// no births at all -- still has gliders drifting through it. That is the
+    /// effect's character rather than an oversight, but it is surprising if you
+    /// did not know, so it is written down here.
+    #[serde(deserialize_with = "deserialize_rule")]
+    pub rule: String,
+
     #[serde(skip)]
     pub initial_cells: u32,
     pub cells_coeff: f32,
@@ -220,6 +257,7 @@ impl Default for ConwayLifeOptions {
     /// that omitted a section silently zeroed it.
     fn default() -> Self {
         Self {
+            rule: "B3/S23".to_string(),
             initial_cells: 200,
             cells_coeff: 1.0,
             generations_per_second: 3.0,
@@ -237,6 +275,8 @@ pub struct ConwayLife {
     pub screen_size: (u16, u16),
     #[allow(dead_code)]
     options: ConwayLifeOptions,
+    /// The parsed rule, resolved once at construction.
+    rule: LifeRule,
     canvas: Canvas,
     cells: HashMap<(usize, usize), LifeCell>,
     pub rng: EffectRng,
@@ -341,11 +381,7 @@ impl ConwayLife {
                 let live_neighbors =
                     count_live_neighbors(&self.cells, x, y, width, height);
 
-                let survives = if alive {
-                    live_neighbors == 2 || live_neighbors == 3
-                } else {
-                    live_neighbors == 3
-                };
+                let survives = self.rule.next_state(alive, live_neighbors);
 
                 if !survives {
                     continue;
@@ -381,6 +417,21 @@ impl ConwayLife {
         let mut rng = seeded_rng(options.seed, "life");
         let canvas = Canvas::new(screen_size.0, screen_size.1);
 
+        // The config loader has already refused an unparseable rule, so this
+        // fallback only exists for an options struct built in code. It is *not*
+        // silent: the crate's rule for a wrong value here is that a bad rule
+        // produces a plausible-looking Life and a bad colour produces an
+        // obviously-wrong picture, and only one of those is worth guessing about
+        // quietly. A hand-written `rule` is a bug in the caller and is reported
+        // as one.
+        let rule = LifeRule::parse(&options.rule).unwrap_or_else(|reason| {
+            eprintln!(
+                "termzzz: [life] ignoring unusable rule {:?}: {reason}",
+                options.rule
+            );
+            LifeRule::LIFE
+        });
+
         let mut cells = HashMap::new();
         for _ in 0..options.initial_cells {
             let x = rng.random_range(0..screen_size.0) as usize;
@@ -392,11 +443,18 @@ impl ConwayLife {
         Self {
             screen_size,
             options,
+            rule,
             canvas,
             cells,
             rng,
             generation_accumulator: 0.0,
         }
+    }
+
+    /// The rule in force, for the effect's own tests.
+    #[cfg(test)]
+    fn rule(&self) -> LifeRule {
+        self.rule
     }
 
     /// Writes every live cell into the canvas.
@@ -502,6 +560,123 @@ pub fn count_live_neighbors(
     }
 
     live
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    /// The step loop uses the configured rule rather than a hardcoded Life.
+    ///
+    /// This is the assertion the whole feature rests on and it lives here
+    /// rather than in `rule.rs` for a specific reason: every test in that module
+    /// reads the rule *directly*, so a `step_generation` still containing
+    /// `live_neighbors == 3` would pass all of them. The rule table would be
+    /// correct, the option would parse, and the picture would not change.
+    ///
+    /// Asserted as a difference in the resulting *board*, not in a returned
+    /// value, because the board is what the user sees.
+    #[test]
+    fn the_configured_rule_changes_the_simulation() {
+        let build = |rule: &str| {
+            // A fixed soup, so the only thing that can differ between two runs
+            // is the rule.
+            let options = ConwayLifeOptions {
+                rule: rule.to_string(),
+                initial_cells: 400,
+                ..ConwayLifeOptions::default()
+            };
+            ConwayLife::new(options, (60, 30))
+        };
+
+        let mut life = build("B3/S23");
+        let mut highlife = build("highlife");
+        for _ in 0..8 {
+            life.step_generation();
+            highlife.step_generation();
+        }
+
+        assert_eq!(life.rule(), LifeRule::LIFE);
+        assert_eq!(highlife.rule(), LifeRule::parse("highlife").unwrap());
+        // `LifeCell` holds only an age, so the cells' *positions* are what
+        // identifies a board, and comparing the sorted key sets avoids needing
+        // `Debug` or `PartialEq` on the cell type for this one check.
+        let keys =
+            |life: &ConwayLife| -> std::collections::BTreeSet<(usize, usize)> {
+                life.cells.keys().copied().collect()
+            };
+        assert_ne!(
+            keys(&life),
+            keys(&highlife),
+            "the two rules produced an identical board, so the step loop is not \
+             consulting the configured rule"
+        );
+    }
+
+    /// No birth counts means the board can only shrink, plus the gliders.
+    ///
+    /// The bound is exact, and the constraint it comes from is not about rules
+    /// at all: this effect injects [`GLIDERS_PER_GENERATION`] gliders of five
+    /// cells into **every** generation, and those are births that never consult
+    /// the birth half of whatever rule is configured. So two obvious claims are
+    /// both false, and both were written here and then measured:
+    ///
+    /// - "a rule with no survival counts empties the board" is false for
+    ///   `seeds` on a quarter-full board, which was still at 167 cells after
+    ///   thirty generations. Seeds is born on two, and a dense board keeps
+    ///   making pairs, so it replaces every survivor it removes.
+    /// - "a rule with no birth counts empties the board" is false for the same
+    ///   reason.
+    ///
+    /// What is true, and is the statement that actually shows the birth table is
+    /// being consulted, is that *apart from the injected gliders* the population
+    /// never grows. That is a tight bound rather than a loose one, so it is
+    /// worth having.
+    #[test]
+    fn a_rule_with_no_births_can_only_lose_cells_to_the_gliders() {
+        let options = ConwayLifeOptions {
+            rule: "B-/S23".to_string(),
+            initial_cells: 200,
+            ..ConwayLifeOptions::default()
+        };
+        let mut life = ConwayLife::new(options, (40, 20));
+
+        // The most the injection can add in one generation.
+        let injection = (GLIDERS_PER_GENERATION * 5) as isize;
+        let mut previous = life.cells.len();
+        for generation in 0..40 {
+            life.step_generation();
+            let growth = life.cells.len() as isize - previous as isize;
+            assert!(
+                growth <= injection,
+                "generation {generation} grew the board by {growth}, more than the \
+                 {injection} cells the glider injection accounts for, so \
+                 something is being born that the configured rule forbids"
+            );
+            previous = life.cells.len();
+        }
+
+        // And it does trend downwards rather than sitting still.
+        assert!(
+            life.cells.len() < 200,
+            "a board that can only lose cells finished with {} of its original \
+             200, so it is not actually losing them",
+            life.cells.len()
+        );
+    }
+
+    /// The default is Conway's Life, spelled in full.
+    ///
+    /// `B3/S23` rather than the name `life` on purpose: the generated config
+    /// should not depend on the alias table, and a test that asserted the
+    /// default equals the string `life` would keep passing if the spelling
+    /// changed to something the table had lost.
+    #[test]
+    fn the_default_rule_is_conways_life() {
+        assert_eq!(ConwayLifeOptions::default().rule, "B3/S23");
+        let life = ConwayLife::new(ConwayLifeOptions::default(), (20, 10));
+        assert_eq!(life.rule(), LifeRule::LIFE);
+    }
 }
 
 #[cfg(test)]
