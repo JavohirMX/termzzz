@@ -75,3 +75,4 @@ pub mod sandpile;
 pub mod session;
 pub mod solarsystem;
 pub mod terrain;
+pub mod wireworld;

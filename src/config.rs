@@ -24,6 +24,7 @@ use crate::{
     sandpile::SandpileOptions,
     solarsystem::SolarSystemOptions,
     terrain::TerrainOptions,
+    wireworld::WireworldOptions,
 };
 use crossterm::style::Color;
 use serde::{Deserialize, Serialize};
@@ -194,6 +195,7 @@ pub struct Config {
     pub ripple: RippleOptions,
     pub rule30: Rule30Options,
     pub sandpile: SandpileOptions,
+    pub wireworld: WireworldOptions,
     pub playlist: PlaylistOptions,
 }
 
@@ -382,6 +384,10 @@ impl Config {
         self.sandpile.clone()
     }
 
+    pub fn get_wireworld_options(&self) -> WireworldOptions {
+        self.wireworld.clone()
+    }
+
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
     }
@@ -421,6 +427,7 @@ impl Config {
         self.ripple.seed = seed;
         self.rule30.seed = seed;
         self.sandpile.seed = seed;
+        self.wireworld.seed = seed;
         // The playlist order, not just the pictures. Without this,
         // `--seed N --shuffle` reproduced the effects and not their order.
         self.playlist.seed = seed;
@@ -526,6 +533,9 @@ impl Config {
         if self.sandpile.seed == DEFAULT_SEED {
             self.sandpile.seed = draw();
         }
+        if self.wireworld.seed == DEFAULT_SEED {
+            self.wireworld.seed = draw();
+        }
         if self.playlist.seed == DEFAULT_SEED {
             self.playlist.seed = draw();
         }
@@ -562,6 +572,7 @@ impl Default for Config {
             ripple: RippleOptions::default(),
             rule30: Rule30Options::default(),
             sandpile: SandpileOptions::default(),
+            wireworld: WireworldOptions::default(),
             playlist: PlaylistOptions::default(),
         }
     }

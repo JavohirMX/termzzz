@@ -24,6 +24,7 @@ use crate::runtime::{FrameContext, InputEvent};
 use crate::sandpile::Sandpile;
 use crate::solarsystem::SolarSystem;
 use crate::terrain::Terrain;
+use crate::wireworld::Wireworld;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -54,6 +55,7 @@ pub enum EffectId {
     Ripple,
     Rule30,
     Sandpile,
+    Wireworld,
 }
 
 /// Everything the CLI needs to know about an effect, in one place.
@@ -279,6 +281,17 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         needs_mouse: false,
         config_section: "rule30",
     },
+    EffectSpec {
+        id: EffectId::Wireworld,
+        name: "wireworld",
+        // "wireworld" and not "circuit": the effect is the *rule*, and the rule
+        // is what is distinctive. A description that said "electrons in a
+        // circuit" would be the same sentence twice over.
+        description: "Electrons running through a generated circuit",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "wireworld",
+    },
 ];
 
 impl EffectId {
@@ -379,6 +392,7 @@ pub enum AnyEffect {
     Ripple(Ripple),
     Rule30(Rule30),
     Sandpile(Sandpile),
+    Wireworld(Wireworld),
 }
 
 impl AnyEffect {
@@ -406,6 +420,7 @@ impl AnyEffect {
             Self::Ripple(_) => EffectId::Ripple,
             Self::Rule30(_) => EffectId::Rule30,
             Self::Sandpile(_) => EffectId::Sandpile,
+            Self::Wireworld(_) => EffectId::Wireworld,
         }
     }
 
@@ -487,6 +502,10 @@ impl AnyEffect {
             }
             EffectId::Sandpile => Self::Sandpile(Sandpile::new(
                 config.get_sandpile_options(),
+                screen_size,
+            )),
+            EffectId::Wireworld => Self::Wireworld(Wireworld::new(
+                config.get_wireworld_options(),
                 screen_size,
             )),
         }
@@ -576,6 +595,7 @@ impl_terminal_effect_for_any!(
     Ripple,
     Rule30,
     Sandpile,
+    Wireworld,
 );
 
 #[cfg(test)]
@@ -611,6 +631,7 @@ mod tests {
         EffectId::Ripple,
         EffectId::Rule30,
         EffectId::Sandpile,
+        EffectId::Wireworld,
     ];
 
     #[test]
