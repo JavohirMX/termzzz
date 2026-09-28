@@ -457,6 +457,151 @@ fn every_effect_survives_a_long_run() {
     }
 }
 
+// --- the screensaver property ---------------------------------------------
+//
+// Everything else in this file checks that an effect is *well formed*: it stays
+// in bounds, it honours its seed, it moves when the speed key changes. Nothing
+// here checks that it is *worth watching*, and that is the property this crate
+// has actually been getting wrong. Two effects in its history were measurably
+// efficient and read as nothing -- `terrain`'s grain round, where a byte count
+// said the effect was getting busier and the picture was getting worse, and a
+// `plasma` change attributed to a glyph recalibration before the pre-change
+// binary had been measured. A frame table cannot tell you whether an effect
+// reads.
+//
+// The one mechanical proxy for "reads" is convergence. A screensaver that
+// settles into a fixed point and then shows a still image for the rest of its
+// playlist slot is broken, however fast it renders and however few bytes it
+// emits -- a still image is zero bytes and zero interest. So this asserts that
+// no effect's diff goes permanently quiet.
+
+/// The longest run of consecutive frames an effect may show nothing new.
+///
+/// 30 frames, which is half a second at 60 fps. The number is a granularity,
+/// not a tuned threshold: the assertion is that the picture is never still for
+/// longer than this, so any value works and the point is to keep it short
+/// enough to catch a stall and long enough that a legitimately slow effect
+/// survives it.
+///
+/// Measured against all twenty effects at 200x50, this separates cleanly. The
+/// stillest genuinely-alive effect is `dvd`, which emitted a change on 73 of
+/// 180 window frames (41%) because the logo is small and does not cross a cell
+/// boundary on every frame -- and even so, the chance of a 30-frame run landing
+/// entirely inside one of its rest gaps is under 1e-6. The two effects that do
+/// fail are listed in [`DELIBERATELY_CONVERGENT`].
+///
+/// A percentage of "frames that changed something" was the obvious formulation
+/// and it needed a magic number in a gap between two measured populations
+/// (5% for `life`, 41% for `dvd`), which is the kind of constant this repo has
+/// been bitten by before. This needs no threshold at all.
+const STILL_RUN_FRAMES: usize = 30;
+
+/// Frames of settling before the measurement window opens.
+///
+/// 300, or five seconds. Generous on purpose: an effect that converges needs
+/// time to get there, and a measurement that starts too early will call a slow
+/// transition still. This is a *floor* on how patient the test is, and the
+/// effects that pass immediately are the ones that are never close.
+const SETTLE_FRAMES: u64 = 300;
+
+/// The measurement window, in frames. Three seconds.
+const WINDOW_FRAMES: u64 = 180;
+
+/// Effects that are *supposed* to stop changing, with the reason each one does.
+///
+/// This is a short list and both entries are properties of the model rather
+/// than defects in the effect, which is the test for whether an entry belongs
+/// here. An entry that is "it converges, we did not fix it" is a bug wearing an
+/// exemption.
+///
+/// - `blank` is a blank screen. It is in the catalogue as a deliberate nothing,
+///   the thing a playlist uses as a rest between effects.
+///
+/// - `life` is Conway's Life, and Conway's Life converges. A random soup on a
+///   finite bounded board settles into still lifes and blinkers, after which
+///   nothing moves -- measured here at 9 changes in 180 frames, against `dvd`'s
+///   73. That is the model behaving correctly, not an effect failing. It becomes
+///   only truer with the `rule` option, where `seeds` dies out entirely and
+///   `2x2` saturates the whole board.
+///
+/// Notably absent: `maze`, which is on a four-second playlist duration and reads
+/// like an effect that holds. It does not. It emits wall texture indefinitely,
+/// about six cells a frame, and its short duration is a pacing decision about
+/// playlists rather than a claim about its own output.
+const DELIBERATELY_CONVERGENT: &[&str] = &["blank", "life"];
+
+/// No effect may hold a still picture for longer than [`STILL_RUN_FRAMES`].
+///
+/// **What this cannot see.** It is a proxy for convergence, and it is a coarse
+/// one. An effect that changes a single cell every half second passes it while
+/// being just as static in the way that matters; so does an effect that cycles
+/// between two states in place. Neither is caught here, and both would need a
+/// hand-written assertion about that effect's own dynamics to be caught at all.
+///
+/// It also says nothing about whether an effect looks good, which is the failure
+/// the two rounds of `terrain` grain actually were. This catches the case where
+/// an effect stops entirely, which is the mechanical way the other one starts.
+#[test]
+fn no_effect_settles_into_a_still_picture() {
+    let size = (200u16, 50u16);
+    let total = SETTLE_FRAMES + WINDOW_FRAMES;
+    let mut offenders: Vec<String> = Vec::new();
+
+    for id in EffectId::all() {
+        let name = id.as_str();
+        if DELIBERATELY_CONVERGENT.contains(&name) {
+            continue;
+        }
+
+        let config = Config::default();
+        let mut effect = AnyEffect::build(id, &config, size);
+
+        let mut input = termzzz::runtime::InputState::default();
+        input.set_size(size);
+
+        let mut run = 0usize;
+        let mut longest = 0usize;
+
+        for frame in 0..total {
+            let context = termzzz::runtime::FrameContext::new(
+                size,
+                frame,
+                Duration::from_secs_f64(frame as f64 / 60.0),
+                Duration::from_secs_f64(1.0 / 60.0),
+                input.clone(),
+            );
+
+            let changed = effect.get_diff_with_context(&context).len();
+
+            if frame < SETTLE_FRAMES {
+                // Not measured. The settling window is allowed to be still,
+                // which is the whole reason it exists.
+            } else if changed == 0 {
+                run += 1;
+                longest = longest.max(run);
+                if run > STILL_RUN_FRAMES {
+                    offenders.push(format!(
+                        "{name} showed nothing new for {run} frames \
+                         (from frame {frame} of {total})"
+                    ));
+                    break;
+                }
+            } else {
+                run = 0;
+            }
+
+            effect.update_with_context(&context);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these effects settled into a still picture, which means a playlist \
+         slot would show a frozen frame for its whole duration:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
 /// `update_size` is a public entry point on a public type, so it has to leave
 /// the effect renderable on its own. The runtime happens to call `reset`
 /// straight afterwards, but that ordering is not part of the trait contract
