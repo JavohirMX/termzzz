@@ -509,13 +509,29 @@ const WINDOW_FRAMES: u64 = 180;
 
 /// Effects that are *supposed* to stop changing, with the reason each one does.
 ///
-/// This is a short list and both entries are properties of the model rather
-/// than defects in the effect, which is the test for whether an entry belongs
-/// here. An entry that is "it converges, we did not fix it" is a bug wearing an
-/// exemption.
+/// This is a short list and every entry is a property of the model or a
+/// deliberate feature rather than a defect in the effect, which is the test for
+/// whether an entry belongs here. An entry that is "it converges, we did not fix
+/// it" is a bug wearing an exemption.
 ///
 /// - `blank` is a blank screen. It is in the catalogue as a deliberate nothing,
 ///   the thing a playlist uses as a rest between effects.
+///
+/// - `physarum` settles on purpose. The plasmodium model anneals its decay from
+///   0.90 to 0.995 over 2,500 steps, holds the finished network for
+///   `hold_seconds` -- 4 seconds, or 240 frames against `STILL_RUN_FRAMES`'s 30 --
+///   and then fades and re-seeds. At the shipped 0.90 it never converged at all:
+///   churn sat at 0.35 to 1.4, meaning a third of the marked field was being
+///   redrawn twice a second for ever.
+///
+///   **It is on this list because the window is too short to catch it otherwise,
+///   which is worth being explicit about.** The measurement here runs
+///   `SETTLE_FRAMES + WINDOW_FRAMES` = 480 frames, about eight seconds, and
+///   physarum does not reach its hold until roughly 45. Left off this list it
+///   would pass by never getting there, which is the failure mode this suite
+///   exists to prevent and not a smaller version of it. The exemption is the
+///   honest response to a *deliberate* hold; a hold that arrived by accident would
+///   need the hold removed instead.
 ///
 /// - `life` is Conway's Life, and Conway's Life converges. A random soup on a
 ///   finite bounded board settles into still lifes and blinkers, after which
@@ -528,7 +544,7 @@ const WINDOW_FRAMES: u64 = 180;
 /// like an effect that holds. It does not. It emits wall texture indefinitely,
 /// about six cells a frame, and its short duration is a pacing decision about
 /// playlists rather than a claim about its own output.
-const DELIBERATELY_CONVERGENT: &[&str] = &["blank", "life"];
+const DELIBERATELY_CONVERGENT: &[&str] = &["blank", "physarum", "life"];
 
 /// No effect may hold a still picture for longer than [`STILL_RUN_FRAMES`].
 ///
