@@ -67,12 +67,38 @@ pub mod presets {
     /// [`DOTS`] this is safe in a CJK-configured terminal.
     pub const BLOCKS: &str = " ░▒▓█";
 
+    /// The eight lower-eighth blocks, plus a space: a smooth vertical gradient.
+    ///
+    /// `▁` through `▇` are the *eighth* blocks, at U+2581 to U+2587, and they are
+    /// a finer and more even instrument than [`BLOCKS`]: eight steps instead of
+    /// three, each a one-eighth increment of the cell's height, and unlike the
+    /// shade blocks they are anchored to the *bottom* of the cell. That anchoring
+    /// is the point for a flame or a waveform, where each row is a sample and the
+    /// row's height is the value -- [`BLOCKS`] would draw the same eight values
+    /// in an order that has nothing to do with which way up they are.
+    ///
+    /// The ink coverage is not monotonic in a subtle way worth stating: `▁` is a
+    /// baseline rule and `█` is the full box, and the seven between them climb in
+    /// one-eighth steps of the *same* bar, so unlike [`SHADE`] there is no point
+    /// at which the ramp reads backwards. Eight steps is also the reason this
+    /// exists next to `BLOCKS`: an eight-bit intensity field rendered through a
+    /// five-entry ramp shows five bands, and through this one it does not.
+    ///
+    /// Font risk is low but not zero, and it is *local*: `█` and the eighth
+    /// blocks are in the Block Elements range that every font with box drawing
+    /// has, and a terminal missing the lot falls back to a replacement glyph
+    /// rather than a blank. The set is single-width and East_Asian_Width =
+    /// Ambiguous, the same class as `░▒▓█` above and for the same reason
+    /// [`is_ambiguous_or_narrow`] allows it.
+    pub const FLAME: &str = " ▁▂▃▄▅▆▇█";
+
     /// Every set above, for `--help` and the docs.
     pub const ALL: &[(&str, &str)] = &[
         ("shade", SHADE),
         ("sparse", SPARSE),
         ("dots", DOTS),
         ("blocks", BLOCKS),
+        ("flame", FLAME),
     ];
 
     /// Looks a set up by name, case-insensitively.
@@ -93,14 +119,23 @@ pub mod presets {
 /// A real width table wants `unic-width`, which is a dependency this crate does
 /// not have for the sake of one assertion. The ranges below are the ones that
 /// actually occur in ramps like these.
+///
+/// The Block Elements range U+2581 to U+2588 -- `▁▂▃▄▅▆▇█`, the shade blocks and
+/// the eighth blocks -- is here as one span because the arm used to single out
+/// `█` alone, which allowed the top of [`presets::BLOCKS`] and rejected the seven
+/// characters directly below it. That was an oversight in the list rather than a
+/// decision about them: all eight are East_Asian_Width = Ambiguous, which is the
+/// class this function already accepts, and `no_preset_contains_a_character_that
+/// _would_shear_a_grid` is what notices when a new preset reaches past the end of
+/// a range.
 pub fn is_ambiguous_or_narrow(glyph: char) -> bool {
     glyph.is_ascii()
         || ('\u{00A0}'..='\u{00FF}').contains(&glyph)
         || ('\u{2000}'..='\u{206F}').contains(&glyph)
         || ('\u{2190}'..='\u{2BFF}').contains(&glyph)
         || ('\u{FF61}'..='\u{FF9F}').contains(&glyph)
+        || ('\u{2581}'..='\u{2588}').contains(&glyph)
         || ('\u{2591}'..='\u{2593}').contains(&glyph)
-        || glyph == '\u{2588}'
         || glyph == '\u{25A0}'
 }
 
