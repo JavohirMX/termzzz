@@ -427,7 +427,9 @@ fn print_help() {
          it each launch differs"
     );
     println!("        --playlist <LIST>    Play effects in order, comma separated");
-    println!("        --shuffle            Play the playlist in random order");
+    println!(
+        "        --shuffle            Shuffle the playlist, and its colour palettes"
+    );
     println!(
         "        --random             Deprecated: unseeded runs are already random"
     );

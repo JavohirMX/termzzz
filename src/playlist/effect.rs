@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::registry::{AnyEffect, EffectId};
 use crate::render::wipe::blank_cell;
 use crate::runtime::{FrameContext, InputEvent, InputState};
+use rand::RngExt;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -75,6 +76,25 @@ pub struct Playlist {
     bag: Vec<usize>,
     /// Held rather than re-seeded per refill -- see [`Playlist::refill`].
     bag_rng: EffectRng,
+    /// Draws the colour palette for each effect in shuffle mode.
+    ///
+    /// A *separate* generator from [`Self::bag_rng`] even though both come from
+    /// the same seed, and that is the point. One generator for both would make
+    /// the effect *order* depend on how many palettes are in the pool, so adding
+    /// a palette would reshuffle every seeded user's playlist. Two streams, each
+    /// reproducible on its own, neither able to move the other.
+    ///
+    /// Not reseeded per effect, for the reason `bag_rng` is not: a reseed from
+    /// the same value would give every effect the same palette.
+    palette_rng: EffectRng,
+    /// The palette the running effect was built with, for inspection.
+    ///
+    /// `None` in sequential mode, and `None` for an effect with no pool. Stored
+    /// rather than recomputed for the reason `Dvd::corner_this_frame` and
+    /// `Physarum::last_churn` are: the value exists to be read, and a test that
+    /// reimplemented the draw to find it would be testing a second copy of the
+    /// rule rather than the one that ran.
+    current_palette: Option<&'static str>,
     position: usize,
     elapsed: f32,
     phase: Phase,
@@ -175,6 +195,7 @@ impl Playlist {
         // "never the same effect twice running" rule holds from the first
         // transition instead of starting one step in.
         let mut bag_rng = seeded_rng(options.seed, "playlist.shuffle");
+        let mut palette_rng = seeded_rng(options.seed, "playlist.palette");
         let mut bag: Vec<usize> = Vec::new();
         let position = if options.shuffle && order.len() > 1 {
             bag = Self::refill(&order, &mut bag_rng);
@@ -182,8 +203,18 @@ impl Playlist {
         } else {
             0
         };
-        let current =
-            AnyEffect::build(slots[order[position]].id, &config, screen_size);
+        // The opening effect's palette is drawn here, by the same code path every
+        // later effect goes through, rather than being left at the config's value
+        // until the first transition. One implementation, so the opening draw is
+        // the same kind of draw and cannot drift from the rest.
+        let opening_id = slots[order[position]].id;
+        let mut palette_config = config.clone();
+        let current_palette = if options.shuffle {
+            Self::draw_palette(opening_id, &mut palette_config, &mut palette_rng)
+        } else {
+            None
+        };
+        let current = AnyEffect::build(opening_id, &palette_config, screen_size);
         let (width, height) = (screen_size.0 as usize, screen_size.1 as usize);
         let mut playlist = Self {
             config,
@@ -193,6 +224,8 @@ impl Playlist {
             order,
             bag,
             bag_rng,
+            palette_rng,
+            current_palette,
             position,
             elapsed: 0.0,
             phase: Phase::Running,
@@ -348,8 +381,48 @@ impl Playlist {
     fn step_to_next(&mut self) {
         self.position = self.next_index();
         let id = self.current_id();
-        self.current = AnyEffect::build(id, &self.config, self.screen_size);
+        // The palette is part of which effect this is, so it is drawn on the same
+        // path as the opening effect's and by the same rule: shuffled in shuffle
+        // mode, and left at whatever the config says otherwise.
+        let mut config = self.config.clone();
+        self.current_palette = if self.options.shuffle {
+            Self::draw_palette(id, &mut config, &mut self.palette_rng)
+        } else {
+            None
+        };
+        self.current = AnyEffect::build(id, &config, self.screen_size);
         self.rebuild_buffers();
+    }
+
+    /// Draws a palette for `id`, applies it to `config`, and reports which.
+    ///
+    /// A no-op returning `None` for an effect with an empty pool, which is every
+    /// effect that takes no palette and `newton` -- whose colour *is* its
+    /// encoding rather than a ramp applied to one, so a name from a table has
+    /// nothing to say to it.
+    ///
+    /// The `None` is load-bearing rather than cosmetic: an effect with no pool
+    /// must consume *nothing* from the stream. If `newton` drew a number and
+    /// threw it away, every effect after it would shift palette relative to a run
+    /// that did not contain newton, and the sequence would depend on which
+    /// effects a given playlist happened to hold.
+    ///
+    /// Returns the name so the caller can record it, and is a free function over
+    /// the generator rather than a method on `self` because the opening effect is
+    /// drawn before `Self` exists -- two copies of this would be two places the
+    /// rule lives.
+    fn draw_palette(
+        id: EffectId,
+        config: &mut Config,
+        rng: &mut EffectRng,
+    ) -> Option<&'static str> {
+        let pool = id.spec().shuffle_palettes;
+        if pool.is_empty() {
+            return None;
+        }
+        let name = pool[rng.random_range(0..pool.len())];
+        config.set_palette(id, name);
+        Some(name)
     }
 
     /// A fresh, shuffled bag of every index in `order`, drawn from the
@@ -457,6 +530,7 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
     use crossterm::style;
+    use std::collections::BTreeMap;
 
     fn playlist_with(
         entries: &[(&str, Option<f32>)],
@@ -597,6 +671,265 @@ mod tests {
 
     /// A playlist too short to shuffle still works.
     ///
+    /// A shuffled playlist gives its effects different colours.
+    ///
+    /// The point of the feature, so it is asserted as the observable rather than
+    /// as a property of the draw: what lands on the terminal has to differ, and
+    /// the only way to see that without a terminal is to read the palette the
+    /// effect was built with.
+    #[test]
+    fn a_shuffled_playlist_varies_the_palette() {
+        let entries: Vec<(&str, Option<f32>)> =
+            EffectId::all().map(|id| (id.as_str(), None)).collect();
+        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+        let mut without_one = 0;
+        for seed in 0..60u64 {
+            let mut playlist = playlist_seeded(&entries, 0.0, true, seed);
+            for _ in 0..entries.len() {
+                match playlist.current_palette {
+                    Some(name) => *seen.entry(name.to_string()).or_default() += 1,
+                    None => without_one += 1,
+                }
+                playlist.step_to_next();
+            }
+        }
+
+        assert!(
+            seen.len() > 1,
+            "every shuffled effect got the same palette across 60 seeds, so the \
+             shuffle is not reaching the palette: {seen:?}"
+        );
+        // And the effects with no pool are not being handed one, which is the
+        // half that would be a regression rather than a missing feature.
+        assert!(
+            without_one > 0,
+            "every effect reported a palette, so effects with no pool are being \
+             given one: {seen:?}"
+        );
+    }
+
+    /// The palette comes from the effect's own pool, and an effect with an empty
+    /// pool has none to draw from.
+    ///
+    /// This is the failure a single shared pool would have: `ink` indexing a
+    /// multi-hue ramp ends on amber where the field is supposed to end on white,
+    /// and a brightness consumer handed `contrast` has no interior shading to
+    /// show at all. It also pins the pool to the setter, which are two lists that
+    /// would otherwise drift apart silently.
+    #[test]
+    fn every_shuffled_palette_comes_from_that_effect_s_own_pool() {
+        let mut config = Config::default();
+        let mut with_a_pool = 0;
+        for id in EffectId::all() {
+            let pool = id.spec().shuffle_palettes;
+            if pool.is_empty() {
+                assert!(
+                    config.palette_of(id).is_none(),
+                    "{id:?} has an empty shuffle pool but does have a palette \
+                     option, so a name could be drawn for it and set nowhere"
+                );
+                continue;
+            }
+            with_a_pool += 1;
+            for name in pool {
+                config.set_palette(id, name);
+                assert_eq!(
+                    config.palette_of(id),
+                    Some(*name),
+                    "{id:?} has {name} in its shuffle pool but setting it did not \
+                     take, so the pool and the setter have drifted apart"
+                );
+            }
+        }
+        assert_eq!(
+            with_a_pool, 7,
+            "the number of effects with a palette to shuffle changed; the pool \
+             table has not been updated to match"
+        );
+    }
+
+    /// Every name in every pool resolves against the table its effect reads.
+    ///
+    /// A typo in a pool is otherwise invisible: the effect falls back to its
+    /// default on an unrecognised name, so a misspelt palette would look like a
+    /// shuffle that quietly did nothing for that effect.
+    #[test]
+    fn every_palette_in_every_pool_resolves() {
+        for id in EffectId::all() {
+            for name in id.spec().shuffle_palettes {
+                if id == EffectId::Ink {
+                    assert!(
+                        crate::ink::FIELD_PALETTES
+                            .iter()
+                            .any(|(candidate, _)| *candidate == *name),
+                        "ink's pool has {name:?}, which is not in FIELD_PALETTES"
+                    );
+                } else {
+                    assert!(
+                        crate::render::palette::presets::by_name(name).is_some(),
+                        "{id:?}'s pool has {name:?}, which is not a named ramp"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `--seed N` pins the palettes, not only the order.
+    ///
+    /// The shuffle order was reproducible and the colours were not, which is the
+    /// same bug the order had once: a `--seed N --shuffle` run that looks the
+    /// same twice is the whole promise of the flag.
+    #[test]
+    fn a_seeded_palette_shuffle_reproduces() {
+        let entries: Vec<(&str, Option<f32>)> =
+            EffectId::all().map(|id| (id.as_str(), None)).collect();
+        let palettes_of = |seed: u64| {
+            let mut playlist = playlist_seeded(&entries, 0.0, true, seed);
+            let mut seen = Vec::new();
+            for _ in 0..entries.len() {
+                seen.push((
+                    playlist.current_id().as_str().to_string(),
+                    playlist.current_palette,
+                ));
+                playlist.step_to_next();
+            }
+            seen
+        };
+        assert_eq!(
+            palettes_of(7),
+            palettes_of(7),
+            "two runs at the same seed chose different palettes, so --seed does \
+             not pin the colours"
+        );
+        assert_ne!(
+            palettes_of(7),
+            palettes_of(8),
+            "seeds 7 and 8 chose the same palettes, so the palette draw is not \
+             reaching the seed"
+        );
+    }
+
+    /// Sequential mode leaves every effect on the palette the config asked for.
+    ///
+    /// The flag is `shuffle`; a run without it has to look exactly as it did
+    /// before this feature existed, or `--playlist` has become a way to lose a
+    /// deliberate choice.
+    #[test]
+    fn a_sequential_playlist_keeps_the_configured_palette() {
+        let mut config = Config::default();
+        config.set_palette(EffectId::Ants, "ember");
+        let options = PlaylistOptions {
+            seed: 3,
+            effects: vec![
+                PlaylistEntry {
+                    effect: "ants".to_string(),
+                    duration: None,
+                },
+                PlaylistEntry {
+                    effect: "donut".to_string(),
+                    duration: None,
+                },
+            ],
+            transition: 0.0,
+            shuffle: false,
+        };
+        let mut playlist = Playlist::new(options, config.clone(), (40, 12));
+
+        for _ in 0..6 {
+            assert_eq!(
+                playlist.current_palette,
+                None,
+                "{} was given a palette in sequential mode",
+                playlist.current_id().as_str()
+            );
+            playlist.step_to_next();
+        }
+    }
+
+    /// Shuffle mode replaces a palette the config pinned on purpose.
+    ///
+    /// Not an accident, and the reason it is worth a test: the alternative --
+    /// honouring an explicit config -- is what most people would expect and is
+    /// strictly more code, because `palette` is a `String` with no way to say
+    /// "unset" short of comparing against each effect's shipped default. Once
+    /// decided, the decision needs pinning or a later well-meaning change passes
+    /// silently.
+    #[test]
+    fn shuffle_overrides_a_configured_palette() {
+        let entries: Vec<(&str, Option<f32>)> =
+            EffectId::all().map(|id| (id.as_str(), None)).collect();
+        let mut ever_ember = 0;
+        for seed in 0..80u64 {
+            let mut playlist = playlist_seeded(&entries, 0.0, true, seed);
+            for _ in 0..entries.len() {
+                if playlist.current_palette == Some("ember") {
+                    ever_ember += 1;
+                }
+                playlist.step_to_next();
+            }
+        }
+        assert!(
+            ever_ember > 0,
+            "no shuffled effect was ever given `ember`, so the draw is not \
+             reaching past the effect's configured default"
+        );
+    }
+
+    /// An effect with no pool consumes nothing from the palette stream.
+    ///
+    /// The palette draw runs off its own generator rather than `bag_rng`, so it
+    /// cannot move the effect *order* at all. But it can still make the palette
+    /// *sequence* depend on which effects a playlist happened to contain: if
+    /// `newton` drew a number and threw it away, then adding a `newton` to a
+    /// playlist would shift every palette after it. So the draw has to leave a
+    /// no-pool effect's slot in the stream untouched, and that is a property of
+    /// the generator rather than something an end-to-end run can show -- two
+    /// playlists with different effect lists legitimately shuffle to different
+    /// orders, so the order cannot be compared across them.
+    #[test]
+    fn an_effect_with_no_pool_consumes_nothing() {
+        // Two generators from the same seed. One is asked to draw for an effect
+        // with no pool before it is read; the other is not touched. The next
+        // value each produces has to be the same number.
+        let mut skipped = seeded_rng(11, "playlist.palette");
+        let mut untouched = seeded_rng(11, "playlist.palette");
+
+        let mut config = Config::default();
+        assert_eq!(
+            Playlist::draw_palette(EffectId::Newton, &mut config, &mut skipped),
+            None,
+            "newton has a palette to shuffle, so this test is not testing what \
+             it says"
+        );
+        assert_eq!(
+            skipped.random_range(0..1_000_000),
+            untouched.random_range(0..1_000_000),
+            "a no-pool draw moved the palette stream, so every later effect's \
+             palette would depend on which palette-less effects a playlist holds"
+        );
+
+        // And an effect that *does* have a pool does consume, or the sequence
+        // would be constant. Compared on the stream position rather than on the
+        // names drawn: two draws landing on the same one of four ramps is a
+        // one-in-four coincidence, and a name comparison would therefore be
+        // flaky in exactly the direction that hides a reseed.
+        let first =
+            Playlist::draw_palette(EffectId::Ants, &mut config, &mut skipped);
+        let second =
+            Playlist::draw_palette(EffectId::Ants, &mut config, &mut skipped);
+        assert!(
+            first.is_some() && second.is_some(),
+            "ants has a palette to shuffle, so this test is not testing what it \
+             says"
+        );
+        assert_ne!(
+            skipped.random_range(0..1_000_000),
+            untouched.random_range(0..1_000_000),
+            "two draws for an effect that has a pool left the stream where it \
+             started, so the generator is being reseeded per effect"
+        );
+    }
+
     /// The opening draw is new code on a path that used to be a constant, and a
     /// single-entry list is the case where an off-by-one in it would panic
     /// rather than merely look wrong.

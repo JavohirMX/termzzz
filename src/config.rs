@@ -1,6 +1,7 @@
 use crate::common::DEFAULT_SEED;
 use crate::{
     ants::AntsOptions,
+    aquarium::AquariumOptions,
     blank::BlankOptions,
     boids::BoidsOptions,
     crab::CrabOptions,
@@ -20,6 +21,7 @@ use crate::{
     plasma::PlasmaOptions,
     playlist::PlaylistOptions,
     rain::digital_rain::DigitalRainOptions,
+    registry::EffectId,
     ripple::RippleOptions,
     solarsystem::SolarSystemOptions,
     terrain::TerrainOptions,
@@ -192,6 +194,7 @@ pub struct Config {
     pub physarum: PhysarumOptions,
     pub ripple: RippleOptions,
     pub newton: NewtonOptions,
+    pub aquarium: AquariumOptions,
     pub playlist: PlaylistOptions,
 }
 
@@ -376,8 +379,58 @@ impl Config {
         self.newton.clone()
     }
 
+    pub fn get_aquarium_options(&self) -> AquariumOptions {
+        self.aquarium.clone()
+    }
+
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
+    }
+
+    /// Sets the palette of whichever section belongs to `id`.
+    ///
+    /// Written out arm by arm for the same reason `override_seed` is: a helper
+    /// that quietly skipped a section would leave that effect on its old colours
+    /// while appearing to work. The match is exhaustive, so an effect that gains
+    /// a `palette` field fails to compile here rather than at runtime.
+    ///
+    /// The name is not validated against a table. Each effect already resolves
+    /// its own string against its own table -- and those are not the same table,
+    /// which is the reason [`crate::registry::EffectSpec::shuffle_palettes`] is
+    /// per-effect -- so assigning is the whole of the job.
+    pub fn set_palette(&mut self, id: EffectId, name: &str) {
+        match id {
+            EffectId::Ripple => self.ripple.palette = name.to_string(),
+            EffectId::Physarum => self.physarum.palette = name.to_string(),
+            EffectId::Donut => self.donut.palette = name.to_string(),
+            EffectId::Mandelbrot => self.mandelbrot.palette = name.to_string(),
+            EffectId::Ink => self.ink.palette = name.to_string(),
+            EffectId::Flyover => self.flyover.palette = name.to_string(),
+            EffectId::Ants => self.ants.palette = name.to_string(),
+            // No palette option, so nothing to set. `newton` is here on purpose
+            // and for a different reason than the rest: it colours by which root
+            // a sample converges to, so a ramp name has no meaning for it.
+            _ => {}
+        }
+    }
+
+    /// The palette currently configured for `id`, or `None` if it has none.
+    ///
+    /// The reader half of [`set_palette`](Self::set_palette), and what lets a
+    /// test pin the two against each other and against
+    /// [`crate::registry::EffectSpec::shuffle_palettes`] -- three lists that have
+    /// to agree and would otherwise drift apart silently.
+    pub fn palette_of(&self, id: EffectId) -> Option<&str> {
+        match id {
+            EffectId::Ripple => Some(&self.ripple.palette),
+            EffectId::Physarum => Some(&self.physarum.palette),
+            EffectId::Donut => Some(&self.donut.palette),
+            EffectId::Mandelbrot => Some(&self.mandelbrot.palette),
+            EffectId::Ink => Some(&self.ink.palette),
+            EffectId::Flyover => Some(&self.flyover.palette),
+            EffectId::Ants => Some(&self.ants.palette),
+            _ => None,
+        }
     }
 
     /// Overrides the seed of every section that has one.
@@ -414,6 +467,7 @@ impl Config {
         self.physarum.seed = seed;
         self.ripple.seed = seed;
         self.newton.seed = seed;
+        self.aquarium.seed = seed;
         // The playlist order, not just the pictures. Without this,
         // `--seed N --shuffle` reproduced the effects and not their order.
         self.playlist.seed = seed;
@@ -516,6 +570,9 @@ impl Config {
         if self.newton.seed == DEFAULT_SEED {
             self.newton.seed = draw();
         }
+        if self.aquarium.seed == DEFAULT_SEED {
+            self.aquarium.seed = draw();
+        }
         if self.playlist.seed == DEFAULT_SEED {
             self.playlist.seed = draw();
         }
@@ -551,6 +608,7 @@ impl Default for Config {
             physarum: PhysarumOptions::default(),
             ripple: RippleOptions::default(),
             newton: NewtonOptions::default(),
+            aquarium: AquariumOptions::default(),
             playlist: PlaylistOptions::default(),
         }
     }

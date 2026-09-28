@@ -1,4 +1,5 @@
 use crate::ants::Ants;
+use crate::aquarium::Aquarium;
 use crate::blank::Blank;
 use crate::boids::Boids;
 use crate::buffer::Cell;
@@ -52,6 +53,7 @@ pub enum EffectId {
     Physarum,
     Ripple,
     Newton,
+    Aquarium,
 }
 
 /// Everything the CLI needs to know about an effect, in one place.
@@ -76,7 +78,49 @@ pub struct EffectSpec {
     pub needs_mouse: bool,
     /// Key of this effect's section in the config file.
     pub config_section: &'static str,
+    /// The palettes shuffle mode may draw from for this effect.
+    ///
+    /// Empty for an effect that takes no palette at all, and that is the *only*
+    /// kind of empty: the effects with no `palette` option, and `newton`, which
+    /// has one conceptually and not as a config field. Newton colours by *which
+    /// root* a sample converges to, built from an OKLab wheel so hue and
+    /// lightness are independent -- picking a ramp out of a table would replace
+    /// the thing the effect encodes rather than restyle it.
+    ///
+    /// Not every effect reads a ramp the same way, which is why this is a
+    /// per-effect list rather than one shared pool. See the constants below.
+    pub shuffle_palettes: &'static [&'static str],
 }
+
+/// Every named ramp, for a consumer that *cycles* through it.
+///
+/// `mandelbrot` is the only one, because it is the only one that wraps: it
+/// samples its ramp with the cycling sampler, so a ramp that climbs back down
+/// is what it wants and any of them suits it.
+const CYCLING_PALETTES: &[&str] = &["depth", "ember", "ocean", "magma", "contrast"];
+
+/// Every named ramp except `contrast`, for a consumer that reads a ramp as a
+/// *brightness scale* and stops at the top.
+///
+/// `contrast` is excluded because its own note calls it "a pure boundary map
+/// with no interior shading". As a cycling ramp that is exactly right -- the
+/// boundaries are the picture. As a brightness scale it has nothing between its
+/// two extremes, so an effect that exists to show veins, crests, a trail or
+/// depth fog would show two flat regions instead.
+///
+/// `donut` is in this group, so shuffle mode will not reach its `contrast` path.
+/// That path is deliberate and documented at `donut_colors` -- a floor-to-white
+/// two-tone torus is a legitimate thing to ask for -- so if you want it in the
+/// shuffle, `donut` is a one-line change to this list.
+const SHADED_PALETTES: &[&str] = &["depth", "ember", "ocean", "magma"];
+
+/// The single-hue brightness ramps, for `ink`.
+///
+/// A separate table because `ink` indexes a ramp by field value and stops at the
+/// top, so its ramps have to end on white -- which none of the multi-hue ones
+/// do. It is why a user who typed `palette = "ember"` there would get a field
+/// that is supposed to end on white and ends on amber instead.
+const FIELD_PALETTES: &[&str] = &["green", "orange", "blue", "magenta"];
 
 pub static EFFECT_SPECS: &[EffectSpec] = &[
     EffectSpec {
@@ -86,6 +130,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 15.0,
         needs_mouse: false,
         config_section: "matrix",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Life,
@@ -94,6 +139,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 20.0,
         needs_mouse: false,
         config_section: "life",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Mandelbrot,
@@ -102,6 +148,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 20.0,
         needs_mouse: false,
         config_section: "mandelbrot",
+        shuffle_palettes: CYCLING_PALETTES,
     },
     EffectSpec {
         id: EffectId::Maze,
@@ -110,6 +157,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 20.0,
         needs_mouse: false,
         config_section: "maze",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Boids,
@@ -123,6 +171,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         // interactive in exactly one of the three ways it can be run.
         needs_mouse: true,
         config_section: "boids",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Blank,
@@ -131,6 +180,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 2.0,
         needs_mouse: false,
         config_section: "blank",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Cube,
@@ -139,6 +189,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 18.0,
         needs_mouse: false,
         config_section: "cube",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Crab,
@@ -147,6 +198,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 15.0,
         needs_mouse: false,
         config_section: "crab",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Donut,
@@ -155,6 +207,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 18.0,
         needs_mouse: false,
         config_section: "donut",
+        shuffle_palettes: SHADED_PALETTES,
     },
     EffectSpec {
         id: EffectId::Dvd,
@@ -163,6 +216,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 12.0,
         needs_mouse: false,
         config_section: "dvd",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Pipes,
@@ -171,6 +225,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 15.0,
         needs_mouse: false,
         config_section: "pipes",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Plasma,
@@ -179,6 +234,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 15.0,
         needs_mouse: false,
         config_section: "plasma",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Fire,
@@ -187,6 +243,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 12.0,
         needs_mouse: false,
         config_section: "fire",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::SolarSystem,
@@ -195,6 +252,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 20.0,
         needs_mouse: false,
         config_section: "solarsystem",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Ink,
@@ -209,6 +267,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 20.0,
         needs_mouse: true,
         config_section: "ink",
+        shuffle_palettes: FIELD_PALETTES,
     },
     EffectSpec {
         id: EffectId::Terrain,
@@ -217,6 +276,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 4.0,
         needs_mouse: false,
         config_section: "terrain",
+        shuffle_palettes: &[],
     },
     EffectSpec {
         id: EffectId::Ants,
@@ -229,6 +289,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 30.0,
         needs_mouse: false,
         config_section: "ants",
+        shuffle_palettes: SHADED_PALETTES,
     },
     EffectSpec {
         id: EffectId::Flyover,
@@ -237,6 +298,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 25.0,
         needs_mouse: false,
         config_section: "flyover",
+        shuffle_palettes: SHADED_PALETTES,
     },
     EffectSpec {
         id: EffectId::Physarum,
@@ -245,6 +307,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 30.0,
         needs_mouse: false,
         config_section: "physarum",
+        shuffle_palettes: SHADED_PALETTES,
     },
     EffectSpec {
         id: EffectId::Ripple,
@@ -253,6 +316,7 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 20.0,
         needs_mouse: false,
         config_section: "ripple",
+        shuffle_palettes: SHADED_PALETTES,
     },
     EffectSpec {
         id: EffectId::Newton,
@@ -267,6 +331,28 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         default_duration: 25.0,
         needs_mouse: false,
         config_section: "newton",
+        shuffle_palettes: &[],
+    },
+    EffectSpec {
+        id: EffectId::Aquarium,
+        // "A fish tank" and not a list of contents. Every entry here names the
+        // thing on screen, and "fish" names what is *in* the scene rather than the
+        // scene itself -- and the scene is the part that makes it read. The
+        // description carries the two cues that do the work, because neither is
+        // guessable from a fish sprite: the depth shading and the light from above.
+        name: "aquarium",
+        description: "A fish tank: shoaling fish, depth shading, light from above",
+        default_duration: 30.0,
+        // Drops a flake of food where you click and the shoal goes for it. Same
+        // reason as `boids` and `ink`: capture is enabled from the *playlist's* own
+        // effects, so a playlist of `aquarium` alone has to turn it on or the effect
+        // is interactive in exactly one of the three ways it can be run.
+        needs_mouse: true,
+        config_section: "aquarium",
+        // It owns three colours -- surface, deep and gravel -- rather than naming a
+        // preset, and they have to move together to keep the gradient monotonic, so
+        // there is nothing here for shuffle mode to draw from.
+        shuffle_palettes: &[],
     },
 ];
 
@@ -367,6 +453,7 @@ pub enum AnyEffect {
     Physarum(Physarum),
     Ripple(Ripple),
     Newton(Newton),
+    Aquarium(Aquarium),
 }
 
 impl AnyEffect {
@@ -393,6 +480,7 @@ impl AnyEffect {
             Self::Physarum(_) => EffectId::Physarum,
             Self::Ripple(_) => EffectId::Ripple,
             Self::Newton(_) => EffectId::Newton,
+            Self::Aquarium(_) => EffectId::Aquarium,
         }
     }
 
@@ -472,6 +560,10 @@ impl AnyEffect {
             EffectId::Newton => {
                 Self::Newton(Newton::new(config.get_newton_options(), screen_size))
             }
+            EffectId::Aquarium => Self::Aquarium(Aquarium::new(
+                config.get_aquarium_options(),
+                screen_size,
+            )),
         }
     }
 }
@@ -558,6 +650,7 @@ impl_terminal_effect_for_any!(
     Physarum,
     Ripple,
     Newton,
+    Aquarium,
 );
 
 #[cfg(test)]
@@ -592,6 +685,7 @@ mod tests {
         EffectId::Physarum,
         EffectId::Ripple,
         EffectId::Newton,
+        EffectId::Aquarium,
     ];
 
     #[test]

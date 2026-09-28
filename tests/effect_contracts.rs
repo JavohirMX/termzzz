@@ -412,6 +412,69 @@ fn every_effect_has_a_config_section() {
     }
 }
 
+/// Every effect that takes a palette actually uses the name it is given.
+///
+/// The chain shuffle mode depends on is three links -- the name resolves against
+/// a table, `Config::set_palette` stores it, and the effect reads it -- and the
+/// first two are cheap to get right and the third is the one that matters. Each
+/// of these effects falls back to its default on a name it does not recognise,
+/// so a palette that was accepted, stored, and then ignored looks exactly like a
+/// shuffle that quietly did nothing.
+///
+/// Compared on the *rendered frame* rather than on any internal field, because
+/// the internal field is the thing under suspicion.
+#[test]
+fn a_palette_name_reaches_the_pixels() {
+    let size = (60u16, 20u16);
+    let frames = 24u64;
+
+    let render = |id: EffectId, palette: &str| {
+        let mut config = Config::default();
+        config.set_palette(id, palette);
+
+        let mut effect = AnyEffect::build(id, &config, size);
+        let mut input = termzzz::runtime::InputState::default();
+        input.set_size(size);
+
+        // Accumulated rather than the last diff, for the reason the seed test
+        // gives: a slow effect changes few cells on any one frame, and a frame
+        // that changes nothing would make two palettes look identical.
+        let mut drawn: BTreeMap<(usize, usize), Cell> = BTreeMap::new();
+        for frame in 0..frames {
+            let step = termzzz::runtime::FrameContext::new(
+                size,
+                frame,
+                Duration::from_secs_f64(frame as f64 / 60.0),
+                Duration::from_secs_f64(1.0 / 60.0),
+                input.clone(),
+            );
+            for (x, y, cell) in effect.get_diff_with_context(&step) {
+                drawn.insert((x, y), cell);
+            }
+            effect.update_with_context(&step);
+        }
+        drawn
+    };
+
+    for id in EffectId::all() {
+        let pool = id.spec().shuffle_palettes;
+        if pool.len() < 2 {
+            continue;
+        }
+        let first = render(id, pool[0]);
+        let second = render(id, pool[1]);
+        assert_ne!(
+            first,
+            second,
+            "{} renders identically for {} and {}, so the palette name is not \
+             reaching the simulation or the render",
+            id.as_str(),
+            pool[0],
+            pool[1]
+        );
+    }
+}
+
 // --- runtime contract: smoke ---------------------------------------------
 
 /// The terminal clamps effect size to `MIN_EFFECT_SIZE`, so 6x6 is the real
