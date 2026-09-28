@@ -618,7 +618,7 @@ mod tests {
         // A tripwire on the catalogue's size, and deliberately hardcoded: adding an
         // effect should fail here, where the sentence says so, rather than being
         // discovered by a wrap-around test that quietly still passes.
-        assert_eq!(EffectId::all().count(), 20, "the catalogue changed size");
+        assert_eq!(EffectId::all().count(), 21, "the catalogue changed size");
     }
 
     /// The last effect in cycle order, which is what `p` from the first wraps to.

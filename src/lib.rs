@@ -70,6 +70,7 @@ pub mod registry;
 pub mod render;
 pub mod ripple;
 pub mod runtime;
+pub mod sandpile;
 pub mod session;
 pub mod solarsystem;
 pub mod terrain;

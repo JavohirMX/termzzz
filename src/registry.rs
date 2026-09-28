@@ -20,6 +20,7 @@ use crate::plasma::Plasma;
 use crate::rain::digital_rain::DigitalRain;
 use crate::ripple::Ripple;
 use crate::runtime::{FrameContext, InputEvent};
+use crate::sandpile::Sandpile;
 use crate::solarsystem::SolarSystem;
 use crate::terrain::Terrain;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ pub enum EffectId {
     Flyover,
     Physarum,
     Ripple,
+    Sandpile,
 }
 
 /// Everything the CLI needs to know about an effect, in one place.
@@ -252,6 +254,18 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         needs_mouse: false,
         config_section: "ripple",
     },
+    EffectSpec {
+        id: EffectId::Sandpile,
+        // Named for the model rather than described. "Avalanche" would sell the
+        // visual and hide the reason it never repeats, which is that avalanche
+        // size is heavy-tailed -- the next drop is four topples or four thousand
+        // and there is no telling which in advance.
+        name: "sandpile",
+        description: "Abelian sandpile avalanches, size following a power law",
+        default_duration: 25.0,
+        needs_mouse: false,
+        config_section: "sandpile",
+    },
 ];
 
 impl EffectId {
@@ -350,6 +364,7 @@ pub enum AnyEffect {
     Flyover(Flyover),
     Physarum(Physarum),
     Ripple(Ripple),
+    Sandpile(Sandpile),
 }
 
 impl AnyEffect {
@@ -375,6 +390,7 @@ impl AnyEffect {
             Self::Flyover(_) => EffectId::Flyover,
             Self::Physarum(_) => EffectId::Physarum,
             Self::Ripple(_) => EffectId::Ripple,
+            Self::Sandpile(_) => EffectId::Sandpile,
         }
     }
 
@@ -451,6 +467,10 @@ impl AnyEffect {
             EffectId::Ripple => {
                 Self::Ripple(Ripple::new(config.get_ripple_options(), screen_size))
             }
+            EffectId::Sandpile => Self::Sandpile(Sandpile::new(
+                config.get_sandpile_options(),
+                screen_size,
+            )),
         }
     }
 }
@@ -536,6 +556,7 @@ impl_terminal_effect_for_any!(
     Flyover,
     Physarum,
     Ripple,
+    Sandpile,
 );
 
 #[cfg(test)]
@@ -569,6 +590,7 @@ mod tests {
         EffectId::Flyover,
         EffectId::Physarum,
         EffectId::Ripple,
+        EffectId::Sandpile,
     ];
 
     #[test]
