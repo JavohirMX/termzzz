@@ -11,6 +11,125 @@ two of its entries — a terminal background setting and a solar system — are 
 only genuinely new features here.
 
 ### Added
+- **Four effects, chosen to fill gaps in the *catalogue* rather than in a
+  renderer.** Sixteen effects had between them no world, no automaton other than
+  Conway's, nothing that propagated across the screen, and nothing where agents
+  collectively built a structure. Each of these is a kind of thing the other
+  sixteen are not, which is the test they were picked by.
+
+  - **`flyover`** — first-person flight over a fractal height field, in braille at
+    2x4. `terrain` shows a landscape from the side and `cube`/`donut` are single
+    objects; this is a camera in a world. One ray is marched per dot *column* and
+    the surface recorded per *row*, rather than per pixel, which is what makes a
+    perspective view of a height field affordable: 800 columns and about 28 noise
+    samples each, measured at 1.47 ms of a 2.43 ms render on a 400x200 terminal.
+
+    Three things about the camera were wrong before they were right, and none of
+    them is caught by a test of the shape. `up` was `right × forward` and so
+    pointed at the ground. The roll rotated in the wrong plane, turning the view
+    sideways rather than banking it. And the pitch was added to the frame centre
+    *and* carried in the camera's basis, counting it twice. Separately, the first
+    march returned the highest point the ray touched — the standard heightfield
+    silhouette, and always off the bottom of the frame, because a camera flying
+    eleven units above the ground cannot see the ground under it. Every column
+    reported empty and the effect drew a blank screen.
+    `a_point_projects_to_the_row_the_projection_says` recomputes the projection by
+    hand from the definition, and is what holds that line.
+
+    `relief` is calibrated against a measured noise range rather than divided by
+    one. Perlin's spec sheet says an octave spans `-1..1`; four octaves at these
+    settings span 1.00 to 1.13 peak to peak across five seeds, so dividing by 1.0
+    would hand back half the height asked for and clip one end asymmetrically.
+    `the_noise_still_spans_the_calibrated_range` fails if the shared noise changes
+    underneath the constant.
+
+  - **`physarum`** — slime-mould agents: each senses a trail field at three
+    points, turns toward the strongest, deposits and advances, and the field
+    diffuses and fades. Nothing in the crate is a continuous-valued field that
+    agents collectively shape. In half-block, because the structure is a density
+    and colour comes free from a cell that already carries two.
+
+    **The sensor distance is the parameter that decides whether this works at
+    all**, which is not what a person tuning it would guess — they would reach for
+    the angle. Measured at 400x200 after 4,000 steps: at 1.5 cells the trail comes
+    out as a few hundred isolated worms; from about 9 up it is a network. The
+    reason is scale. The agents move one cell per step, so that is how many cells
+    ahead they can see, and too small a distance puts all three sensors inside one
+    trail cell where they read the same value and the turn is a coin flip. The
+    angle barely matters by comparison, and this file previously said the reverse.
+
+    `spread` is the second, and it is not what the name suggests. A full blur
+    spreads the trail about a cell per step, and since it lives for tens of steps
+    the veins merge into each other: measured, a full blur marks four percent of the
+    field as one solid component, which is a slab with a network inside it. The
+    shipped value is 0.10, and the marked cells are then under one percent of the
+    field with a boundary-to-area ratio near 0.9, which is what a vein looks like.
+    A test asserts *both*, because a slab and a network can each be a single
+    connected component over a similar area and connectivity alone cannot tell them
+    apart — an earlier version of that test reported "one component, 100%
+    connected" on a picture of three solid bands.
+
+  - **`ripple`** — the summed waves of two or three point sources, in half-block.
+    `fire`, `plasma` and `ink` are all field *sums* that sit still; nothing else in
+    the crate travels across the screen. The sine is an 8,192-entry table rather
+    than `f32::sin`, because a wave from a point source is `sin(k·√(dx²+dy²))` and
+    the root does not factor the way a `sin(a+b)` does. 480,000 calls a frame is
+    the same cost class as the plasma effect already at the top of this crate's
+    frame table. The table's accuracy test is what found that casting a negative
+    float to an integer saturates to zero in Rust, so every argument below minus
+    one turn read the table's first entry — and since the field is
+    `k·r - time + phase`, that is every pixel, and the descending half of every
+    wave was a flat wash. A test of the *shape* would not have caught it, because a
+    wrong scale still makes waves travel.
+
+  - **`ants`** — several Langton's ants on one board, so they read each other's
+    flips and wreck each other's highways. The multi-ant version is the effect; a
+    single ant is a ten-line toy. The grid is a **flip count** rather than a bit,
+    because the renderer wants the age of a trail and not only its colour, and the
+    turn reads the count's *parity*, since the ant toggles the cell. Reading the
+    turn off "has this cell ever been touched" is the obvious shortcut, and it
+    pins the ant in a four-by-four block after sixteen cells where it stays for
+    ever: measured, a diagonal run of 4 for ever, instead of one that grows from 40
+    cells at ten thousand steps to 211 at twenty thousand.
+
+    It is also by a wide margin the cheapest effect in the crate by output volume
+    — **1,105 bytes a frame at 400x200**, against the mandelbrot's 383,000 — for
+    the same reason `terrain` and `dvd` are: once its highway forms, the ant
+    retraces the cells it has already made, and a cell that does not change is not
+    written.
+- **The last two byte-volume problems in the crate turned out to be one problem,
+  and it is not the one it looks like.** The output path emits a colour only when
+  it differs from the last one it wrote, so a smoothly interpolated field is a
+  colour change in *every* cell.
+
+  `ripple` was emitting **2.79 MB of escape sequences a frame** — forty times the
+  mandelbrot's — and spending 4.83 ms encoding it. `physarum` was at 410 KB and
+  0.83 ms, the most expensive encode in the crate. Both are now **73 KB and 75 KB**,
+  with encodes of 0.14 ms and 0.16 ms.
+
+  The instructive part is that quantising the ramp was tried *first*, on the
+  reasoning that a continuous gradient is what defeats the style cache, and it
+  moved the byte count by four percent. The changes were coming from the **spatial
+  frequency of the pattern**, not from the depth of the ramp: a ring eleven cells
+  wide puts a colour step every two of them. Both matter and neither is sufficient
+  alone. `levels` is a documented option on both effects, because how many colours
+  a frame uses turns out to be a bandwidth question rather than a taste one.
+- **Clicking scatters the flock.** A click drops a shockwave into `boids`. The
+  wave travels outward from where you clicked and pushes the boids it passes
+  directly away from that point, drawn as a ring so you can see where it is and
+  how far it reaches. Dragging leaves a trail of them; simply moving the mouse
+  does nothing, because the runtime reports a hover and a drag identically and
+  the effect has to have been watching for the press to tell them apart.
+
+  The force is computed alongside the three flocking rules rather than written to
+  velocities afterwards, so it is damped and speed-clamped by the same code as
+  everything else. That is deliberate: a click is a disturbance, and it cannot
+  launch a boid faster than the simulation allows.
+
+  **One upgrade note.** `boids` is now registered as reading the mouse, so a
+  playlist that runs it will enable mouse capture where it did not before. If
+  you had a playlist of `boids` on its own and a terminal where capture is
+  unavailable, you will now see a warning on startup that was not there before.
 - **`--shuffle` shuffles properly, and `--seed` pins it.** The opening effect is
   now drawn from the same shuffled bag as every transition, so a shuffled
   playlist no longer always starts on its first entry. The order is seeded, so

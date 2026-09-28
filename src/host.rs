@@ -615,7 +615,19 @@ mod tests {
             host.next();
         }
         assert_eq!(host.id(), EffectId::Life, "the cycle did not wrap");
-        assert_eq!(EffectId::all().count(), 16, "the catalogue changed size");
+        // A tripwire on the catalogue's size, and deliberately hardcoded: adding an
+        // effect should fail here, where the sentence says so, rather than being
+        // discovered by a wrap-around test that quietly still passes.
+        assert_eq!(EffectId::all().count(), 20, "the catalogue changed size");
+    }
+
+    /// The last effect in cycle order, which is what `p` from the first wraps to.
+    ///
+    /// Read from the registry rather than written out. Three of these tests used
+    /// to name the last effect literally, so every effect added to the crate broke
+    /// a wrap-around assertion that had nothing to do with wrapping.
+    fn last_effect() -> EffectId {
+        EffectId::all().last().expect("the catalogue is not empty")
     }
 
     #[test]
@@ -628,7 +640,7 @@ mod tests {
         host.previous();
         assert_eq!(
             host.id(),
-            EffectId::Terrain,
+            last_effect(),
             "`p` from the first effect did not wrap to the last"
         );
 
@@ -933,7 +945,7 @@ mod tests {
         );
         assert_eq!(
             press(&mut host(EffectId::Life), &['p', 'p']),
-            EffectId::Terrain,
+            last_effect(),
             "`p` from the first effect did not wrap to the last"
         );
     }

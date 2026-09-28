@@ -17,11 +17,15 @@ Terminal screensavers and generative visual effects written in Rust.
 - Pipes
 - Plasma
 - Fire
-- Constellation
+- 3D solar system (`solarsystem`)
 - Terrain
 - Bouncing DVD logo (`dvd`)
 - Blank screen
 - Interactive generative field you pour ink into (`ink`)
+- Several Langton's ants sharing one board (`ants`)
+- First-person flight over a fractal height field (`flyover`)
+- Slime-mould agents building a transport network (`physarum`)
+- Interfering waves from a few point sources (`ripple`)
 
 ## Usage
 
@@ -40,6 +44,10 @@ termzzz fire
 termzzz plasma
 termzzz solarsystem
 termzzz terrain
+termzzz ants
+termzzz flyover
+termzzz physarum
+termzzz ripple
 termzzz blank
 termzzz ink
 ```
@@ -51,19 +59,34 @@ termzzz matrix --seed 1234
 termzzz --playlist matrix,dvd,plasma --seed 1234
 ```
 
-Omit `--seed` to get the default, which is the same every time. The seed can also
-be set per effect in the config file, for example `[matrix] seed = 7`.
+Leave `--seed` off and every effect draws a fresh seed at startup, so no two runs
+look the same. Pin one with `--seed` to reproduce a particular run, or per effect in
+the config file, for example `[matrix] seed = 7`.
 
 Press `q`, `Esc`, or `Ctrl+C` to exit. `+` and `-` change the global animation speed
 in every effect. `n` and `p` move to the next and previous effect, behind the same
 diagonal wipe the playlist uses, so you can walk the whole catalogue without
-restarting. In ink mode:
+restarting.
+
+Click in boids mode to scatter the flock. A click drops a shockwave that travels
+outward and pushes the boids it passes away from where you clicked; the ring is
+drawn, so you can see where the wave is and how far it reaches. Drag to leave a
+trail of them. Just moving the mouse does nothing — the flock only reacts to a
+button press. The flock closes up again afterwards, since the rules that hold it
+together are still running.
+
+In ink mode:
 
 - `r` reseeds the field
 - `Space` pauses and resumes the animation
 - `[` and `]` cycle glyph palettes
 - The mouse wheel resizes the pointer brush
 - Pointer movement temporarily brightens the field, then fades out
+
+Mouse capture is enabled for the whole session whenever the running effect (or any
+effect in the playlist) is one of the two that read it, so `n` can reach an
+interactive effect at any moment without the terminal having to be reconfigured
+mid-run.
 
 ### Speed
 

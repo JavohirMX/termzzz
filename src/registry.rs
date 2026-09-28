@@ -1,3 +1,4 @@
+use crate::ants::Ants;
 use crate::blank::Blank;
 use crate::boids::Boids;
 use crate::buffer::Cell;
@@ -8,13 +9,16 @@ use crate::cube::Cube;
 use crate::donut::Donut;
 use crate::dvd::Dvd;
 use crate::fire::Fire;
+use crate::flyover::Flyover;
 use crate::ink::AsciiField;
 use crate::life::ConwayLife;
 use crate::mandelbrot::Mandelbrot;
 use crate::maze::Maze;
+use crate::physarum::Physarum;
 use crate::pipes::Pipes;
 use crate::plasma::Plasma;
 use crate::rain::digital_rain::DigitalRain;
+use crate::ripple::Ripple;
 use crate::runtime::{FrameContext, InputEvent};
 use crate::solarsystem::SolarSystem;
 use crate::terrain::Terrain;
@@ -42,6 +46,10 @@ pub enum EffectId {
     SolarSystem,
     Ink,
     Terrain,
+    Ants,
+    Flyover,
+    Physarum,
+    Ripple,
 }
 
 /// Everything the CLI needs to know about an effect, in one place.
@@ -104,9 +112,14 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
     EffectSpec {
         id: EffectId::Boids,
         name: "boids",
-        description: "Boids flocking simulation",
+        description: "Boids flocking simulation, scattered by clicking",
         default_duration: 20.0,
-        needs_mouse: false,
+        // A click drops a shockwave into the flock, so this effect reads the
+        // mouse. Not optional bookkeeping: `main.rs` decides whether to enable
+        // capture from *the playlist's own effects*, so a playlist of `boids`
+        // alone would otherwise never enable it and the effect would be
+        // interactive in exactly one of the three ways it can be run.
+        needs_mouse: true,
         config_section: "boids",
     },
     EffectSpec {
@@ -203,6 +216,42 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         needs_mouse: false,
         config_section: "terrain",
     },
+    EffectSpec {
+        id: EffectId::Ants,
+        name: "ants",
+        // "Langton's ants" rather than "Langton's ant": the effect is several of
+        // them on one board, and the whole point of that is that they read each
+        // other's flips and wreck each other's highways. Naming it in the singular
+        // would describe a ten-line effect that is not this one.
+        description: "Several Langton's ants sharing one board",
+        default_duration: 30.0,
+        needs_mouse: false,
+        config_section: "ants",
+    },
+    EffectSpec {
+        id: EffectId::Flyover,
+        name: "flyover",
+        description: "First-person flight over a fractal height field",
+        default_duration: 25.0,
+        needs_mouse: false,
+        config_section: "flyover",
+    },
+    EffectSpec {
+        id: EffectId::Physarum,
+        name: "physarum",
+        description: "Slime-mould agents building a transport network",
+        default_duration: 30.0,
+        needs_mouse: false,
+        config_section: "physarum",
+    },
+    EffectSpec {
+        id: EffectId::Ripple,
+        name: "ripple",
+        description: "Interfering waves from a few point sources",
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "ripple",
+    },
 ];
 
 impl EffectId {
@@ -297,6 +346,10 @@ pub enum AnyEffect {
     SolarSystem(SolarSystem),
     Ink(AsciiField),
     Terrain(Terrain),
+    Ants(Ants),
+    Flyover(Flyover),
+    Physarum(Physarum),
+    Ripple(Ripple),
 }
 
 impl AnyEffect {
@@ -318,6 +371,10 @@ impl AnyEffect {
             Self::SolarSystem(_) => EffectId::SolarSystem,
             Self::Ink(_) => EffectId::Ink,
             Self::Terrain(_) => EffectId::Terrain,
+            Self::Ants(_) => EffectId::Ants,
+            Self::Flyover(_) => EffectId::Flyover,
+            Self::Physarum(_) => EffectId::Physarum,
+            Self::Ripple(_) => EffectId::Ripple,
         }
     }
 
@@ -379,6 +436,21 @@ impl AnyEffect {
                 config.get_terrain_options(),
                 screen_size,
             )),
+            EffectId::Ants => Self::Ants(Ants::new(
+                config.get_ants_options(screen_size),
+                screen_size,
+            )),
+            EffectId::Flyover => Self::Flyover(Flyover::new(
+                config.get_flyover_options(),
+                screen_size,
+            )),
+            EffectId::Physarum => Self::Physarum(Physarum::new(
+                config.get_physarum_options(screen_size),
+                screen_size,
+            )),
+            EffectId::Ripple => {
+                Self::Ripple(Ripple::new(config.get_ripple_options(), screen_size))
+            }
         }
     }
 }
@@ -460,6 +532,10 @@ impl_terminal_effect_for_any!(
     SolarSystem,
     Ink,
     Terrain,
+    Ants,
+    Flyover,
+    Physarum,
+    Ripple,
 );
 
 #[cfg(test)]
@@ -489,6 +565,10 @@ mod tests {
         EffectId::SolarSystem,
         EffectId::Ink,
         EffectId::Terrain,
+        EffectId::Ants,
+        EffectId::Flyover,
+        EffectId::Physarum,
+        EffectId::Ripple,
     ];
 
     #[test]

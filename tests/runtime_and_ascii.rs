@@ -114,6 +114,10 @@ fn every_seeded_effect_gets_its_own_random_seed() {
         config.cube.seed,
         config.donut.seed,
         config.plasma.seed,
+        config.ants.seed,
+        config.flyover.seed,
+        config.physarum.seed,
+        config.ripple.seed,
     ];
     for (name, seed) in [
         ("boids", seeds[0]),
@@ -130,6 +134,10 @@ fn every_seeded_effect_gets_its_own_random_seed() {
         ("cube", seeds[11]),
         ("donut", seeds[12]),
         ("plasma", seeds[13]),
+        ("ants", seeds[14]),
+        ("flyover", seeds[15]),
+        ("physarum", seeds[16]),
+        ("ripple", seeds[17]),
     ] {
         assert_ne!(seed, DEFAULT_SEED, "{name} was left on the default seed");
     }
@@ -1634,9 +1642,16 @@ fn the_frame_loop_switches_effects_on_n_and_p() {
         "`p` did not step back"
     );
     // And from the first effect it has to wrap round to the last.
+    //
+    // Asked of the registry rather than named. It used to say `Terrain`, so every
+    // effect added to the crate broke a wrap-around assertion that had nothing to
+    // do with wrapping -- three times now, in two different files.
+    let last = EffectId::all()
+        .last()
+        .expect("the effect catalogue is not empty");
     assert_eq!(
         run(vec![press('p'), press('p')]),
-        EffectId::Terrain,
+        last,
         "`p` from the first effect did not wrap to the last"
     );
 }

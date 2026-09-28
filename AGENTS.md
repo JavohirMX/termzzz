@@ -58,7 +58,7 @@ cargo clippy       # Run linter
 
 ## Project Status
 - **Version**: 0.2.0
-- **Effects**: 16 screensavers and visual effects, plus a playlist mode
+- **Effects**: 20 screensavers and visual effects, plus a playlist mode
 - **Platforms**: macOS and Linux
 - **Configuration**: `~/.config/termzzz.toml`
 
@@ -92,6 +92,17 @@ Open engineering work, in priority order:
    believing one — a single run of it read 2.50 ms for this row against 2.01 ms
    on the next two, which is contention from the release build in the same
    command and not a property of the effect.
+   **`flyover` is now over it too, at 2.86 ms and 351 KB**, and unlike the
+   others that is a landscape render rather than a pathological case. Splitting
+   the render by phase: the ray march is 1.47 ms of it, at 800 dot columns and
+   about 28 noise samples each; the tile transpose, the braille dither and the
+   per-cell paint are 0.96 ms between them, and the rest is the canvas diff. Two attempts to improve it failed and both are worth
+   knowing about, because they were confident and wrong: a tiled transpose for the
+   scattered writes changed nothing, and an `exp` lookup table for the fog changed
+   nothing either. The march is the cost and the only levers on it are the step
+   growth and the draw distance. `ants`, `physarum` and `ripple` all came in
+   *under* budget, so the gate is not simply worse than it was — it is one more
+   row on a list that was already red.
    `terrain` is at 373 µs and 16 KB at 400x200, from 1.3 ms and 554 KB before the
    height-field rewrite — because the surface costs one noise sample per column
    rather than per cell, and unchanged sky cells drop out of the diff
@@ -100,7 +111,53 @@ Open engineering work, in priority order:
    reaction-diffusion want half-block (smooth colour). Each is roughly 150-350
    lines now that the renderer exists. Note that `cell.bg` only reached the
    terminal very recently, so half-block work is the first thing to have actually
-   exercised that path
+   exercised that path.
+
+   **Partly done, and the two that landed changed the shape of the question.**
+   `physarum` shipped, along with `flyover` (braille), `ripple` (half-block) and
+   `ants` (cell grid). What that round established is that the renderer is not
+   what decides which effect is cheap, and the four things below are worth more
+   than the remaining list of names.
+
+   - **How many colours a frame uses is a bandwidth setting, not a taste one.**
+     The encoder emits a colour only when it differs from the last one written, so
+     a smoothly interpolated field is a colour change in every cell. `ripple` was
+     emitting 2.79 MB a frame and `physarum` 410 KB, and they are now 73 KB and
+     75 KB. `ripple` also had to be made a *coarser pattern* — its first wave
+     number put a ring every eleven cells, which is a colour step every two of
+     them. **Quantising the ramp alone moved the byte count four percent**, which
+     is the number to remember: the changes were coming from the spatial frequency,
+     not the depth of the ramp. Both are now documented options (`levels`).
+
+   - **A model with a scale in it has one parameter that decides whether it
+     works, and it is not the one you reach for.** Physarum's sensor *distance* is
+     decisive — 1.5 cells gives isolated worms, 9 gives a network — because the
+     agents move one cell per step and that is how far ahead they can see. The
+     sensor *angle*, which every reference document leads with, barely matters.
+     Sweep it and write down what you measured, because the intuition about which
+     knob matters was wrong here and would have been again.
+
+   - **A model that grows structure needs a measure that cannot be satisfied by
+     its opposite.** Physarum's test wants to know it built a network; a slab and
+     a network can each be one connected component over a similar area, so
+     connectivity said "100% connected" about a picture of three solid bands. The
+     boundary-to-area ratio is what tells them apart, and coverage is the second
+     half. Both are asserted, and the first version of that test is written up in
+     the test's own comment because it is the clearest example in the crate of a
+     metric agreeing with a broken picture.
+
+   - **Where a walk can go, the highest point is often off-screen.** Flyover's
+     march returned the highest point its ray touched, which is the standard
+     heightfield silhouette, and it is *always* below the last row: a camera flying
+     eleven units above the ground cannot see the ground under it. Every column
+     reported empty. What a height field wants is the *profile* — the depth at each
+     row — and the per-row table is also what the fog needs. Three of flyover's
+     camera bugs (`up` was `right × forward`, the roll rotated in the wrong plane,
+     the pitch was counted twice) drew plausible pictures or none, and none of
+     them is visible to a test of the shape. Recompute the projection by hand from
+     the definition in a test; that is the only thing that catches it.
+
+   Still on the list, unchanged: `starfield`, `flow`, and Gray-Scott.
 
 The output path was rebuilt recently and is worth knowing before touching it. It
 does not use crossterm's `PrintStyledContent`, because that emits the attributes

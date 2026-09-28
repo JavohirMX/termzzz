@@ -1,5 +1,6 @@
 use crate::common::DEFAULT_SEED;
 use crate::{
+    ants::AntsOptions,
     blank::BlankOptions,
     boids::BoidsOptions,
     crab::CrabOptions,
@@ -8,14 +9,17 @@ use crate::{
     dvd::DvdOptions,
     error::{ConfigError, Result, TermzzzError},
     fire::FireOptions,
+    flyover::FlyoverOptions,
     ink::AsciiFieldOptions,
     life::ConwayLifeOptions,
     mandelbrot::MandelbrotOptions,
     maze::MazeOptions,
+    physarum::PhysarumOptions,
     pipes::PipesOptions,
     plasma::PlasmaOptions,
     playlist::PlaylistOptions,
     rain::digital_rain::DigitalRainOptions,
+    ripple::RippleOptions,
     solarsystem::SolarSystemOptions,
     terrain::TerrainOptions,
 };
@@ -182,6 +186,10 @@ pub struct Config {
     pub fire: FireOptions,
     pub terrain: TerrainOptions,
     pub solarsystem: SolarSystemOptions,
+    pub ants: AntsOptions,
+    pub flyover: FlyoverOptions,
+    pub physarum: PhysarumOptions,
+    pub ripple: RippleOptions,
     pub playlist: PlaylistOptions,
 }
 
@@ -315,6 +323,53 @@ impl Config {
         self.solarsystem.clone()
     }
 
+    /// The ant count, from the screen area.
+    ///
+    /// Derived here rather than in the effect for the reason every other effect
+    /// does it: a fixed count is wrong at both ends of the range, and the
+    /// arithmetic belongs next to the other densities rather than inside a
+    /// constructor. Clamped, because ants sharing a cell flip it within a step of
+    /// each other and destroy each other's turn decisions -- past the ceiling the
+    /// board is noise, which the same picture at a lower density produces free.
+    pub fn get_ants_options(&self, screen_size: (u16, u16)) -> AntsOptions {
+        let mut options = self.ants.clone();
+        let area = screen_size.0 as f32 * screen_size.1 as f32;
+        options.ants = (area * crate::ants::ANT_DENSITY * options.ant_coeff).clamp(
+            crate::ants::MIN_ANT_COUNT as f32,
+            crate::ants::MAX_ANT_COUNT as f32,
+        ) as u16;
+        options
+    }
+
+    pub fn get_flyover_options(&self) -> FlyoverOptions {
+        self.flyover.clone()
+    }
+
+    /// The agent count, from the size of the trail map.
+    ///
+    /// The trail map is at half-block row resolution rather than at cell
+    /// resolution -- see [`crate::physarum::Physarum::size`] -- so the density is
+    /// per *field row* and not per cell. Getting that wrong by a factor of two is
+    /// invisible as a number and visible as a field that is either starved or a
+    /// solid block.
+    pub fn get_physarum_options(&self, screen_size: (u16, u16)) -> PhysarumOptions {
+        let mut options = self.physarum.clone();
+        let width = screen_size.0 as f32;
+        let height =
+            screen_size.1 as f32 * crate::render::halfblock::ROWS_PER_CELL as f32;
+        options.agents =
+            (width * height * crate::physarum::AGENT_DENSITY * options.agent_coeff)
+                .clamp(
+                    crate::physarum::MIN_AGENT_COUNT as f32,
+                    crate::physarum::MAX_AGENT_COUNT as f32,
+                ) as u32;
+        options
+    }
+
+    pub fn get_ripple_options(&self) -> RippleOptions {
+        self.ripple.clone()
+    }
+
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
     }
@@ -348,6 +403,10 @@ impl Config {
         self.cube.seed = seed;
         self.donut.seed = seed;
         self.plasma.seed = seed;
+        self.ants.seed = seed;
+        self.flyover.seed = seed;
+        self.physarum.seed = seed;
+        self.ripple.seed = seed;
         // The playlist order, not just the pictures. Without this,
         // `--seed N --shuffle` reproduced the effects and not their order.
         self.playlist.seed = seed;
@@ -435,6 +494,18 @@ impl Config {
         if self.plasma.seed == DEFAULT_SEED {
             self.plasma.seed = draw();
         }
+        if self.ants.seed == DEFAULT_SEED {
+            self.ants.seed = draw();
+        }
+        if self.flyover.seed == DEFAULT_SEED {
+            self.flyover.seed = draw();
+        }
+        if self.physarum.seed == DEFAULT_SEED {
+            self.physarum.seed = draw();
+        }
+        if self.ripple.seed == DEFAULT_SEED {
+            self.ripple.seed = draw();
+        }
         if self.playlist.seed == DEFAULT_SEED {
             self.playlist.seed = draw();
         }
@@ -465,6 +536,10 @@ impl Default for Config {
             fire: FireOptions::default(),
             terrain: TerrainOptions::default(),
             solarsystem: SolarSystemOptions::default(),
+            ants: AntsOptions::default(),
+            flyover: FlyoverOptions::default(),
+            physarum: PhysarumOptions::default(),
+            ripple: RippleOptions::default(),
             playlist: PlaylistOptions::default(),
         }
     }
