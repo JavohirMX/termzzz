@@ -258,6 +258,11 @@ impl Ripple {
 
         // Expanded to `levels` discrete stops so `sample_index` picks one of them
         // rather than interpolating. See `RippleOptions::levels`.
+        //
+        // Truncated before expanding, for the reason in `Physarum`: `OCEAN` is
+        // mirrored, `sample_index` walks the stops in order, and a mirrored ramp
+        // walked in order draws its top index in near-black. See
+        // `Palette::truncated_at_peak`.
         let levels = options.levels.max(2);
         let palette = Palette::new(
             Palette::new(
@@ -265,6 +270,7 @@ impl Ripple {
                     .unwrap_or(palette_presets::OCEAN)
                     .to_vec(),
             )
+            .truncated_at_peak()
             .expand(levels),
         );
 

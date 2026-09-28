@@ -392,11 +392,16 @@ impl Flyover {
         let screen_size = normalize_effect_size(screen_size);
         let grid = BrailleGrid::new(screen_size.0 as usize, screen_size.1 as usize);
 
+        // Truncated, for the reason in `Physarum`: `DEPTH` is mirrored, and taken
+        // whole it drew the highest terrain in near-black while the sky sat in the
+        // pale middle of the ramp -- so the silhouette was the darkest thing in
+        // the frame. See `Palette::truncated_at_peak`.
         let palette = Palette::new(
             palette_presets::by_name(&options.palette)
                 .unwrap_or(palette_presets::DEPTH)
                 .to_vec(),
-        );
+        )
+        .truncated_at_peak();
 
         let mut flyover = Self {
             screen_size,
