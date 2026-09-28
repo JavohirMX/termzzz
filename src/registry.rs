@@ -21,6 +21,7 @@ use crate::rain::digital_rain::DigitalRain;
 use crate::ripple::Ripple;
 use crate::rule30::Rule30;
 use crate::runtime::{FrameContext, InputEvent};
+use crate::sand::Sand;
 use crate::sandpile::Sandpile;
 use crate::solarsystem::SolarSystem;
 use crate::terrain::Terrain;
@@ -54,6 +55,7 @@ pub enum EffectId {
     Physarum,
     Ripple,
     Rule30,
+    Sand,
     Sandpile,
     Wireworld,
 }
@@ -292,6 +294,17 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         needs_mouse: false,
         config_section: "wireworld",
     },
+    EffectSpec {
+        id: EffectId::Sand,
+        // "sand" and not "falling-sand": the mechanism is the material, and
+        // naming the mechanic would describe the only one of the three scenes
+        // that is not a falling granular pile.
+        name: "sand",
+        description: "Falling sand, water and fire in an hourglass",
+        default_duration: 25.0,
+        needs_mouse: false,
+        config_section: "sand",
+    },
 ];
 
 impl EffectId {
@@ -391,6 +404,7 @@ pub enum AnyEffect {
     Physarum(Physarum),
     Ripple(Ripple),
     Rule30(Rule30),
+    Sand(Sand),
     Sandpile(Sandpile),
     Wireworld(Wireworld),
 }
@@ -419,6 +433,7 @@ impl AnyEffect {
             Self::Physarum(_) => EffectId::Physarum,
             Self::Ripple(_) => EffectId::Ripple,
             Self::Rule30(_) => EffectId::Rule30,
+            Self::Sand(_) => EffectId::Sand,
             Self::Sandpile(_) => EffectId::Sandpile,
             Self::Wireworld(_) => EffectId::Wireworld,
         }
@@ -499,6 +514,9 @@ impl AnyEffect {
             }
             EffectId::Rule30 => {
                 Self::Rule30(Rule30::new(config.get_rule30_options(), screen_size))
+            }
+            EffectId::Sand => {
+                Self::Sand(Sand::new(config.get_sand_options(), screen_size))
             }
             EffectId::Sandpile => Self::Sandpile(Sandpile::new(
                 config.get_sandpile_options(),
@@ -594,6 +612,7 @@ impl_terminal_effect_for_any!(
     Physarum,
     Ripple,
     Rule30,
+    Sand,
     Sandpile,
     Wireworld,
 );
@@ -630,6 +649,7 @@ mod tests {
         EffectId::Physarum,
         EffectId::Ripple,
         EffectId::Rule30,
+        EffectId::Sand,
         EffectId::Sandpile,
         EffectId::Wireworld,
     ];

@@ -71,6 +71,7 @@ pub mod render;
 pub mod ripple;
 pub mod rule30;
 pub mod runtime;
+pub mod sand;
 pub mod sandpile;
 pub mod session;
 pub mod solarsystem;

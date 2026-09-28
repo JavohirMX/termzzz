@@ -21,6 +21,7 @@ use crate::{
     rain::digital_rain::DigitalRainOptions,
     ripple::RippleOptions,
     rule30::Rule30Options,
+    sand::SandOptions,
     sandpile::SandpileOptions,
     solarsystem::SolarSystemOptions,
     terrain::TerrainOptions,
@@ -194,6 +195,7 @@ pub struct Config {
     pub physarum: PhysarumOptions,
     pub ripple: RippleOptions,
     pub rule30: Rule30Options,
+    pub sand: SandOptions,
     pub sandpile: SandpileOptions,
     pub wireworld: WireworldOptions,
     pub playlist: PlaylistOptions,
@@ -380,6 +382,10 @@ impl Config {
         self.rule30.clone()
     }
 
+    pub fn get_sand_options(&self) -> SandOptions {
+        self.sand.clone()
+    }
+
     pub fn get_sandpile_options(&self) -> SandpileOptions {
         self.sandpile.clone()
     }
@@ -426,6 +432,7 @@ impl Config {
         self.physarum.seed = seed;
         self.ripple.seed = seed;
         self.rule30.seed = seed;
+        self.sand.seed = seed;
         self.sandpile.seed = seed;
         self.wireworld.seed = seed;
         // The playlist order, not just the pictures. Without this,
@@ -530,6 +537,9 @@ impl Config {
         if self.rule30.seed == DEFAULT_SEED {
             self.rule30.seed = draw();
         }
+        if self.sand.seed == DEFAULT_SEED {
+            self.sand.seed = draw();
+        }
         if self.sandpile.seed == DEFAULT_SEED {
             self.sandpile.seed = draw();
         }
@@ -571,6 +581,7 @@ impl Default for Config {
             physarum: PhysarumOptions::default(),
             ripple: RippleOptions::default(),
             rule30: Rule30Options::default(),
+            sand: SandOptions::default(),
             sandpile: SandpileOptions::default(),
             wireworld: WireworldOptions::default(),
             playlist: PlaylistOptions::default(),
