@@ -19,13 +19,9 @@ use crate::pipes::Pipes;
 use crate::plasma::Plasma;
 use crate::rain::digital_rain::DigitalRain;
 use crate::ripple::Ripple;
-use crate::rule30::Rule30;
 use crate::runtime::{FrameContext, InputEvent};
-use crate::sand::Sand;
-use crate::sandpile::Sandpile;
 use crate::solarsystem::SolarSystem;
 use crate::terrain::Terrain;
-use crate::wireworld::Wireworld;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -54,10 +50,6 @@ pub enum EffectId {
     Flyover,
     Physarum,
     Ripple,
-    Rule30,
-    Sand,
-    Sandpile,
-    Wireworld,
 }
 
 /// Everything the CLI needs to know about an effect, in one place.
@@ -260,51 +252,6 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         needs_mouse: false,
         config_section: "ripple",
     },
-    EffectSpec {
-        id: EffectId::Sandpile,
-        // Named for the model rather than described. "Avalanche" would sell the
-        // visual and hide the reason it never repeats, which is that avalanche
-        // size is heavy-tailed -- the next drop is four topples or four thousand
-        // and there is no telling which in advance.
-        name: "sandpile",
-        description: "Abelian sandpile avalanches, size following a power law",
-        default_duration: 25.0,
-        needs_mouse: false,
-        config_section: "sandpile",
-    },
-    EffectSpec {
-        id: EffectId::Rule30,
-        // "rule30" rather than "cellular": every one of the 256 elementary rules
-        // is this effect, and the shipped one is Wolfram's. Naming the number is
-        // what tells a user what they are looking at.
-        name: "rule30",
-        description: "Elementary cellular automaton as a space-time diagram",
-        default_duration: 20.0,
-        needs_mouse: false,
-        config_section: "rule30",
-    },
-    EffectSpec {
-        id: EffectId::Wireworld,
-        name: "wireworld",
-        // "wireworld" and not "circuit": the effect is the *rule*, and the rule
-        // is what is distinctive. A description that said "electrons in a
-        // circuit" would be the same sentence twice over.
-        description: "Electrons running through a generated circuit",
-        default_duration: 20.0,
-        needs_mouse: false,
-        config_section: "wireworld",
-    },
-    EffectSpec {
-        id: EffectId::Sand,
-        // "sand" and not "falling-sand": the mechanism is the material, and
-        // naming the mechanic would describe the only one of the three scenes
-        // that is not a falling granular pile.
-        name: "sand",
-        description: "Falling sand, water and fire in an hourglass",
-        default_duration: 25.0,
-        needs_mouse: false,
-        config_section: "sand",
-    },
 ];
 
 impl EffectId {
@@ -403,10 +350,6 @@ pub enum AnyEffect {
     Flyover(Flyover),
     Physarum(Physarum),
     Ripple(Ripple),
-    Rule30(Rule30),
-    Sand(Sand),
-    Sandpile(Sandpile),
-    Wireworld(Wireworld),
 }
 
 impl AnyEffect {
@@ -432,10 +375,6 @@ impl AnyEffect {
             Self::Flyover(_) => EffectId::Flyover,
             Self::Physarum(_) => EffectId::Physarum,
             Self::Ripple(_) => EffectId::Ripple,
-            Self::Rule30(_) => EffectId::Rule30,
-            Self::Sand(_) => EffectId::Sand,
-            Self::Sandpile(_) => EffectId::Sandpile,
-            Self::Wireworld(_) => EffectId::Wireworld,
         }
     }
 
@@ -512,20 +451,6 @@ impl AnyEffect {
             EffectId::Ripple => {
                 Self::Ripple(Ripple::new(config.get_ripple_options(), screen_size))
             }
-            EffectId::Rule30 => {
-                Self::Rule30(Rule30::new(config.get_rule30_options(), screen_size))
-            }
-            EffectId::Sand => {
-                Self::Sand(Sand::new(config.get_sand_options(), screen_size))
-            }
-            EffectId::Sandpile => Self::Sandpile(Sandpile::new(
-                config.get_sandpile_options(),
-                screen_size,
-            )),
-            EffectId::Wireworld => Self::Wireworld(Wireworld::new(
-                config.get_wireworld_options(),
-                screen_size,
-            )),
         }
     }
 }
@@ -611,10 +536,6 @@ impl_terminal_effect_for_any!(
     Flyover,
     Physarum,
     Ripple,
-    Rule30,
-    Sand,
-    Sandpile,
-    Wireworld,
 );
 
 #[cfg(test)]
@@ -648,10 +569,6 @@ mod tests {
         EffectId::Flyover,
         EffectId::Physarum,
         EffectId::Ripple,
-        EffectId::Rule30,
-        EffectId::Sand,
-        EffectId::Sandpile,
-        EffectId::Wireworld,
     ];
 
     #[test]

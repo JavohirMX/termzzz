@@ -20,12 +20,8 @@ use crate::{
     playlist::PlaylistOptions,
     rain::digital_rain::DigitalRainOptions,
     ripple::RippleOptions,
-    rule30::Rule30Options,
-    sand::SandOptions,
-    sandpile::SandpileOptions,
     solarsystem::SolarSystemOptions,
     terrain::TerrainOptions,
-    wireworld::WireworldOptions,
 };
 use crossterm::style::Color;
 use serde::{Deserialize, Serialize};
@@ -194,10 +190,6 @@ pub struct Config {
     pub flyover: FlyoverOptions,
     pub physarum: PhysarumOptions,
     pub ripple: RippleOptions,
-    pub rule30: Rule30Options,
-    pub sand: SandOptions,
-    pub sandpile: SandpileOptions,
-    pub wireworld: WireworldOptions,
     pub playlist: PlaylistOptions,
 }
 
@@ -378,22 +370,6 @@ impl Config {
         self.ripple.clone()
     }
 
-    pub fn get_rule30_options(&self) -> Rule30Options {
-        self.rule30.clone()
-    }
-
-    pub fn get_sand_options(&self) -> SandOptions {
-        self.sand.clone()
-    }
-
-    pub fn get_sandpile_options(&self) -> SandpileOptions {
-        self.sandpile.clone()
-    }
-
-    pub fn get_wireworld_options(&self) -> WireworldOptions {
-        self.wireworld.clone()
-    }
-
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
     }
@@ -431,10 +407,6 @@ impl Config {
         self.flyover.seed = seed;
         self.physarum.seed = seed;
         self.ripple.seed = seed;
-        self.rule30.seed = seed;
-        self.sand.seed = seed;
-        self.sandpile.seed = seed;
-        self.wireworld.seed = seed;
         // The playlist order, not just the pictures. Without this,
         // `--seed N --shuffle` reproduced the effects and not their order.
         self.playlist.seed = seed;
@@ -534,18 +506,6 @@ impl Config {
         if self.ripple.seed == DEFAULT_SEED {
             self.ripple.seed = draw();
         }
-        if self.rule30.seed == DEFAULT_SEED {
-            self.rule30.seed = draw();
-        }
-        if self.sand.seed == DEFAULT_SEED {
-            self.sand.seed = draw();
-        }
-        if self.sandpile.seed == DEFAULT_SEED {
-            self.sandpile.seed = draw();
-        }
-        if self.wireworld.seed == DEFAULT_SEED {
-            self.wireworld.seed = draw();
-        }
         if self.playlist.seed == DEFAULT_SEED {
             self.playlist.seed = draw();
         }
@@ -580,10 +540,6 @@ impl Default for Config {
             flyover: FlyoverOptions::default(),
             physarum: PhysarumOptions::default(),
             ripple: RippleOptions::default(),
-            rule30: Rule30Options::default(),
-            sand: SandOptions::default(),
-            sandpile: SandpileOptions::default(),
-            wireworld: WireworldOptions::default(),
             playlist: PlaylistOptions::default(),
         }
     }
