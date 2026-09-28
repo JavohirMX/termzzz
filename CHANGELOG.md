@@ -11,6 +11,11 @@ two of its entries — a terminal background setting and a solar system — are 
 only genuinely new features here.
 
 ### Added
+- **`--shuffle` shuffles properly, and `--seed` pins it.** The opening effect is
+  now drawn from the same shuffled bag as every transition, so a shuffled
+  playlist no longer always starts on its first entry. The order is seeded, so
+  `--seed N --shuffle` is the reproducible run the flag promises — it was
+  reproducing the pictures and not the order.
 - **An unseeded run is random.** Every effect that uses randomness now gets a
   fresh seed on each launch, so no two runs look the same. Previously every
   effect started from the same fixed seed, which meant a screensaver looked
@@ -186,6 +191,42 @@ them.
   version of this test was satisfied by a pool trimmed to 16 of 54 characters.
 
 ### Fixed
+#### The screensaver stopped on a monitor you were not looking at
+
+"When I put it in my second monitor and working on my first, its stopping."
+
+The loop skipped the effect's update while the window was unfocused, but still
+called `get_diff` and `write_cells`. No effect in the crate renders from a wall
+clock — every one draws from state that only the update advances — so an
+un-updated frame re-rendered byte-identically, the diff came back **empty**, and
+**zero bytes reached the terminal**. The loop woke four times a second to write
+silence.
+
+The simulation now advances whether or not the window has focus; the frame *rate*
+is what the option reduces. That option is renamed `throttle_when_unfocused`,
+because nothing was ever paused — the process ran throughout — and the old name
+is part of why this read as intended. The old spelling is still accepted.
+
+`idle_fps` is also now 20 rather than 4, and that is a threshold rather than a
+taste: the loop clamps a frame's delta to 50 ms, so an effect advances at most
+50 ms per drawn frame, and `N` frames a second reaches real time at exactly 20.
+Below that, `idle_fps` was quietly making an unfocused effect run slow *as well
+as* choppy — and the freeze had been hiding that, because a frozen effect's speed
+is zero.
+
+#### `--shuffle` never shuffled the first effect
+
+Every shuffled run opened on `matrix`. `Playlist::new` hardcoded the opening
+position to slot 0, and the bag is only consulted for *transitions* — so a run
+always opened on the first entry, and with no `--playlist` that entry is
+`EffectId::all()[0]`, which is `matrix`. The shuffle was working; it just started
+one entry too late, and a bare `--shuffle` looked like it did nothing at all.
+
+A second bug sat next to it: `--seed N` promised a reproducible run and was not
+giving one, because the bag drew from the operating system's entropy. The
+playlist has a seed now, threaded through `--seed` and through the per-launch
+randomisation like every effect.
+
 #### Saturn's rings were sized in the wrong unit
 
 "I think the rings of saturn are too big" was diagnosed here as a taste problem —
