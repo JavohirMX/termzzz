@@ -24,6 +24,7 @@ termzzz fire        # Fire simulation
 termzzz terrain     # A side-view landscape: two ridges, parallax, sky
 termzzz solarsystem # 3D orrery: tilted orbits, real periods
 termzzz dvd         # The real DVD wordmark, bouncing, in braille
+termzzz newton      # Newton's method basins, hue by which root, ink by iterations
 termzzz blank       # Blank screen
 termzzz ink         # Interactive generative field you pour ink into
 
@@ -156,6 +157,89 @@ Open engineering work, in priority order:
      the pitch was counted twice) drew plausible pictures or none, and none of
      them is visible to a test of the shape. Recompute the projection by hand from
      the definition in a test; that is the only thing that catches it.
+
+   Still on the list, unchanged: `starfield`, `flow`, and Gray-Scott.
+
+3. **`newton` shipped, and it is the second fractal in the crate.** Worth reading
+   before adding a third, because the design question and the cost question turned
+   out to be the same question and both answers were the opposite of what I
+   expected.
+
+   The idea: iterate `z <- z - p(z)/p'(z)` from every cell, colour by *which root*
+   each one reaches, shade by how many iterations it took. The mandelbrot colours
+   by a single scalar, so a sequential ramp is the right instrument for it and
+   every preset in `render/palette` is one. This needs **categorical** colour, and
+   the crate had none — hence `oklab_hue` and `perceptual_distance` in
+   `palette.rs`, and `INKED` in `glyph_ramp.rs`.
+
+   **The cost is 3.45 ms at 400x200 — over the 2 ms line, and a third of the
+   mandelbrot's 11.50 ms.** That is one more red row, and it is on the list
+   deliberately: the picture is a categorical one the crate could not draw before,
+   at a terminal eight times heavier than the budget assumes. At 200x50 it is
+   0.43 ms and at 80x24 it is 0.08 ms, so the ordinary sizes are free.
+
+   Four things came out of it that generalise past this effect.
+
+   - **A const generic was worth a third of the frame.** With the degree as a
+     runtime value, both loops in the iteration have a runtime trip count, so LLVM
+     unrolls neither and the effect ran at 65 ns/sample against 29 for identical
+     arithmetic with the degree fixed at 3. Passing the degree as a const generic
+     took 5.25 ms to 3.45 ms. **Before blaming arithmetic for a slow effect, check
+     whether the loop bounds are constants.** The iteration counts are 3, 4 and 5,
+     which is as close to a compile-time special case as a config value gets.
+
+   - **Two optimisations that looked obviously right and were not, both
+     measured.** Testing `|p(z)|` instead of the nearest root is the standard cheap
+     test and is *worse on both axes* here — 7.02 iterations against 6.02, 37.5
+     ns/sample against 28.9 — because it needs more iterations to reach an
+     equivalent distance. And hinting the previous iteration's root, exploiting
+     that a basin is sticky, came out at 2.81 and 2.46 ms against 3.13 and 2.39 for
+     the plain version: inside the ~30% run-to-run noise, with identical iteration
+     counts and *zero* root disagreements. Not worth the branch.
+
+   - **A measurement written down on a noisy run was backwards, and nothing
+     noticed for a day.** The file's docs claimed lowering the iteration cap makes
+     the effect *slower*, mirroring the mandelbrot where the cap is the dominant
+     cost. Measured properly, interleaved to average out machine drift:
+
+     ```text
+     cap   render    mean iters   never converged
+       6    4.81 ms      4.95          43.8%
+      12    5.95 ms      6.06           7.8%
+      24    6.16 ms      6.29           0.36%
+      48    6.21 ms      6.31           0.00%
+     ```
+
+     The cap is a **quality** setting here, not a performance one: its entire
+     range is worth 22% of the render, and the cheap end costs **44% of the frame
+     its correct colour**. The reason is the *shape* of the distribution —
+     iteration counts cluster around six with a thin tail, so almost every sample
+     ends on the early-out and the cap only ever affects the few that would have
+     gone on longest. The mandelbrot is the opposite because its interior pixels
+     all run to the cap. **The same knob means opposite things in two effects, so
+     "this is the expensive one" does not transfer.**
+
+   - **OKLab is not scaled to 0-100, and I set a threshold of 30 against a
+     quantity whose entire useful range is 0.6.** Every colour-separation
+     assertion in the first draft failed while looking like it was testing
+     separation. The numbers: about 0.02 is a just-noticeable difference, 0.1 is
+     comfortably different, 0.3 is different categories, 0.5 is about as far apart
+     as two colours get (saturated red vs green measures 0.52). A categorical
+     palette wants its closest pair above ~0.15. This is now in
+     `perceptual_distance`'s doc comment, because it is a thing the next reader
+     will get wrong in exactly the same way.
+
+   And the reason the wheel is OKLab rather than HSV: **HSV holds *value* fixed,
+   which is not perceptual lightness.** At S=0.85, V=0.95 the six HSV sector
+   anchors come out with OKLab lightnesses spread over 0.47 — nearly ten times a
+   just-noticeable difference, and *larger than the separation between adjacent
+   hues*. So a set of HSV colours told apart only by hue is really being told
+   apart by brightness, and when the effect is also using brightness for
+   something (here: the iteration count) the two channels fight over the same
+   signal. Constant L and constant C fixes it by construction: minimum pairwise
+   distance 0.282/0.211/0.172 for degrees 3/4/5, against 0.475/0.121/0.181 for
+   HSV. **Note that HSV is *better* at three and worse at four** — 90° apart lands
+   on azure and violet — so "the HSV wheel is fine" is not a thing to assume.
 
    Still on the list, unchanged: `starfield`, `flow`, and Gray-Scott.
 

@@ -113,6 +113,28 @@ Effects are initialized with a safe minimum simulation size of 6x6
 (`common::MIN_EFFECT_SIZE`), which the runtime enforces before handing a size to
 an effect. Output writes are clipped to the actual terminal dimensions regardless.
 
+The `mandelbrot` and `newton` effects are both one sample per cell, but they
+colour from opposite directions, and the difference is worth knowing before
+adding a third fractal. The mandelbrot's colour is a function of one scalar — the
+escape count — so a *sequential* ramp is the right instrument and every preset in
+`render::palette` is one. `newton`'s colour is a *label*: which of three roots the
+sample converged to. That needs categorical colour, so `palette.rs` gained
+`oklab_hue` (a constant-lightness, constant-chroma hue wheel) and
+`perceptual_distance` (a separation measure, in OKLab units, which are not scaled
+to 0-100 — see its doc comment). The reason for OKLab rather than HSV is that HSV
+holds *value* fixed, which is not perceptual lightness: at `S = 0.85, V = 0.95` its
+sector anchors come out with OKLab lightnesses spread over 0.47, which is larger
+than the separation between adjacent hues, so an HSV set told apart "by hue" is
+really told apart by brightness.
+
+`newton` also measures one sample per cell as the right resolution rather than a
+`HalfBlockField`, which is four times the samples for vertical detail this picture
+does not use: 3.45 ms at 400x200 against 10.4 ms. And it is the crate's clearest
+example of a const generic being worth a third of a frame — with the polynomial
+degree as a runtime value, both loops in its iteration have a runtime trip count,
+so LLVM unrolls neither, and passing the degree as a const generic took 5.25 ms to
+3.45 ms with an identical orbit.
+
 The ink field is a domain-warped wave field: the sample coordinates are
 displaced by a sine and a cosine before three wave terms and a diagonal ripple are
 summed. That value indexes a character ramp and a bounded colour palette, and

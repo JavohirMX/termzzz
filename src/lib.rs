@@ -25,6 +25,7 @@
 //! | `life`   | Conway's Game of Life                    |
 //! | `mandelbrot` | Escape-time Mandelbrot set, zooming   |
 //! | `maze`   | Maze generation and animation            |
+//! | `newton` | Newton's method, coloured by which root each sample reaches |
 //! | `physarum`| Slime-mould agents building a transport network |
 //! | `pipes`  | Pipe maze animation                      |
 //! | `plasma` | Plasma color wave effect                 |
@@ -61,6 +62,7 @@ pub mod ink;
 pub mod life;
 pub mod mandelbrot;
 pub mod maze;
+pub mod newton;
 pub mod physarum;
 pub mod pipes;
 pub mod plasma;

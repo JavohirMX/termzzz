@@ -26,6 +26,7 @@ Terminal screensavers and generative visual effects written in Rust.
 - First-person flight over a fractal height field (`flyover`)
 - Slime-mould agents building a transport network (`physarum`)
 - Interfering waves from a few point sources (`ripple`)
+- Newton's method basins, coloured by which root each sample finds (`newton`)
 
 ## Usage
 
@@ -48,6 +49,7 @@ termzzz ants
 termzzz flyover
 termzzz physarum
 termzzz ripple
+termzzz newton
 termzzz blank
 termzzz ink
 ```

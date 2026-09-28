@@ -14,6 +14,7 @@ use crate::ink::AsciiField;
 use crate::life::ConwayLife;
 use crate::mandelbrot::Mandelbrot;
 use crate::maze::Maze;
+use crate::newton::Newton;
 use crate::physarum::Physarum;
 use crate::pipes::Pipes;
 use crate::plasma::Plasma;
@@ -50,6 +51,7 @@ pub enum EffectId {
     Flyover,
     Physarum,
     Ripple,
+    Newton,
 }
 
 /// Everything the CLI needs to know about an effect, in one place.
@@ -252,6 +254,20 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         needs_mouse: false,
         config_section: "ripple",
     },
+    EffectSpec {
+        id: EffectId::Newton,
+        // "Newton's method", and the description carries the part that matters.
+        // A name alone does not say what is on screen: the mandelbrot is also an
+        // iteration on the complex plane, and the two are close enough that
+        // "Newton fractal" as a bare name would leave a user who has just watched
+        // `mandelbrot` with no reason to expect a different picture. What
+        // distinguishes this one is the colour, so that is what the line says.
+        name: "newton",
+        description: "Newton's method basins, coloured by which root each sample finds",
+        default_duration: 25.0,
+        needs_mouse: false,
+        config_section: "newton",
+    },
 ];
 
 impl EffectId {
@@ -350,6 +366,7 @@ pub enum AnyEffect {
     Flyover(Flyover),
     Physarum(Physarum),
     Ripple(Ripple),
+    Newton(Newton),
 }
 
 impl AnyEffect {
@@ -375,6 +392,7 @@ impl AnyEffect {
             Self::Flyover(_) => EffectId::Flyover,
             Self::Physarum(_) => EffectId::Physarum,
             Self::Ripple(_) => EffectId::Ripple,
+            Self::Newton(_) => EffectId::Newton,
         }
     }
 
@@ -450,6 +468,9 @@ impl AnyEffect {
             )),
             EffectId::Ripple => {
                 Self::Ripple(Ripple::new(config.get_ripple_options(), screen_size))
+            }
+            EffectId::Newton => {
+                Self::Newton(Newton::new(config.get_newton_options(), screen_size))
             }
         }
     }
@@ -536,6 +557,7 @@ impl_terminal_effect_for_any!(
     Flyover,
     Physarum,
     Ripple,
+    Newton,
 );
 
 #[cfg(test)]
@@ -569,6 +591,7 @@ mod tests {
         EffectId::Flyover,
         EffectId::Physarum,
         EffectId::Ripple,
+        EffectId::Newton,
     ];
 
     #[test]

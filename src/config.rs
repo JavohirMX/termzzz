@@ -14,6 +14,7 @@ use crate::{
     life::ConwayLifeOptions,
     mandelbrot::MandelbrotOptions,
     maze::MazeOptions,
+    newton::NewtonOptions,
     physarum::PhysarumOptions,
     pipes::PipesOptions,
     plasma::PlasmaOptions,
@@ -190,6 +191,7 @@ pub struct Config {
     pub flyover: FlyoverOptions,
     pub physarum: PhysarumOptions,
     pub ripple: RippleOptions,
+    pub newton: NewtonOptions,
     pub playlist: PlaylistOptions,
 }
 
@@ -370,6 +372,10 @@ impl Config {
         self.ripple.clone()
     }
 
+    pub fn get_newton_options(&self) -> NewtonOptions {
+        self.newton.clone()
+    }
+
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
     }
@@ -407,6 +413,7 @@ impl Config {
         self.flyover.seed = seed;
         self.physarum.seed = seed;
         self.ripple.seed = seed;
+        self.newton.seed = seed;
         // The playlist order, not just the pictures. Without this,
         // `--seed N --shuffle` reproduced the effects and not their order.
         self.playlist.seed = seed;
@@ -506,6 +513,9 @@ impl Config {
         if self.ripple.seed == DEFAULT_SEED {
             self.ripple.seed = draw();
         }
+        if self.newton.seed == DEFAULT_SEED {
+            self.newton.seed = draw();
+        }
         if self.playlist.seed == DEFAULT_SEED {
             self.playlist.seed = draw();
         }
@@ -540,6 +550,7 @@ impl Default for Config {
             flyover: FlyoverOptions::default(),
             physarum: PhysarumOptions::default(),
             ripple: RippleOptions::default(),
+            newton: NewtonOptions::default(),
             playlist: PlaylistOptions::default(),
         }
     }

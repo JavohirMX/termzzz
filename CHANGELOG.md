@@ -11,6 +11,35 @@ two of its entries — a terminal background setting and a solar system — are 
 only genuinely new features here.
 
 ### Added
+- **`newton`** — Newton's method on the complex plane, coloured by *which root*
+  each sample converges to. Iterate `z <- z - p(z)/p'(z)` from every cell; the
+  plane divides into basins and the fractal boundary between them is the picture.
+
+  Two things about it are new to the crate rather than new to the effect. **The
+  colour is categorical, not a ramp** — the mandelbrot's colour is a function of
+  one scalar, so a sequential ramp is right for it, but "which of three roots" is
+  a *label* and needs colours that differ from each other rather than lying along
+  a scale. Hence `oklab_hue` and `perceptual_distance` in `render/palette.rs`, and
+  `INKED` in `render/glyph_ramp.rs` (a space-free ramp, because a space is a hole
+  in a filled region and the lowest ink step covers the largest smooth area of
+  every basin). The two colour channels are kept independent — hue says which
+  root, taken from that root's own angle so it moves as the roots drift; ink says
+  how many iterations it took — and a test rotates the hue assignment and requires
+  that no cell's convergence changes, which is what stops a rewrite collapsing
+  them into one lookup.
+
+  **One sample per cell, not a half-block field**, which went against copying the
+  mandelbrot's renderer and was measured rather than assumed: a half-block field is
+  four times the cell count (10.4 ms at 400x200 against 3.45 ms) and buys two
+  vertical samples per cell, but this picture's detail is in the *shading* gradient
+  across a basin, which is a function of iteration count and not of vertical
+  position. The glyph ramp does the work the half-block would have.
+
+  Cost is **3.45 ms at 400x200** — over the 2 ms line, and a third of the
+  mandelbrot's 11.50 ms. One more red row, deliberately: it draws a picture the
+  crate could not draw before. At 200x50 it is 0.43 ms and at 80x24 it is 0.08 ms,
+  so the ordinary sizes are free.
+
 - **Four effects, chosen to fill gaps in the *catalogue* rather than in a
   renderer.** Sixteen effects had between them no world, no automaton other than
   Conway's, nothing that propagated across the screen, and nothing where agents
