@@ -152,11 +152,16 @@ pub struct DvdOptions {
     /// Was a bool meaning "on corners", and corners are almost unreachable: a
     /// corner hit needs both axes to reverse on the same frame, and the bounce
     /// periods are `2 * max_x / vx` and `2 * max_y / vy`. On an 80x24 terminal
-    /// with the default 30-cell logo those are 5.6 and 3.8 seconds, so the two
-    /// only coincide after 25 and 17 of them -- about 95 seconds, and a figure
-    /// that moves with the logo's width rather than being a property of anything.
-    /// The logo sat at one colour for a minute and a half, which is the same as
-    /// never changing.    ///
+    /// with the default 30-cell logo those are 8.3 and 5.7 seconds, so the two
+    /// are least-commonly-aligned after 25 and 17 of them -- 142 seconds, and
+    /// even then float accumulation tends to put the two walls on adjacent
+    /// frames rather than the same one.
+    ///
+    /// The original note here put that at "about 95 seconds" and treated it as
+    /// the reason the logo sat at one colour too long. Same complaint, much
+    /// worse number: over 1,000 seconds of measured simulation the corner
+    /// happened **once** at 80x24 and **zero** times at 200x50 and 400x200. See
+    /// [`ColorChange::Corner`].
     /// lemonyte's `dvd-screensaver`, which is the reference for this effect,
     /// recolours on *every* wall hit, and that is what [`ColorChange::Bounce`]
     /// still does. It is no longer the default: with a 30-cell wordmark and a
@@ -166,8 +171,93 @@ pub struct DvdOptions {
     pub color_change: ColorChange,
     /// Start the logo from a corner instead of the middle.
     pub start_in_corner: bool,
+    /// Throw a ripple of light out of a corner when the logo hits one.
+    ///
+    /// Independent of [`color_change`](Self::color_change), and it has to be:
+    /// [`ColorChange::Corner`] gates on the same conjunction, so tying the wave to
+    /// that mode would mean the wave's visibility depends on which recolour rule
+    /// the user picked. As it is, `Never` still throws waves.
+    ///
+    /// **How often you will see one is a measurement, and it is not often.**
+    /// A corner needs both axes to clamp on the same frame; over 1,000 seconds at
+    /// the shipped defaults that happened once at 80x24 and not at all at 200x50 or
+    /// 400x200. See [`ColorChange::Corner`] for the arithmetic. Two fixes were
+    /// tried and are recorded there because both were confident: solving `vy` for a
+    /// rational ratio of the two bounce periods made corners *rarer* as the ratio
+    /// approached 1, and a proximity window (calling a corner any two wall hits
+    /// within N frames) works at 80x24 -- one per 100s at N=3, one per 34s at
+    /// N=10 -- but does nothing at 400x200, where the periods differ by 2.66s per
+    /// cycle and the relative phase walks through a full cycle every 25 minutes.
+    ///
+    /// So this is honest about being an easter egg rather than a feature you watch
+    /// for. If you want it on a predictable beat, the proximity window is the lever
+    /// and it is a small change from here.
+    ///
+    /// The detection is `hit_x && hit_y`, which `step` already computes for the
+    /// colour rule, so it costs nothing to watch for it under every mode.
+    ///
+    /// A screensaver that marks its rarest event is the point of the effect. The
+    /// logo is a flat silhouette crossing a flat field, and the only thing that
+    /// ever happens to it is bounce-and-recolour; a corner is the one moment with
+    /// a *place* in it, and it costs nothing to acknowledge it.
+    pub corner_wave: bool,
     /// Seed for the starting corner and colour.
     pub seed: u64,
+}
+
+/// How fast a corner wave's radius grows, in cells per second.
+///
+/// 46, which is about four screens wide a second at 400x200. Chosen against the
+/// logo's own speed rather than in the abstract: the default logo crosses its own
+/// width in 2.5 seconds, so a wave that took four would still be inside the logo
+/// when the logo left the corner, and would read as a smear trailing the logo
+/// rather than as something that happened where the logo was. Slower than the
+/// logo, faster than the eye tracks a single cell.
+const WAVE_SPEED: f64 = 46.0;
+
+/// How long a corner wave lives, in seconds.
+///
+/// 1.1, at which the radius reaches about 50 cells -- past the logo, and past the
+/// near side of an 80x24 terminal in about a second. The wave's own fade is the
+/// real limiter; this is the backstop that stops a paused-then-resumed run
+/// carrying a dead wave around for ever.
+const WAVE_LIFE: f64 = 1.1;
+
+/// Half the wave's thickness in cells, measured as a radial band rather than a
+/// hard edge.
+///
+/// Two, which at 60 Hz is about a cell and a half of travel per frame: a
+/// one-cell ring would strobe as it crossed cell boundaries, and a wider one stops
+/// reading as a wave and starts reading as a disc.
+const WAVE_HALF_WIDTH: f64 = 2.0;
+
+/// The mark a wave is drawn in.
+///
+/// `·`, a middle dot, and mid-cell on purpose. A baseline glyph would draw a
+/// ring whose centre sits below where the ring is, which reads as a ring around
+/// the wrong point; `·` is Latin-1 supplement, so it is the same ambiguous-width
+/// class the crate already accepts for `░▒▓█`, and it is a dot rather than a bar
+/// so that where the ring crosses a row of text it does not look like more text.
+const WAVE_GLYPH: char = '\u{00B7}';
+
+/// The most corner waves alive at once.
+///
+/// Three. A corner is effectively unreachable at the shipped defaults -- see
+/// [`ColorChange::Corner`] -- so on a real run this is never more than one, and
+/// this is for the configurations where it is not: a small logo on a large
+/// terminal corners on *every* bounce, so the list would otherwise grow without
+/// bound. Dropping the oldest is right rather than dropping the newest: a wave
+/// from a corner the logo has already left is the one with nothing left to say.
+const MAX_WAVES: usize = 3;
+
+/// One ripple of light, expanding from a corner.
+struct CornerWave {
+    /// The corner, in cells, with the wave's origin at the corner cell itself.
+    cx: f64,
+    cy: f64,
+    /// Seconds since it was thrown. Advances on the frame delta, so it obeys the
+    /// pause and speed keys along with everything else in the effect.
+    age: f64,
 }
 
 /// How many wall hits separate two colour changes in [`ColorChange::Steady`].
@@ -219,8 +309,28 @@ pub enum ColorChange {
     Bounce,
     /// Only when both axes reverse on the same frame, which is the easter egg the
     /// reference's README jokes about -- "it could hit the corner if you look at
-    /// it long enough". On an 80x24 terminal with the default logo that is about
-    /// every 95 seconds; see [`DvdOptions::color_change`], which works out why.
+    /// it long enough".
+    ///
+    /// **In practice you will probably never see this fire, and that is a
+    /// measurement rather than an opinion.** A corner needs both axes to clamp on
+    /// the *same* frame, which is a measure-zero condition: the two bounce periods
+    /// are `2*max_x/vx` and `2*max_y/vy`, and with the shipped 30-cell wordmark at
+    /// 80x24 those are 8.3 and 5.7 seconds, a ratio of 25:17 whose least common
+    /// alignment is 142 seconds away -- and float accumulation means the two walls
+    /// are then crossed on *adjacent* frames rather than the same one, which is not
+    /// a corner.
+    ///
+    /// Measured over 1,000 seconds of real simulation at the shipped defaults:
+    ///
+    /// ```text
+    /// terminal   x-hits  y-hits  corners
+    /// 80x24        240     350       1
+    /// 200x50        70     139       0
+    /// 400x200       32      31       0
+    /// ```
+    ///
+    /// See [`DvdOptions::color_change`] for the arithmetic, and the note on
+    /// [`DvdOptions::corner_wave`] for what was tried against it.
     Corner,
     /// Never. One colour for the whole run.
     Never,
@@ -324,6 +434,7 @@ impl Default for DvdOptions {
             slope: 2.0,
             color_change: ColorChange::default(),
             start_in_corner: true,
+            corner_wave: true,
             seed: DEFAULT_SEED,
         }
     }
@@ -349,6 +460,14 @@ pub struct Dvd {
     color_index: usize,
     /// Wall hits since the last recolour. What [`ColorChange::Steady`] counts.
     wall_hits: u32,
+    /// Whether the frame just stepped reversed *both* axes: a corner hit.
+    ///
+    /// Stored rather than re-derived, for the reason on the assignment in
+    /// [`step`](Self::step). Read it after `step` and it means the frame just
+    /// processed; it is not a latch.
+    corner_this_frame: bool,
+    /// Ripples currently expanding out of a corner. See [`DvdOptions::corner_wave`].
+    waves: Vec<CornerWave>,
     rng: EffectRng,
 }
 
@@ -416,6 +535,10 @@ impl TerminalEffect for Dvd {
         // resize would make the first post-resize colour depend on how long the
         // previous run had been going.
         self.wall_hits = 0;
+        self.corner_this_frame = false;
+        // And the same for the waves: one thrown from a corner that no longer
+        // exists would expand across a new screen from an old screen's geometry.
+        self.waves.clear();
     }
 }
 
@@ -435,6 +558,8 @@ impl Dvd {
             vy: 1.0,
             color_index: 0,
             wall_hits: 0,
+            corner_this_frame: false,
+            waves: Vec::new(),
             // Replaced by `reset` below; this only has to be a valid generator.
             rng: seeded_rng(seed, "dvd"),
             options,
@@ -583,6 +708,48 @@ impl Dvd {
             self.wall_hits = self.wall_hits.saturating_add(1);
         }
 
+        // A corner is both axes reversing on the same frame, which is the
+        // conjunction `ColorChange::Corner` already tests. Watched here rather
+        // than inside the colour rule because the wave is not the colour rule:
+        // `Never` still throws waves, and `Bounce` throws one on the same rare
+        // occasion.
+        //
+        // The position is read after the clamps above, so `x` and `y` are exactly
+        // `0.0` or `max_x`/`max_y` on a frame that hit, and this is the corner
+        // rather than a position just past it.
+        //
+        // **Stored rather than re-derived.** The obvious alternative is for a
+        // caller to infer it from `waves` -- "was one pushed this frame?" -- and
+        // the way to do that is to look for an age of zero, which does not work
+        // because the ageing below runs *after* the push, so a wave thrown on a
+        // given frame is already one step old by the time `step` returns. That
+        // was tried and reported ten disagreements where there were ten corners
+        // and no disagreements. An event rare enough that it happens a handful of
+        // times in twenty thousand frames is not something to ask about by
+        // measuring something else.
+        self.corner_this_frame = hit_x && hit_y;
+        if self.corner_this_frame && self.options.corner_wave {
+            self.waves.push(CornerWave {
+                cx: self.x,
+                cy: self.y,
+                age: 0.0,
+            });
+            if self.waves.len() > MAX_WAVES {
+                self.waves.remove(0);
+            }
+        }
+
+        // Ageing after the throw, so a wave thrown this frame is one step old
+        // rather than one step *younger* -- which would make it lag the logo by
+        // one frame on every wave, on a ring that is expanding.
+        //
+        // `retain` rather than `remove` so the two cannot drift: a wave is
+        // dropped by exactly the condition that ends it being drawn.
+        for wave in &mut self.waves {
+            wave.age += delta;
+        }
+        self.waves.retain(|wave| wave.age < WAVE_LIFE);
+
         if self
             .options
             .color_change
@@ -590,6 +757,100 @@ impl Dvd {
         {
             self.color_index = (self.color_index + 1) % PALETTE.len();
             self.wall_hits = 0;
+        }
+    }
+
+    /// Paints every live wave's ring onto the canvas, dimmer than the logo.
+    ///
+    /// Drawn *before* the logo, so the logo occludes the ring where they cross.
+    /// A wave is light in the room, not paint on the logo, and having the ring
+    /// cut through the wordmark as it passes reads as a rendering fault. The cost
+    /// of that choice is that the ring is invisible behind the logo, which is
+    /// correct and also most of why a wave reads as coming *from* the corner.
+    ///
+    /// ## Why this walks the ring instead of scanning for it
+    ///
+    /// The obvious way to draw a ring is to iterate the bounding box of its
+    /// annulus and test each cell's distance. At 400x200 a wave at radius 200
+    /// would have a bounding box of the whole screen, so that is 80,000 `hypot`s
+    /// a frame to draw about 1,250 cells -- two thirds of this crate's frame
+    /// budget spent on arithmetic whose answer is "not in the ring" 98% of the
+    /// time, and a number that grows with the *square* of the radius.
+    ///
+    /// Walking the ring parametrically costs O(circumference) instead: for each
+    /// radius in the band, step the angle by whatever keeps consecutive samples
+    /// one cell apart. The step is `1/r` radians, so the number of samples is
+    /// `ceil(2*pi*r)` and the ring is always connected no matter how far out it
+    /// is. That is the whole reason this is a loop over angles and not a loop
+    /// over cells.
+    fn draw_waves(&mut self, ink: style::Color) {
+        let style::Color::Rgb { r, g, b } = ink else {
+            return;
+        };
+
+        // Copied out before the drawing loop because the loop needs `&mut self`
+        // for the canvas and `&self.waves` at once. Three waves, so this is three
+        // copies rather than a borrow conflict and a `split_at_mut`.
+        let waves: Vec<(f64, f64, f64)> = self
+            .waves
+            .iter()
+            .map(|wave| (wave.cx, wave.cy, wave.age))
+            .collect();
+
+        for (cx, cy, age) in waves {
+            // Fade on the same curve the radius uses, so the ring dims as it
+            // spreads rather than blinking out at the end of its life.
+            let remaining = 1.0 - (age / WAVE_LIFE).clamp(0.0, 1.0);
+            let color = style::Color::Rgb {
+                r: (r as f64 * remaining) as u8,
+                g: (g as f64 * remaining) as u8,
+                b: (b as f64 * remaining) as u8,
+            };
+
+            // At age zero the radius is zero and there is no ring to draw, so a
+            // wave is thrown invisible and becomes visible on the next frame. One
+            // frame at 60 Hz, and cheaper than the special case that would avoid
+            // it.
+            let radius = WAVE_SPEED * age;
+            let inner = (radius - WAVE_HALF_WIDTH).max(0.0);
+            let outer = radius + WAVE_HALF_WIDTH;
+
+            // One radius per cell, so the band is filled rather than being two
+            // hairlines with a gap between them.
+            let mut r = inner;
+            while r <= outer {
+                if r > 0.0 {
+                    self.stamp_ring(cx, cy, r, color);
+                }
+                r += 1.0;
+            }
+        }
+    }
+
+    /// Writes one circle of `WAVE_GLYPH`, one sample per cell of arc.
+    fn stamp_ring(&mut self, cx: f64, cy: f64, radius: f64, color: style::Color) {
+        // One sample per cell of circumference. The division is what keeps the
+        // ring connected: a fixed angle count would leave gaps at large radii, and
+        // a gap in a ring is not a thinner ring, it is two arcs.
+        let samples = (std::f64::consts::TAU * radius).ceil().max(8.0) as usize;
+        let cell = Cell::new(WAVE_GLYPH, color, style::Attribute::Reset);
+
+        for index in 0..samples {
+            let angle = std::f64::consts::TAU * index as f64 / samples as f64;
+            // `.round()` and not `.floor()`. A floor biases every sample down and
+            // the ring is very slightly *thinner* than it is centred on, which
+            // shows up as the ring and its centre drifting apart as it expands --
+            // the same rounding the logo's own sub-cell offset had to agree on.
+            let x = (cx + radius * angle.cos()).round();
+            let y = (cy + radius * angle.sin()).round();
+            if x < 0.0 || y < 0.0 {
+                continue;
+            }
+            let (x, y) = (x as usize, y as usize);
+            if x >= self.canvas.width() || y >= self.canvas.height() {
+                continue;
+            }
+            self.canvas.set(x, y, cell);
         }
     }
 
@@ -633,6 +894,9 @@ impl Dvd {
         // cleared here or the previous frame's logo stays on screen and the two
         // smear into each other.
         self.canvas.clear();
+
+        // Before the logo, so the logo occludes it. See `draw_waves`.
+        self.draw_waves(ink);
 
         // Position in dots, not cells, so the sub-cell part of the position is
         // drawn rather than discarded. A different multiplier per axis, on
@@ -1902,5 +2166,428 @@ mod tests {
                 assert!(x < 10 && y < 4);
             }
         }
+    }
+
+    /// A configuration whose bounce periods are commensurate, so corners happen
+    /// often and a test need not wait a quarter of an hour for one.
+    ///
+    /// **The corner is a geometric accident, and this leans on that.** A corner is
+    /// "both axes reverse on the same frame", which is a measure-zero condition:
+    /// the two bounce periods are `2*max_x/vx` and `2*max_y/vy`, and with the
+    /// default 30-cell wordmark at 80x24 those are 8.3 and 5.7 seconds, a ratio
+    /// of 25:17 whose least common alignment is 142 seconds away -- and float
+    /// accumulation means the two walls are then crossed on *adjacent* frames
+    /// rather than the same one, which is not a corner.
+    ///
+    /// Measured over 1,000 seconds of real simulation at the shipped defaults:
+    ///
+    /// ```text
+    /// terminal   x-hits  y-hits  corners
+    /// 80x24        240     350       1
+    /// 200x50        70     139       0
+    /// 400x200       32      31       0
+    /// ```
+    ///
+    /// So the default logo almost never corners, and a test written against it is
+    /// a test that measures how long you are willing to wait. This uses a
+    /// three-character logo on a large terminal, where `logo_height` is one cell
+    /// and the two periods come out *equal* -- 66.3 seconds each, measured -- so
+    /// every single bounce is a corner. Deterministic, fast enough to run, and
+    /// honest about being a special geometry.
+    fn corner_rich() -> Dvd {
+        Dvd::new(
+            DvdOptions {
+                logo: String::from("DVD"),
+                start_in_corner: false,
+                color_change: ColorChange::Never,
+                ..Default::default()
+            },
+            (400, 200),
+        )
+    }
+
+    /// A wave is thrown on a corner, and on no other frame.
+    ///
+    /// The distinction that matters is *both* axes. A single-axis wall hit arrives
+    /// every second or two, and a wave there would be a constant effect rather
+    /// than an event, which would spend the whole idea.
+    ///
+    /// The conjunction is checked against an *independent* prediction rather than
+    /// against a count, because a count cannot tell "every wall hit throws a wave"
+    /// from "corners are rare so the two counts happen to differ". Each axis's
+    /// clamp is recomputed here from the position `step` leaves behind, which is
+    /// the only thing the wave's rule is allowed to depend on.
+    #[test]
+    fn a_wave_is_thrown_exactly_when_both_axes_reverse_together() {
+        let mut dvd = corner_rich();
+        let mut throws = 0u32;
+        let mut wall_hits = 0u32;
+        let mut disagreements = 0u32;
+
+        for _ in 0..20_000 {
+            // Read *before* the step. Reading it after makes `grew` identically
+            // false, which is a test that cannot fail and asserts nothing.
+            let waves_before = dvd.waves.len();
+            dvd.update();
+
+            // The same conjunction, derived independently from the geometry.
+            let max_x = (dvd.screen_size.0 as f64 - dvd.logo_width()).max(0.0);
+            let max_y = (dvd.screen_size.1 as f64 - dvd.logo_height()).max(0.0);
+            let clamped_x = max_x > 0.0 && (dvd.x == 0.0 || dvd.x == max_x);
+            let clamped_y = max_y > 0.0 && (dvd.y == 0.0 || dvd.y == max_y);
+
+            let grew = dvd.waves.len() > waves_before;
+            // A wave thrown on the frame just stepped is the newest one. Age alone
+            // is ambiguous -- it is `DT` old, not zero, because `step` ages after
+            // it pushes -- so the flag is the authority and the age a cross-check.
+            let youngest = dvd
+                .waves
+                .iter()
+                .map(|wave| wave.age)
+                .fold(f64::INFINITY, f64::min);
+
+            if dvd.corner_this_frame {
+                throws += 1;
+            }
+            if clamped_x || clamped_y {
+                wall_hits += 1;
+            }
+            if dvd.corner_this_frame != (clamped_x && clamped_y) {
+                disagreements += 1;
+            }
+            // Whatever the flag says, a throw must have added a wave and nothing
+            // else may have.
+            if dvd.corner_this_frame != grew {
+                disagreements += 1;
+            }
+            if grew {
+                assert!(
+                    youngest <= DT * 1.5,
+                    "a new wave is {youngest}s old on the frame it was thrown, so \
+                     it was not zero-age when pushed"
+                );
+            }
+        }
+
+        assert_eq!(
+            disagreements, 0,
+            "{disagreements} frames where the stored corner flag and the geometry \
+             disagreed, or where a flag without a wave"
+        );
+        assert!(
+            throws > 5,
+            "only {throws} corners in 20,000 frames, so this configuration is not \
+             corner-rich and the rule above was never exercised"
+        );
+        // The fixture's own premise, asserted because everything above depends
+        // on it: in this geometry every wall hit *is* a corner, so the two counts
+        // must agree. If this stops holding, the two periods are no longer
+        // commensurate and this test has quietly stopped testing the conjunction
+        // -- it would be measuring a rare event again.
+        assert_eq!(
+            wall_hits, throws,
+            "this fixture was chosen because its two bounce periods are equal, so \
+             every one of its {wall_hits} wall hits should have been a corner"
+        );
+    }
+
+    /// A single-axis wall hit throws no wave, which is the half of the rule the
+    /// corner-rich fixture cannot see.
+    ///
+    /// A wall hit arrives every second or two and a corner arrives about once a
+    /// quarter of an hour, so in this configuration the two counts differ by two
+    /// orders of magnitude. That is the whole claim: a wave marks the *rare* event
+    /// and not the common one, and a version keyed to `hit_x || hit_y` would pass
+    /// the corner test above and fail this one.
+    #[test]
+    fn a_single_axis_wall_hit_throws_no_wave() {
+        let mut dvd = Dvd::new(
+            DvdOptions {
+                color_change: ColorChange::Never,
+                ..Default::default()
+            },
+            (80, 24),
+        );
+
+        let mut wall_hits = 0u32;
+        let mut throws = 0u32;
+        for _ in 0..20_000 {
+            let before = dvd.wall_hits;
+            dvd.update();
+            if dvd.wall_hits != before {
+                wall_hits += 1;
+            }
+            if dvd.corner_this_frame {
+                throws += 1;
+            }
+        }
+
+        assert!(
+            wall_hits > 100,
+            "only {wall_hits} wall hits in 20,000 frames, so the fixture is not \
+             exercising the single-axis case"
+        );
+        assert!(
+            throws * 20 < wall_hits,
+            "{wall_hits} wall hits produced {throws} waves, so the wave is keyed to \
+             a wall rather than to a corner"
+        );
+    }
+
+    /// A corner is reachable in the shipped default configuration, given a seed
+    /// that reaches one.
+    ///
+    /// Four pinned seeds rather than one, because the corner is rare enough that
+    /// whether a *particular* run reaches one is a property of where that logo
+    /// happened to start -- and `DEFAULT_SEED` means unset, so an unpinned effect
+    /// draws a fresh one at every construction and a test against it is a test of
+    /// the clock. See `corner_rich` for the measurement of how rare this is.
+    #[test]
+    fn a_corner_is_reachable_at_the_shipped_defaults() {
+        let mut reached = 0;
+        for seed in [1u64, 2, 3, 4] {
+            let mut dvd = Dvd::new(
+                DvdOptions {
+                    color_change: ColorChange::Never,
+                    seed,
+                    ..Default::default()
+                },
+                (80, 24),
+            );
+            for _ in 0..60_000 {
+                dvd.update();
+                if dvd.corner_this_frame {
+                    reached += 1;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            reached, 4,
+            "only {reached} of four seeded runs at 80x24 with the default wordmark \
+             reached a corner in 1,000 seconds, so the wave is unreachable in the \
+             shipped configuration"
+        );
+    }
+
+    /// The wave's ring is a ring, at the radius the clock says it should be.
+    ///
+    /// A circle is a shape, and a shape cannot be checked by counting cells or
+    /// checking that *something* was drawn -- a filled disc and a ring share a
+    /// centre and mean opposite things. So this measures the distribution of the
+    /// drawn cells' distances from the corner and asks whether the band is
+    /// populated and whether anything outside it is.
+    ///
+    /// The tolerance is the cell diagonal, and it is not slack. `stamp_ring`
+    /// samples a point at exactly radius `r` in continuous space and then rounds
+    /// it to a cell, so a cell it writes can sit half a cell away in each axis
+    /// from the circle -- `sqrt(0.5^2 + 0.5^2)`, about 0.71 cells. Measuring
+    /// without that term fails against a *correct* ring, which is the more
+    /// expensive mistake: it invites widening the renderer to satisfy a test.
+    #[test]
+    fn the_wave_draws_a_ring_at_the_radius_its_age_implies() {
+        let (cx, cy) = (20.0, 12.0);
+        let age = 0.5;
+        let mut dvd = Dvd::new(options(), (80, 24));
+        // Injected rather than driven: this is a test of `stamp_ring`'s geometry,
+        // and reaching a real corner takes ~95 seconds of simulation. The wave
+        // list is private state, so a test setting it directly is legitimate.
+        dvd.waves.push(CornerWave { cx, cy, age });
+
+        let diff = dvd.get_diff();
+        let ring: Vec<f64> = diff
+            .iter()
+            .filter(|(_, _, cell)| cell.symbol == WAVE_GLYPH)
+            .map(|(x, y, _)| (*x as f64 - cx).hypot(*y as f64 - cy))
+            .collect();
+
+        assert!(
+            ring.len() > 40,
+            "the ring drew only {} cells, which is not a ring",
+            ring.len()
+        );
+
+        let radius = WAVE_SPEED * age;
+        // Half the drawn band, plus the rounding.
+        let tolerance = WAVE_HALF_WIDTH + 0.5 * std::f64::consts::SQRT_2;
+        let inside = ring.iter().filter(|d| **d < radius - tolerance).count();
+        let outside = ring.iter().filter(|d| **d > radius + tolerance).count();
+        let in_band = ring.len() - inside - outside;
+
+        assert!(
+            in_band > 20,
+            "only {in_band} of {} cells are within the band around r = {radius}",
+            ring.len()
+        );
+        assert_eq!(
+            inside + outside,
+            0,
+            "{inside} cells are inside the band and {outside} are outside it, so \
+             this is a filled disc and not a ring"
+        );
+    }
+
+    /// The ring is dimmer than the logo it came from.
+    ///
+    /// A wave in the logo's exact colour would be a second logo, and the eye
+    /// would read the two as one object rather than as an event happening near
+    /// one. The comparison is against the logo's own ink at the same moment, not
+    /// against a constant, because the palette's brightest entries are close to
+    /// white and a fixed bar would pass for a dark colour and fail for a bright
+    /// one.
+    #[test]
+    fn the_wave_is_dimmer_than_the_logo() {
+        let mut dvd = Dvd::new(options(), (80, 24));
+        dvd.waves.push(CornerWave {
+            cx: 0.0,
+            cy: 0.0,
+            age: 0.2,
+        });
+        let diff = dvd.get_diff();
+
+        let logo = PALETTE[dvd.color_index % PALETTE.len()];
+        let (lr, lg, lb) = (logo.0 as f64, logo.1 as f64, logo.2 as f64);
+        let logo_luma = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+
+        let mut wave_seen = false;
+        for (_, _, cell) in &diff {
+            if cell.symbol != WAVE_GLYPH {
+                continue;
+            }
+            let style::Color::Rgb { r, g, b } = cell.color else {
+                panic!("a wave cell is not truecolor: {:?}", cell.color);
+            };
+            wave_seen = true;
+            let luma = 0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64;
+            assert!(
+                luma < logo_luma,
+                "a wave cell is at luma {luma:.1} against the logo's {logo_luma:.1}, \
+                 so the wave is not dimmer than the logo"
+            );
+        }
+        assert!(wave_seen, "the fixture drew no wave cells at all");
+    }
+
+    /// Turning the option off draws no wave, under every colour mode.
+    ///
+    /// `Never` is the interesting mode: the colour never changes, so a test that
+    /// only used the default would not notice whether the wave is really
+    /// independent of the colour rule or quietly hanging off it.
+    #[test]
+    fn the_wave_can_be_turned_off_without_touching_the_colour_rule() {
+        for mode in ColorChange::ALL {
+            let mut dvd = Dvd::new(
+                DvdOptions {
+                    color_change: *mode,
+                    corner_wave: false,
+                    ..options()
+                },
+                (80, 24),
+            );
+            for _ in 0..2_000 {
+                dvd.update();
+                let diff = dvd.get_diff();
+                assert!(
+                    !diff.iter().any(|(_, _, c)| c.symbol == WAVE_GLYPH),
+                    "{mode:?} drew a wave with corner_wave off"
+                );
+            }
+        }
+    }
+
+    /// A wave costs a ring, not a screen.
+    ///
+    /// The renderer walks the ring parametrically precisely so that its cost is
+    /// the circumference rather than the bounding box, and this is the assertion
+    /// that keeps it that way. The bounding-box version would draw a few hundred
+    /// more cells here and would still *look* right, which is the dangerous
+    /// failure: it is a performance regression with no visual symptom, found
+    /// only by this test or by a frame table.
+    ///
+    /// Measured against the ring's own area at the same radius, so the bound is a
+    /// property of the geometry rather than a number tuned to one terminal.
+    #[test]
+    fn a_wave_writes_a_ring_and_not_its_bounding_box() {
+        let radius = 60.0;
+        let mut dvd = Dvd::new(options(), (400, 200));
+        // Age chosen so the ring's radius is `radius`, and pushed to the middle
+        // of the screen so the whole ring is on it.
+        dvd.waves.push(CornerWave {
+            cx: 200.0,
+            cy: 100.0,
+            age: radius / WAVE_SPEED,
+        });
+
+        let written = dvd
+            .get_diff()
+            .iter()
+            .filter(|(_, _, c)| c.symbol == WAVE_GLYPH)
+            .count();
+        let band_area = 2.0 * WAVE_HALF_WIDTH * std::f64::consts::TAU * radius;
+        assert!(
+            written as f64 >= band_area * 0.6,
+            "the ring drew {written} cells, fewer than the {band_area:.0} its own \
+             area implies, so it has gaps in it"
+        );
+        assert!(
+            (written as f64) < band_area * 3.0,
+            "the ring drew {written} cells against a {band_area:.0}-cell band, so \
+             it is filling far more than its own width"
+        );
+        // And the absolute number, which is what would actually hurt: the whole
+        // 400x200 screen is 80,000 cells.
+        assert!(
+            written < 4_000,
+            "one wave wrote {written} cells on an 80,000-cell screen"
+        );
+    }
+
+    /// A wave expires, and leaves nothing behind when it does.
+    ///
+    /// `Canvas::commit` diffs, so a wave that stops being drawn *does* erase
+    /// itself -- but only because `draw` clears the canvas every frame. If the
+    /// clear ever stops, or a wave is dropped from the list without being aged
+    /// out, the ring would freeze on screen. So this checks the erasures are
+    /// actually emitted.
+    #[test]
+    fn an_expired_wave_is_erased_rather_than_left_on_screen() {
+        let mut dvd = Dvd::new(options(), (80, 24));
+        dvd.waves.push(CornerWave {
+            cx: 40.0,
+            cy: 12.0,
+            age: 0.1,
+        });
+        let during = dvd.get_diff();
+        assert!(
+            during.iter().any(|(_, _, c)| c.symbol == WAVE_GLYPH),
+            "the fixture drew no ring"
+        );
+
+        // Age past its life. In steps rather than one big delta, because `step`
+        // clamps the frame delta to 0.1s -- so a single call with a huge delta
+        // would advance the wave by 0.1s and nothing else. That clamp is why a
+        // wave cannot be skipped forward by a stall, and it is worth knowing
+        // rather than rediscovering.
+        let context = crate::runtime::FrameContext::new(
+            dvd.screen_size,
+            0,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs_f64(0.1),
+            crate::runtime::InputState::default(),
+        );
+        for _ in 0..(WAVE_LIFE as usize * 10 + 4) {
+            dvd.update_with_context(&context);
+        }
+        assert!(
+            dvd.waves.is_empty(),
+            "a wave {}s old is still alive with a life of {WAVE_LIFE}s",
+            dvd.waves.first().map_or(0.0, |w| w.age)
+        );
+
+        let after = dvd.get_diff();
+        assert!(
+            after.iter().all(|(_, _, c)| c.symbol != WAVE_GLYPH),
+            "a wave cell survived its own removal"
+        );
     }
 }
