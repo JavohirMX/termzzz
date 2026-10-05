@@ -9,6 +9,33 @@ license = "MIT"
 repository = "https://github.com/JavohirMX/termzzz"
 documentation = "https://docs.rs/termzzz"
 homepage = "https://github.com/JavohirMX/termzzz"
+readme = "README.md"
+rust-version = "1.89"
+# Both lists are capped at 5 by crates.io, so these are full. Dropping a
+# keyword to make room is a real decision, not a free edit.
+keywords = ["terminal", "screensaver", "ascii", "ansi", "visualization"]
+categories = ["command-line-utilities", "visualization"]
+
+# Without `readme` above crates.io renders no README at all, which is the
+# whole reason the file is here. The rest is what does not need to reach a
+# `cargo install` user: CI definitions, the working notes, and the local dev
+# harness. `AGENTS.md` alone is 87 KB of the 118-file package.
+exclude = [
+  "/.github",
+  "/AGENTS.md",
+  "/specs",
+  "/benches",
+  "/examples",
+  "/assets",
+  "/Justfile",
+  "/.tmuxp.yaml",
+  "/.envrc",
+  "/_typos.toml",
+  "/prek.toml",
+  "/flake.nix",
+  "/flake.lock",
+  "/.gitignore",
+]
 
 [dependencies]
 # `serde` so `style::Color` can go straight into `GlobalOptions`. Parsing the

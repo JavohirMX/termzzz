@@ -15,7 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install cargo-audit
-        run: cargo install cargo-audit
+        # `--locked` is required, not an optimisation. Without it cargo-audit
+        # resolves its newest dependencies, and `kstring@2.0.5` needs rustc
+        # 1.96 while this repo pins 1.89 -- so the audit tool itself fails to
+        # build and the job reports a toolchain error rather than a finding.
+        run: cargo install cargo-audit --locked
       - name: run security audit
         run: cargo audit
 

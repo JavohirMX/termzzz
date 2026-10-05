@@ -6,13 +6,69 @@
 //! from `EffectId::all()` and `Config` rather than hard-coding per-effect
 //! values, so a newly added effect is covered without editing this file.
 
+use std::cell::Cell as StdCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use termzzz::buffer::Cell;
+use termzzz::clock::Clock;
 use termzzz::common::TerminalEffect;
 use termzzz::config::Config;
 use termzzz::registry::{AnyEffect, EffectId};
+
+thread_local! {
+    /// The synthetic "now" that [`clock_frame`] hands the clock effect.
+    ///
+    /// `Clock`'s time source is a bare `fn() -> SystemTime`, so it cannot
+    /// capture the frame it is being drawn for. The frame index has to reach it
+    /// out of band, and a thread-local is the seam that lets a `fn` pointer read
+    /// state that changes per frame.
+    static CLOCK_NOW: StdCell<Option<SystemTime>> = const { StdCell::new(None) };
+}
+
+/// The clock effect's time source, returning whatever `CLOCK_NOW` holds.
+///
+/// Falling back to the epoch rather than to `SystemTime::now()` is deliberate:
+/// a real clock would make this suite's result depend on how fast the machine
+/// running it is, which is the exact failure this exists to prevent.
+fn clock_frame() -> SystemTime {
+    CLOCK_NOW.with(|now| now.get().unwrap_or(UNIX_EPOCH))
+}
+
+/// Sets the time `clock_frame` returns for the next draw.
+///
+/// A frame at 60 Hz, so this matches the `delta` the caller passes to
+/// `FrameContext` and the clock advances at the rate it will actually be run
+/// at. Driving it with the wall clock instead measures the *host* rather than
+/// the effect: this suite takes 51-65s in a debug build and 10s under `nix
+/// build`, which is release, and against `STILL_RUN_FRAMES` of 30 that is the
+/// difference between passing and failing for reasons the effect cannot control.
+fn set_clock_frame(frame: u64) {
+    CLOCK_NOW.with(|now| {
+        now.set(Some(
+            UNIX_EPOCH + Duration::from_secs_f64(frame as f64 / 60.0),
+        ))
+    });
+}
+
+/// Builds `id`, giving the clock effect an injected time source.
+///
+/// Every other effect goes through the registry unchanged; the match is on the
+/// variant rather than on the name so a rename cannot quietly stop applying it.
+fn build_with_injected_time(
+    id: EffectId,
+    config: &Config,
+    size: (u16, u16),
+) -> AnyEffect {
+    match id {
+        EffectId::Clock => AnyEffect::Clock(Clock::with_clock(
+            config.get_clock_options(),
+            size,
+            clock_frame,
+        )),
+        _ => AnyEffect::build(id, config, size),
+    }
+}
 
 // The effect names the CLI accepts are checked once, against
 // `registry::KNOWN_IDS`, in `registry.rs`. They are deliberately not listed
@@ -659,7 +715,7 @@ fn no_effect_settles_into_a_still_picture() {
         }
 
         let config = Config::default();
-        let mut effect = AnyEffect::build(id, &config, size);
+        let mut effect = build_with_injected_time(id, &config, size);
 
         let mut input = termzzz::runtime::InputState::default();
         input.set_size(size);
@@ -668,6 +724,7 @@ fn no_effect_settles_into_a_still_picture() {
         let mut longest = 0usize;
 
         for frame in 0..total {
+            set_clock_frame(frame);
             let context = termzzz::runtime::FrameContext::new(
                 size,
                 frame,

@@ -55,9 +55,11 @@ jobs:
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info --ignore-filename-regex "src/bin/.*|src/tui/*.rs"
         
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        # v3's uploader was sunset, so every upload 404s. With
+        # `fail_ci_if_error` that turned a dead upload service into a red
+        # build on an otherwise passing commit.
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: true
-          verbose: true

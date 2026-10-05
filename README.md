@@ -141,9 +141,11 @@ For a local checkout, install it with:
 cargo install --path .
 ```
 
-Once the canonical package repository is configured and published, `cargo install termzzz` will be available.
+It is also on crates.io, so `cargo install termzzz` works once the first release
+is published.
 
-The project currently targets macOS and Linux. Windows support can be added after the initial ASCII release.
+macOS and Linux are the supported targets. The test suite also runs on Windows
+in CI, but Windows is not a supported platform yet.
 
 ## Development
 
