@@ -59,13 +59,13 @@ cargo clippy       # Run linter
 - **GitHub**: canonical repository and release links are pending selection
 
 ## Project Status
-- **Version**: 0.2.0
-- **Effects**: 20 screensavers and visual effects, plus a playlist mode
+- **Version**: 0.0.1
+- **Effects**: 23 screensavers and visual effects, plus a playlist mode
 - **Platforms**: macOS and Linux
 - **Configuration**: `~/.config/termzzz.toml`
 
 ## Current Focus
-Ship the `termzzz` 0.2.0 release. Global speed control, the DVD logo, playlist
+Ship the `termzzz` 0.0.1 release. Global speed control, the DVD logo, playlist
 mode, the effect registry, a pinnable terminal background, and a 3D solar system
 are all done. What remains is the canonical GitHub repository and the
 distribution metadata (crates.io publication, Homebrew, Nix).

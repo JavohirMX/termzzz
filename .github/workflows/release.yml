@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag matching Cargo.toml (e.g., v0.2.0)'
+        description: 'Release tag matching Cargo.toml (e.g., v0.0.1)'
         required: true
 
 permissions:
@@ -85,7 +85,7 @@ jobs:
       run: |
         TAG_NAME="$REQUESTED_TAG"
         if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "Release tag must look like v0.2.0" >&2
+          echo "Release tag must look like v0.0.1" >&2
           exit 1
         fi
         CURRENT_VERSION=$(grep '^version = ' Cargo.toml | cut -d '"' -f 2)

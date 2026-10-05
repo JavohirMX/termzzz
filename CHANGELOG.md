@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - Unreleased
+## [0.0.1] - 2026-10-05
 
 Everything below is in three groups: what a session of watching the effects
 running turned up, then the earlier audit that found the outright bugs, then the
