@@ -30,7 +30,7 @@ pub mod palette;
 pub mod quadrant;
 pub mod wipe;
 
-pub use braille::BrailleGrid;
+pub use braille::{BrailleGrid, braille_bit, braille_dot_position};
 pub use dither::Dither;
 pub use glyph_ramp::{GlyphRamp, presets as glyph_presets};
 pub use halfblock::HalfBlockField;

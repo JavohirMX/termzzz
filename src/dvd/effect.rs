@@ -988,6 +988,9 @@ impl Dvd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::braille::{
+        DOTS_PER_CELL, braille_bit, braille_dot_position,
+    };
     use std::time::Duration;
 
     fn options() -> DvdOptions {
@@ -1495,17 +1498,6 @@ mod tests {
     /// default measured 17% -- one frame in six.
     #[test]
     fn the_logo_moves_on_enough_frames_to_read_as_motion() {
-        const DOT_POS: [(i64, i64); 8] = [
-            (0, 0),
-            (0, 1),
-            (0, 2),
-            (1, 0),
-            (1, 1),
-            (1, 2),
-            (1, 3),
-            (0, 3),
-        ];
-
         // The dots currently on screen. A diff only carries *changes*, so the
         // frame has to be accumulated -- which is also what the terminal does, and
         // is the only reason this measures the picture rather than the delta.
@@ -1514,9 +1506,20 @@ mod tests {
         let on_screen = |cells: &std::collections::HashMap<(usize, usize), u32>| {
             let mut dots = std::collections::HashSet::new();
             for (&(x, y), &bits) in cells {
-                for (i, (dx, dy)) in DOT_POS.iter().enumerate() {
+                // The bit layout comes from `BrailleGrid`, not from a table
+                // written out here. This one carried its own copy with the
+                // bottom two dots transposed -- bits 6 and 7 are dots 7 and 8,
+                // and the local table had (1,3) at index 6. Counting how many
+                // dots move does not care much, which is why it went unnoticed;
+                // it is the same mapping as everywhere else, so it is read from
+                // the one place that owns it.
+                for i in 0..DOTS_PER_CELL {
                     if bits & (1 << i) != 0 {
-                        dots.insert((x as i64 * 2 + dx, y as i64 * 4 + dy));
+                        let (dx, dy) = braille_dot_position(i);
+                        dots.insert((
+                            x as i64 * DOTS_X as i64 + dx as i64,
+                            y as i64 * DOTS_Y as i64 + dy as i64,
+                        ));
                     }
                 }
             }
@@ -1824,15 +1827,23 @@ mod tests {
         // And the encoding is braille, by name, for three cells whose bit patterns
         // are worked out by hand from the bitmap above. U+28FF is all eight dots,
         // which is the property a logo needs from a sub-cell renderer: a solid
-        // interior has to come out solid, or the letter is visibly striped. U+28EA
-        // is the right-hand column of a cell raised on all four rows plus the
-        // bottom-left dot, which is the slanted left edge of the first D. The
-        // fourth is the top-left corner, which has to be a space rather than a
-        // blank pattern -- `BrailleGrid` emits a space for an empty cell because
-        // it is one byte narrower, and that is the byte-cost half of only writing
-        // cells that have ink.
+        // interior has to come out solid, or the letter is visibly striped. U+28F8
+        // is DOTS-4-5-6-7-8 -- the right-hand column of a cell raised on all four
+        // rows plus the bottom-left dot -- which is the slanted left edge of the
+        // first D. The fourth is the top-left corner, which has to be a space
+        // rather than a blank pattern: `BrailleGrid` emits a space for an empty
+        // cell because it is one byte narrower, and that is the byte-cost half of
+        // only writing cells that have ink.
+        //
+        // This cell used to be asserted as U+28EA, which is DOTS-2-4-6-7-8. Under
+        // the row-major reading that happened to be the set this art produced,
+        // and it is a *different* set from U+28F8, so the assertion was pinning
+        // the encoding rather than the picture. The comment described the encoded
+        // bits, not the dots, which is how it read as a note about the art while
+        // being a note about the arithmetic. The dots do not move when the mapping
+        // is fixed, so the dot description above is the part that was always true.
         assert_eq!(dvd.grid.cell_char(2, 1), '\u{28ff}', "a solid interior");
-        assert_eq!(dvd.grid.cell_char(2, 0), '\u{28ea}', "the slanted edge");
+        assert_eq!(dvd.grid.cell_char(2, 0), '\u{28f8}', "the slanted edge");
         assert_eq!(dvd.grid.cell_char(0, 0), ' ', "a cell with no ink");
         assert_eq!(dvd.grid.cell_char(29, 6), ' ', "the far bottom corner");
     }
@@ -1935,8 +1946,7 @@ mod tests {
                         let screen_y = top + dot_j;
                         let cell_x = screen_x / DOTS_X;
                         let cell_y = screen_y / DOTS_Y;
-                        let bit = 1u8
-                            << ((screen_y % DOTS_Y) * DOTS_X + screen_x % DOTS_X);
+                        let bit = braille_bit(screen_x % DOTS_X, screen_y % DOTS_Y);
                         let raised = written
                             .get(&(cell_x, cell_y))
                             .is_some_and(|bits| bits & bit != 0);

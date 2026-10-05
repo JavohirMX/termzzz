@@ -328,6 +328,47 @@ pub struct Flyover {
     depth_at_row: Vec<f32>,
     /// One column's coverage, written contiguously and then transposed.
     column_coverage: Vec<f32>,
+    /// The row each dot column's own silhouette sits on, or `usize::MAX` where
+    /// the march found no ground.
+    ///
+    /// Recorded during the draw rather than recovered afterwards, which is the
+    /// whole point. `column_coverage` is the per-column scratch buffer and is
+    /// zeroed once per *frame*, so the rows above a column's silhouette are only
+    /// clear because `draw` clears them per column as well. Without that, a
+    /// column whose silhouette sat *lower* than its neighbour's would inherit
+    /// the neighbour's ground in its sky.
+    ///
+    /// **This has never actually happened.** Searched rather than assumed: across
+    /// 40 seeds x 600 frames x 200 dot columns at 200x50 -- 9.6 million
+    /// column-draws -- no column ever carried coverage above its own
+    /// silhouette, and the worst stale coverage measured was 0.0000. The reason
+    /// is structural: `march` gap-fills downwards from the topmost row any ray
+    /// touched, and because the camera looks slightly down over terrain running
+    /// to the horizon, that topmost row is pinned near the horizon for every
+    /// column. So the sequence of `top` values is effectively flat and the
+    /// condition cannot arise from the shipped landscape.
+    ///
+    /// The clear is kept anyway. It is one `fill` of a short slice, it is what
+    /// makes the buffer's contract "this column's coverage, nothing else" true by
+    /// construction rather than by luck, and the condition would become reachable
+    /// by any change that made the skyline vary between adjacent columns -- a
+    /// nearer ridge, a steeper pitch, a rolled camera.
+    ///
+    /// Two sky tests already existed and neither could see this. One asserts the
+    /// top *eighth* of the screen is empty, and a smear would sit beside a
+    /// silhouette rather than above the highest one. The other derives the
+    /// skyline from the drawn frame, so leaked ink *raises* the skyline it is
+    /// measuring and satisfies it. Both read the picture.
+    ///
+    /// The first version of the regression test here had the same flaw and was
+    /// worse for it: it found each column's skyline as the topmost inked row of
+    /// the coverage field -- the very quantity a leak would have corrupted -- so
+    /// stale rows raised the measurement and the smear cancelled itself out. The
+    /// test passed against the code it was written for. **A question about where
+    /// the ground starts cannot be answered from a field in which the ground may
+    /// have leaked upwards**, which is why the skyline is stored while it is still
+    /// known and read back here rather than re-derived.
+    silhouette: Vec<usize>,
     /// Every column's coverage, still column-major. See [`Flyover::transpose`].
     profiles: Vec<f32>,
     /// Per-cell colour over the cell grid.
@@ -362,6 +403,7 @@ impl TerminalEffect for Flyover {
         self.coverage = vec![0.0; self.grid.dot_width() * self.grid.dot_height()];
         self.depth_at_row = vec![0.0; self.grid.dot_height()];
         self.column_coverage = vec![0.0; self.grid.dot_height()];
+        self.silhouette = vec![usize::MAX; self.grid.dot_width()];
         self.profiles = vec![0.0; self.grid.dot_width() * self.grid.dot_height()];
         self.cell_colour =
             vec![Color::Reset; self.canvas.width() * self.canvas.height()];
@@ -412,6 +454,7 @@ impl Flyover {
             coverage: vec![0.0; grid.dot_width() * grid.dot_height()],
             depth_at_row: vec![0.0; grid.dot_height()],
             column_coverage: vec![0.0; grid.dot_height()],
+            silhouette: vec![usize::MAX; grid.dot_width()],
             profiles: vec![0.0; grid.dot_width() * grid.dot_height()],
             cell_colour: vec![
                 Color::Reset;
@@ -522,6 +565,27 @@ impl Flyover {
     /// The braille glyph this effect last drew into a cell.
     pub fn cell_symbol(&self, x: usize, y: usize) -> char {
         self.canvas.on_screen().get(x, y).symbol
+    }
+
+    /// The coverage one dot of one column was drawn with, from the per-column
+    /// depth profile rather than from the finished frame.
+    ///
+    /// The picture is the wrong place to ask a question about *where the ground
+    /// starts in this column*, because a glyph is the OR of eight dots: a cell
+    /// that is inked somewhere does not say which dot, and the frame cannot
+    /// separate one column's sky from the next one's ground.
+    pub fn profile_at(&self, dot_x: usize, dot_y: usize) -> f32 {
+        let dh = self.grid.dot_height();
+        self.profiles
+            .get(dot_x * dh + dot_y)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// The row this dot column's own silhouette sits on, or `usize::MAX` where
+    /// the march found no ground in it.
+    pub fn silhouette_of(&self, dot_x: usize) -> usize {
+        self.silhouette.get(dot_x).copied().unwrap_or(usize::MAX)
     }
 
     /// How many cells carry any ground at all, how many carry none, and the
@@ -678,6 +742,7 @@ impl Flyover {
         self.build_sky();
         self.coverage.fill(0.0);
         self.column_coverage.fill(0.0);
+        self.silhouette.fill(usize::MAX);
 
         let (dw, dh) = (self.grid.dot_width(), self.grid.dot_height());
         let [right, up, forward] = self.camera.basis();
@@ -707,6 +772,7 @@ impl Flyover {
                 // coverage and the cells are painted as sky below.
                 continue;
             };
+            self.silhouette[sx] = top;
 
             // Lit by the surface normal at the silhouette, which is the far edge of
             // the ground in this column and so the part a viewer reads the shape
@@ -967,6 +1033,59 @@ mod tests {
         (0..width)
             .map(|x| (0..height).find(|y| flyover.cell_symbol(x, *y) != ' '))
             .collect()
+    }
+
+    /// No column is inked above its own silhouette.
+    ///
+    /// **A guard, not a reproduction.** The condition has never occurred in this
+    /// effect -- 9.6 million column-draws were searched and the worst stale
+    /// coverage was zero, for the structural reason given on [`Flyover`].'s
+    /// `silhouette` field. So this does not fail against the version of `draw`
+    /// that omits the per-column clear, and it is kept for the day the skyline
+    /// stops being flat rather than because it caught anything.
+    ///
+    /// What it does establish is that the buffer means what its doc says. The
+    /// skyline is read from `silhouette`, recorded while it was known; deriving
+    /// it from the coverage field instead made this test pass against the exact
+    /// defect it was written for, which is worth stating because it is the trap
+    /// the other two sky tests fell into.
+    #[test]
+    fn no_column_is_inked_above_its_own_silhouette() {
+        let mut flyover = fixture(3);
+        run(&mut flyover, 120);
+        let (dw, _dh) = flyover.dot_dimensions();
+
+        let mut with_ground = 0;
+        let mut smeared = Vec::new();
+        for sx in 0..dw {
+            let top = flyover.silhouette_of(sx);
+            if top == usize::MAX {
+                continue; // no ground in this column; nothing to smear into
+            }
+            with_ground += 1;
+            if let Some(leaked) =
+                (0..top).find(|y| flyover.profile_at(sx, *y) > 0.0)
+            {
+                smeared.push((sx, leaked, top));
+            }
+        }
+
+        assert!(
+            with_ground > dw / 2,
+            "only {with_ground} of {dw} columns found ground, so this measured \
+             nothing about the sky"
+        );
+        assert!(
+            smeared.is_empty(),
+            "{} of {dw} columns carry coverage ABOVE their own skyline -- column \
+             {} is inked at row {} but its silhouette is row {}, and so on for \
+             {smeared:?}. The sky is inheriting the neighbouring column's ground, \
+             which no column of this landscape has ever done.",
+            smeared.len(),
+            smeared.first().map(|s| s.0).unwrap_or(0),
+            smeared.first().map(|s| s.1).unwrap_or(0),
+            smeared.first().map(|s| s.2).unwrap_or(0),
+        );
     }
 
     #[test]

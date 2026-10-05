@@ -520,6 +520,32 @@ fn every_effect_survives_a_long_run() {
     }
 }
 
+// --- effects that read the wall clock -------------------------------------
+//
+// Two of the tests below cannot be run against `clock`, and neither of them can
+// be made to work by giving the effect a seed. `clock` displays the current time
+// and has no randomness at all, so:
+//
+//   - **Reproducibility is undefined, not unimplemented.** Two runs a
+//     microsecond apart legitimately differ. A seed cannot fix that, because
+//     there is nothing random to pin; the only way to make two runs match would
+//     be to make the clock lie.
+//   - **Advancing on the frame delta is a bug.** `effects_advance_using_the_frame
+//     _delta` exists to catch an effect whose speed depends on the terminal's
+//     refresh rate. A clock derives its display from the wall clock precisely so
+//     that it does not.
+//
+// It is a one-entry list and the entry is checked by name, so an effect cannot
+// quietly acquire an exemption: `every_effect_id_has_a_spec_entry` and the
+// tripwire in `src/host.rs` both fail the moment the catalogue changes size, and
+// a name on this list that matches no effect is a dead entry that would be
+// invisible until somebody needed it.
+//
+// **Neither of these is a coverage gap being papered over.** There is no version
+// of a clock that satisfies either test, so the honest response is to say which
+// effect is exempt and why rather than to weaken the assertion for everything.
+const WALL_CLOCK: &[&str] = &["clock"];
+
 // --- the screensaver property ---------------------------------------------
 //
 // Everything else in this file checks that an effect is *well formed*: it stays
@@ -836,6 +862,10 @@ fn effects_advance_using_the_frame_delta() {
     let mut nondeterministic: Vec<&str> = Vec::new();
 
     for id in EffectId::all() {
+        if WALL_CLOCK.contains(&id.as_str()) {
+            continue;
+        }
+
         // A static effect has no time dependence to express, so every rate
         // renders the same still image. Compare two settled frames rather than
         // the first one: a lazily generated effect renders its content on its
@@ -1019,6 +1049,76 @@ fn every_effect_stays_in_bounds_after_resizing() {
     );
 }
 
+/// No effect panics at any terminal size, however narrow.
+///
+/// A terminal can report a width of 4 — a vertical split does it — and
+/// `update_size` clamps to 1 rather than to anything a size-dependent guard
+/// could lean on. `life` seeded gliders with `random_range(2..width - 3 + 1)`,
+/// which is empty at exactly 4, and `rand` asserts on an empty range; the guard
+/// in front of it tested `width <= 3`, so it admitted the one width that broke.
+///
+/// Two details make this able to see that, and both were the reason it hid:
+///
+/// - **Narrow sizes.** The resize test above stops at 6, which is one above the
+///   interesting one.
+/// - **Enough frames to reach a step.** `life` advances a generation through an
+///   accumulator, and `generations_per_second` defaults to 3.0, so the handful
+///   of updates elsewhere in this file never arrive at the glider code at all.
+///   A defect behind a slow accumulator hides behind the accumulator, so this
+///   drives a full second of frames at 60 Hz.
+///
+/// Panicking is a contract violation rather than a returned error, so this is a
+/// `catch_unwind` sweep: the assertion is about which effect blew up and at what
+/// size, and the panic hook is silenced so the report is the message below.
+#[test]
+fn no_effect_panics_at_any_terminal_size() {
+    let mut offenders: Vec<String> = Vec::new();
+
+    // Widths 1..=12 covers every size-dependent guard's off-by-one; the second
+    // pair is tall-and-thin, which is the other axis of the same arithmetic.
+    let sizes: Vec<(u16, u16)> = (1..=12)
+        .flat_map(|w| [(w, 24u16), (w, 4), (24, w)])
+        .collect();
+
+    for id in EffectId::all() {
+        let config = Config::default();
+        for &(width, height) in &sizes {
+            let mut effect = AnyEffect::build(id, &config, (width, height));
+            let mut input = termzzz::runtime::InputState::default();
+            input.set_size((width, height));
+            let delta = Duration::from_secs_f64(1.0 / 60.0);
+
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for frame in 0..70 {
+                        let context = termzzz::runtime::FrameContext::new(
+                            (width, height),
+                            frame,
+                            delta,
+                            delta,
+                            input.clone(),
+                        );
+                        let _ = effect.get_diff_with_context(&context);
+                        effect.update_with_context(&context);
+                    }
+                }));
+
+            if outcome.is_err() {
+                offenders.push(format!("{} at {width}x{height}", id.as_str()));
+                break;
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these effects panicked at a terminal size a resize can produce: \
+         {offenders:?}. A guard in front of a size-dependent range has to \
+         exclude every width the range is empty at, not the width the range \
+         starts being small."
+    );
+}
+
 // --- cell model -----------------------------------------------------------
 
 #[test]
@@ -1112,6 +1212,10 @@ fn seeded_effects_are_reproducible_and_seed_sensitive() {
 
     for id in EffectId::all() {
         let name = id.as_str();
+
+        if WALL_CLOCK.contains(&name) {
+            continue;
+        }
 
         // Sampled more than twice: one pair can coincide by chance, which would
         // make this check flaky in both directions.

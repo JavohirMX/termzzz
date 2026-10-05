@@ -1461,6 +1461,268 @@ fn check_mode_rejects_unknown_effects() {
 }
 
 #[test]
+fn check_mode_writes_deltas_that_accumulate_rather_than_clearing() {
+    // `--check` used to clear the screen on every frame and then write only that
+    // frame's delta. A delta is a difference against the effect's own canvas, so
+    // that erased everything the effect had not happened to redraw and never
+    // repainted it: `--check --frames 100` showed a near-empty screen, and the
+    // more static the effect the emptier it got. `--frames 1` was unaffected
+    // because the first commit is a full repaint.
+    //
+    // There is no terminal here, so the property under test is the one the caller
+    // depends on: `render_frames` emits each frame's delta and nothing else, so
+    // the stream *is* the picture when the deltas are written in order onto one
+    // screen.
+    let config = Config::default();
+    let size = (80u16, 24u16);
+
+    // One frame.
+    let mut single = AnyEffect::build(EffectId::Terrain, &config, size);
+    let mut input = termzzz::runtime::InputState::default();
+    input.set_size(size);
+    let delta = std::time::Duration::from_secs_f64(1.0 / 60.0);
+    let mut one = Vec::new();
+    termzzz::check::render_frames(
+        &mut single,
+        1,
+        size,
+        &mut input,
+        delta,
+        &mut one,
+        Default::default(),
+    )
+    .unwrap();
+
+    // Many frames, from an identical starting effect and seed.
+    let mut many = AnyEffect::build(EffectId::Terrain, &config, size);
+    let mut many_out = Vec::new();
+    termzzz::check::render_frames(
+        &mut many,
+        40,
+        size,
+        &mut input,
+        delta,
+        &mut many_out,
+        Default::default(),
+    )
+    .unwrap();
+
+    // The decisive property: this function emits no screen clear at all. The
+    // caller clears once, before the loop, and everything after that is deltas
+    // accumulating onto one screen. Counting clears rather than comparing
+    // lengths is what makes this able to see the bug -- a clear is four bytes and
+    // lands in the same place in the stream, so a length or prefix comparison
+    // passes against it happily.
+    const CLEAR: &[u8] = b"\x1b[2J";
+    let count =
+        |hay: &[u8]| hay.windows(CLEAR.len()).filter(|w| *w == CLEAR).count();
+    assert_eq!(
+        count(&one),
+        0,
+        "render_frames emitted a screen clear; the caller owns clearing, and a \
+         clear between frames erases the deltas already written"
+    );
+    assert_eq!(
+        count(&many_out),
+        0,
+        "render_frames emitted {} screen clears over 40 frames, one per frame \
+         most likely. Every one of those erases the picture the earlier deltas \
+         built, which is the bug this test exists for.",
+        count(&many_out)
+    );
+
+    // The first frame is written identically no matter how many follow.
+    assert!(
+        many_out.starts_with(&one),
+        "the first frame of a 40-frame render differs from a 1-frame render, so \
+         something in the loop depends on the frame count"
+    );
+    assert!(
+        many_out.len() > one.len(),
+        "40 frames produced no more output than 1, so the later frames wrote \
+         nothing at all"
+    );
+
+    // And the later frames are deltas, which is the whole reason the caller must
+    // not clear. If a later frame were itself a full repaint then this test would
+    // be checking nothing about accumulation.
+    let per_frame = many_out.len() / 40;
+    assert!(
+        per_frame < one.len() / 2,
+        "the average frame wrote {} bytes against a first frame's {}, so the \
+         deltas are not much smaller than a repaint and there is nothing here \
+         about accumulation",
+        per_frame,
+        one.len()
+    );
+}
+
+/// A hostile value in any config key must not panic or empty the screen.
+///
+/// `Config` is the only untrusted input the binary takes, and the only place a
+/// user can put a value no test would otherwise write. Two shapes of failure
+/// came out of it:
+///
+/// - **`pipes` was the one options struct with no bound at all.** Every other
+///   count and density in `config.rs` is `.clamp`ed; `get_pipes_options` was a
+///   bare `clone`. So `pipe_type_change = 1.5` reached `rng.random_bool`, which
+///   *panics* on a value outside the unit interval — and fires lazily, on the
+///   first pipe that restarts, so the message names `p=1.5` and neither the
+///   effect nor the config key.
+/// - **`cleanup_factor = 1.5` is worse than a crash** because it does not
+///   crash: `empty_percentage < 1 - factor` is never true, so the effect never
+///   cleans up and holds one filled screen for ever. A number out of range with
+///   no visible consequence is the failure a smoke test cannot find, which is why
+///   this asserts that cells carry ink and not merely that nothing panicked.
+///
+/// **Every key is swept, not a chosen one.** The keys are read out of
+/// `--print-config`'s own output, so a new option is covered the day it is added
+/// and a test that hardcoded `speed` would not have found the `pipes` bug —
+/// which is exactly what happened when this test first swept `speed` alone and
+/// came back green.
+#[test]
+fn a_hostile_value_in_any_config_key_leaves_an_effect_drawing() {
+    let printed =
+        toml::to_string_pretty(&Config::default()).expect("defaults print");
+
+    // (section, key) for every leaf key, read off the printed config so the
+    // names are the ones a user would type.
+    let mut keys: Vec<(String, String)> = Vec::new();
+    let mut section = String::new();
+    for line in printed.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_string();
+        } else if let Some((key, _)) = line.split_once('=') {
+            let key = key.trim();
+            // Only leaves; a table header line has already been handled above.
+            if !key.is_empty() && !section.is_empty() {
+                keys.push((section.clone(), key.to_string()));
+            }
+        }
+    }
+    assert!(
+        keys.len() > 50,
+        "only {} keys were found in the printed config, so this swept almost \
+         nothing",
+        keys.len()
+    );
+
+    let hostile_values = ["nan", "inf", "-inf", "1e30", "-1e30", "0.0", "-0.0"];
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for (section, key) in &keys {
+        for value in hostile_values {
+            let toml_src = format!("[{section}]\n{key} = {value}\n");
+            // A key that will not take the value -- a `u64` seed against `nan`,
+            // say -- is rejected at parse time, which is a fine outcome.
+            let Ok(config) = toml::from_str::<Config>(&toml_src) else {
+                continue;
+            };
+            checked += 1;
+
+            // A section names its own effect, so only that one needs building --
+            // except `[global]`, whose keys reach every effect through the
+            // runtime, and `[playlist]`, which composes them.
+            let targets: Vec<EffectId> = match section.as_str() {
+                "global" | "playlist" => EffectId::all()
+                    .filter(|id| *id != EffectId::Blank)
+                    .collect(),
+                name => EffectId::all().filter(|id| id.as_str() == name).collect(),
+            };
+            assert!(
+                !targets.is_empty(),
+                "section [{section}] names no effect, so {section}.{key} was \
+                 never exercised against anything"
+            );
+
+            for id in targets {
+                // Each case runs on its own thread with a deadline, because a hang is one of
+                // the failures being looked for and `catch_unwind` cannot see
+                // one. It was found this way: `solarsystem.sun_size = 1e30`
+                // saturated `as isize` to `isize::MAX` and looped from
+                // `-isize::MAX` to `isize::MAX` -- the test suite hung rather
+                // than failed, which in CI is a job that times out with no
+                // explanation attached to it.
+                let size = (40u16, 16u16);
+                let (tx, rx) = std::sync::mpsc::channel();
+                let name = id.as_str().to_string();
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    let result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            let mut effect = AnyEffect::build(id, &config, size);
+                            let mut input = termzzz::runtime::InputState::default();
+                            input.set_size(size);
+                            let delta =
+                                std::time::Duration::from_secs_f64(1.0 / 60.0);
+                            let mut inked = 0usize;
+                            for frame in 0..30 {
+                                let context = termzzz::runtime::FrameContext::new(
+                                    size,
+                                    frame,
+                                    delta,
+                                    delta,
+                                    input.clone(),
+                                );
+                                inked +=
+                                    effect.get_diff_with_context(&context).len();
+                                effect.update_with_context(&context);
+                            }
+                            inked
+                        }),
+                    );
+                    let _ = tx.send(result);
+                });
+
+                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        offenders.push(format!(
+                            "{section}.{key} = {value} -> {name} HUNG (10s)"
+                        ));
+                    }
+                    Err(_) => {}
+                    Ok(Err(_)) => offenders.push(format!(
+                        "{section}.{key} = {value} -> {name} PANICKED"
+                    )),
+                    Ok(Ok(0)) => {
+                        // "Drew nothing" is only a finding when the value is one
+                        // a person would plausibly type. `1e30` into a radius is
+                        // not a typo, it is a nonsense number, and the honest
+                        // outcome for it is an invisible effect rather than a
+                        // crash -- so those are left alone. Everything short of
+                        // 1e30 is in scope, which covers `nan`, `inf`, `-inf`,
+                        // `0.0` and `-0.0`.
+                        if !value.contains("e30") {
+                            offenders.push(format!(
+                                "{section}.{key} = {value} -> {name} drew nothing \
+                                 in 30 frames"
+                            ));
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                }
+            }
+        }
+    }
+
+    assert!(
+        checked > 50,
+        "only {checked} key/value pairs were exercised"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a hostile config value panicked an effect or left it drawing nothing. \
+         `Config` is the only untrusted input the binary takes. First 20 of {}: \
+         {:?}",
+        offenders.len(),
+        offenders.iter().take(20).cloned().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn registry_builds_every_effect() {
     let config = Config::default();
 

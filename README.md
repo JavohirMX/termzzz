@@ -28,6 +28,7 @@ Terminal screensavers and generative visual effects written in Rust.
 - Interfering waves from a few point sources (`ripple`)
 - Newton's method basins, coloured by which root each sample finds (`newton`)
 - A fish tank: shoaling fish, depth shading, light from above (`aquarium`)
+- A large clock, with a rule showing the seconds (`clock`)
 
 ## Usage
 
@@ -52,6 +53,7 @@ termzzz physarum
 termzzz ripple
 termzzz newton
 termzzz aquarium
+termzzz clock
 termzzz blank
 termzzz ink
 ```

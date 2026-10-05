@@ -20,6 +20,17 @@ directories = "6.0"
 env_logger = "0.11"
 log = "0.4"
 
+# The only dependency here that is not about rendering, terminal I/O or config.
+# `clock` is the feature that brings `Local::now`, and it is the whole reason
+# this is here: a clock effect that showed UTC, or that asked the user to keep a
+# UTC offset up to date across a DST boundary, would be wrong twice a year.
+#
+# Default features are off deliberately. The defaults add `oldtime` (a
+# deprecated pre-0.4 time zone table), `wasmbind` (for the browser, which is not
+# a target here) and nothing else this crate uses. `clock` implies `now`, which
+# implies `std`, and pulls `iana-time-zone` on unix.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

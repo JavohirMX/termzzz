@@ -4,6 +4,7 @@ use crate::{
     aquarium::AquariumOptions,
     blank::BlankOptions,
     boids::BoidsOptions,
+    clock::ClockOptions,
     crab::CrabOptions,
     cube::CubeOptions,
     donut::DonutOptions,
@@ -169,6 +170,29 @@ impl Default for GlobalOptions {
 /// Deliberately *not* `deny_unknown_fields`. A stale key from a removed setting
 /// would then be a hard startup failure, and an ignored key is a much better
 /// failure than a refusal to launch.
+///
+/// A probability a user may have typed anything into is put back in range by
+/// [`bounded_probability`], for the two separate hazards there are: out of the
+/// unit interval, and NaN, which `clamp` returns unchanged. TOML 1.1 accepts
+/// `nan`, `inf` and `-inf`, so both arrive from a config file rather than only
+/// from code. A non-finite value falls back to the effect's own default rather
+/// than to `0.0`, on the grounds that a typo is more likely to have meant "leave
+/// this alone" than "never do this".
+/// The smallest `pipes` screen-full that will trigger a cleanup.
+///
+/// Zero is degenerate rather than merely aggressive: the reset condition becomes
+/// satisfiable by one drawn cell, and the effect never accumulates anything.
+/// Measured rather than chosen -- see the table on the call site.
+const MIN_CLEANUP_FACTOR: f64 = 0.05;
+
+fn bounded_probability(value: f64, fallback: f64) -> f64 {
+    if !value.is_finite() {
+        fallback
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -195,6 +219,7 @@ pub struct Config {
     pub ripple: RippleOptions,
     pub newton: NewtonOptions,
     pub aquarium: AquariumOptions,
+    pub clock: ClockOptions,
     pub playlist: PlaylistOptions,
 }
 
@@ -254,8 +279,21 @@ impl Config {
     pub fn get_life_options(&self, screen_size: (u16, u16)) -> ConwayLifeOptions {
         let mut options = self.life.clone();
         let (w, h) = screen_size;
+        // Bounded at the cell count of the terminal. `cells_coeff` is a config
+        // float and TOML 1.1 accepts `inf`, and `f32 as u32` **saturates** rather
+        // than trapping, so an infinite coefficient became `u32::MAX` and the
+        // constructor tried to seed four billion cells into a `HashMap`: 30
+        // frames at 40x16 took 47.6 seconds. A screensaver that appears to hang
+        // on a typo is the worst failure this file can have, and every other
+        // count here is already clamped for the same reason.
+        //
+        // A NaN coefficient lands on 0 through the same cast, which is a valid
+        // count, so the finiteness check is not redundant with the clamp.
+        let area = w as f32 * h as f32 * 0.15;
+        let cells = area
+            * crate::common::bounded_f32(options.cells_coeff, 1.0, 0.0, f32::MAX);
         options.initial_cells =
-            (w as f32 * h as f32 * 0.15 * options.cells_coeff) as u32;
+            (cells.clamp(0.0, area) as u32).min(w as u32 * h as u32);
         options
     }
 
@@ -309,7 +347,57 @@ impl Config {
     }
 
     pub fn get_pipes_options(&self) -> PipesOptions {
-        self.pipes.clone()
+        let mut options = self.pipes.clone();
+        // Three probabilities, and this was the only options struct in the crate
+        // handed to `Config` without a bound. Each one has a distinct failure
+        // outside `0.0..=1.0`, and two of them are silent:
+        //
+        // - `pipe_type_change` goes to `rng.random_bool`, which **panics** on a
+        //   value outside the unit interval rather than returning anything. The
+        //   message names `p=1.5` and neither the config key nor the effect, and
+        //   it fires lazily -- on the first pipe that restarts, so seconds in or
+        //   never on a small terminal.
+        // - `cleanup_factor` above 1.0 makes `empty_percentage < 1 - factor`
+        //   never true, so the effect **never cleans up** and holds one filled
+        //   screen for ever. At 0.0 it resets every frame and the pipes never
+        //   grow. Neither is a crash and neither is visible from the number.
+        // - `turn_probability` has the same `random_bool` panic.
+        //
+        // Clamping matches what every other count and density in this file
+        // already does, and puts a plausible ceiling on a value the user typed
+        // rather than refusing it -- `life`'s rule is the other choice, and it is
+        // made where a wrong value yields a *plausible-looking* Life.
+        //
+        // `.clamp` also has to answer NaN, because TOML 1.1 accepts `nan` and
+        // `f64::clamp` propagates it: `nan.clamp(0.0, 1.0)` is NaN, which is
+        // still outside the unit interval and still panics `random_bool`. So
+        // each is checked for finiteness first, which is also what
+        // `common::bounded_f32` does for the global `speed` and `idle_fps`.
+        options.turn_probability =
+            bounded_probability(options.turn_probability, 0.2);
+        options.pipe_type_change =
+            bounded_probability(options.pipe_type_change, 0.3);
+        // `cleanup_factor` is how full the screen must be before it is cleared,
+        // so the reset fires when `empty_percentage < 1 - cleanup_factor`. At
+        // exactly zero that condition is satisfied by a *single drawn cell*, and
+        // the effect oscillates between one cell and blank forever. Measured
+        // over 120 frames at 40x16, seeded:
+        //
+        // ```text
+        // cleanup   0.00   0.05   0.10   0.15   0.20   0.25   0.50   0.90
+        // inked        0     27     64      6     44    131    259    259
+        // ```
+        //
+        // Zero is the only degenerate value -- any positive factor requires some
+        // fraction of the screen filled before a reset, which is enough for the
+        // pipes to grow. The floor is the first value in that table that draws at
+        // all, rather than a round number; the table is not monotonic, and the
+        // dips at 0.15 and 0.40 are the effect working as intended (those
+        // thresholds reset often, which is the variety), measured at one instant.
+        options.cleanup_factor = bounded_probability(options.cleanup_factor, 0.9)
+            .max(MIN_CLEANUP_FACTOR);
+
+        options
     }
 
     pub fn get_plasma_options(&self) -> PlasmaOptions {
@@ -383,6 +471,16 @@ impl Config {
         self.aquarium.clone()
     }
 
+    /// The clock's options, unchanged.
+    ///
+    /// No screen-size arithmetic here, unlike most of the accessors above, and
+    /// that is the effect's own decision rather than an omission: the clock
+    /// chooses how large to draw itself from the size it is handed at draw time,
+    /// so there is nothing to derive on the config.
+    pub fn get_clock_options(&self) -> ClockOptions {
+        self.clock.clone()
+    }
+
     pub fn get_playlist_options(&self) -> PlaylistOptions {
         self.playlist.clone()
     }
@@ -446,6 +544,12 @@ impl Config {
     /// render differently, so a section left off this list fails the test suite
     /// rather than quietly doing nothing. Adding mandelbrot without adding it
     /// here is exactly how that was found.
+    ///
+    /// **`clock` is absent on purpose**, and this is the only effect that is. It
+    /// has no `seed` field because it reads the system clock, so there is nothing
+    /// for `--seed` to override: pinning it would mean the clock stopped telling
+    /// the time, which is not a slower clock. It is named in `WALL_CLOCK` in
+    /// `tests/effect_contracts.rs` instead, which is the exemption that fits it.
     pub fn override_seed(&mut self, seed: u64) {
         self.mandelbrot.seed = seed;
         self.matrix.seed = seed;
@@ -609,6 +713,7 @@ impl Default for Config {
             ripple: RippleOptions::default(),
             newton: NewtonOptions::default(),
             aquarium: AquariumOptions::default(),
+            clock: ClockOptions::default(),
             playlist: PlaylistOptions::default(),
         }
     }

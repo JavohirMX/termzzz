@@ -861,7 +861,25 @@ impl SolarSystem {
         // Sampled on a lattice rather than by angle, because a radial falloff is
         // easier to get right on a grid and the sun is small enough that the grid
         // is a few dozen dots.
-        let dot_reach = (on_screen * DOTS_X as f64).ceil() as isize;
+        //
+        // Bounded by the grid, and the bound is load-bearing. `sun_size` is a
+        // config `f64` and TOML accepts `inf`; `sun_radius_cells` rejects a
+        // non-finite or negative size, but `1e30` *is* finite, so `on_screen`
+        // passed that check and `(on_screen * DOTS_X).ceil() as isize`
+        // **saturated** to `isize::MAX`. The loop below then ran from
+        // `-isize::MAX` to `isize::MAX` and the effect hung on the frame thread
+        // with no way out -- a permanent freeze from one number in a config
+        // file.
+        //
+        // Clamping to the dot grid is also just correct: a halo wider than the
+        // screen cannot raise a dot outside it, so everything past the edge was
+        // being computed to be discarded. An earlier version guarded with
+        // `on_screen.is_finite()`, which is why `inf` was caught and `1e30` was
+        // not -- **a finiteness check bounds the wrong end of the problem.**
+        let grid_w = self.screen_size.0 as isize * DOTS_X as isize;
+        let grid_h = self.screen_size.1 as isize * DOTS_Y as isize;
+        let dot_reach = ((on_screen * DOTS_X as f64).ceil() as isize)
+            .clamp(0, grid_w.max(grid_h));
         let dot_x0 = (centre.x * DOTS_X as f64).floor() as isize;
         let dot_y0 = (centre.y * DOTS_Y as f64).floor() as isize;
         // `core_fraction` is where the solid disc ends and the speckled halo

@@ -1953,6 +1953,7 @@ impl Cube {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::braille::braille_bit;
     use std::collections::{HashMap, HashSet};
 
     /// A rotation at which all six faces are turned away from edge-on.
@@ -2044,8 +2045,14 @@ mod tests {
                 out.insert((
                     x0 / DOTS_X as i32,
                     y0 / DOTS_Y as i32,
-                    1u8 << ((y0 as usize % DOTS_Y) * DOTS_X
-                        + (x0 as usize % DOTS_X)),
+                    // The bit layout comes from `BrailleGrid`, not from a second
+                    // copy of it written out here. This helper used to spell it
+                    // out, and when the two disagreed this test reported the
+                    // cube's line rasteriser as broken rather than noticing that
+                    // the expectation and the implementation were two different
+                    // functions. It still answers a question the renderer cannot:
+                    // *which cell and which dot* each edge crosses.
+                    braille_bit(x0 as usize % DOTS_X, y0 as usize % DOTS_Y),
                 ));
             }
             if x0 == x1 && y0 == y1 {

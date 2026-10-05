@@ -358,8 +358,20 @@ impl ConwayLife {
         // which on the sparse end of the ramp is the difference between a
         // visible cell and a barely-there one.
         let mut seeded: HashSet<(usize, usize)> = HashSet::new();
+        // The range below is `2..width - GLIDER_SIZE + 1`, which is empty --
+        // and `random_range` asserts on an empty range rather than returning
+        // anything -- unless `width - GLIDER_SIZE + 1 > 2`, that is
+        // `width >= GLIDER_SIZE + 2`. The old guard tested
+        // `width <= GLIDER_SIZE`, which admits `width == GLIDER_SIZE + 1`, so a
+        // four-column terminal panicked on the first generation with a bare
+        // "cannot sample empty range" that names neither `life` nor a cause.
+        //
+        // Four columns is not exotic: a terminal narrowed by a vertical split
+        // reaches it, and `update_size` clamps to 1 rather than to anything
+        // this guard could rely on.
+        const MIN_FOR_GLIDER: usize = GLIDER_SIZE + 2;
         for _ in 0..GLIDERS_PER_GENERATION {
-            if width <= GLIDER_SIZE || height <= GLIDER_SIZE {
+            if width < MIN_FOR_GLIDER || height < MIN_FOR_GLIDER {
                 break;
             }
             let x = self.rng.random_range(2..width - GLIDER_SIZE + 1);

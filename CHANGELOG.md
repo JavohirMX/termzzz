@@ -11,6 +11,78 @@ two of its entries — a terminal background setting and a solar system — are 
 only genuinely new features here.
 
 ### Added
+- **`clock`** — the current time, as large as the terminal allows, drawn in
+  braille. Ten digits and a colon, authored on a 5×7 grid of *source cells* and
+  expanded to a 2×2 block of dots each; a braille dot is half a cell in both
+  directions, so a square source cell comes out undistorted and the aspect caveat
+  in `render/` does not apply. The clock is scaled by the largest **even** integer
+  `k` that fits, and evenness is a rendering requirement rather than tidiness: a
+  scaled source cell is `2k` dots tall and a braille cell is 4, so an odd `k`
+  draws every digit's top and bottom edge *across* a cell as a row of half-height
+  marks. The first version returned 5 at 200×50 and the digits had visibly
+  chewed tops; nothing in the test suite could see it, because every assertion
+  about the scale is arithmetic and none of them looks at the picture.
+
+  **A seconds rule, and that is what makes it a screensaver.** A clock that only
+  redraws on the second is still for 59 of every 60 frames, which is exactly what
+  `no_effect_settles_into_a_still_picture` exists to reject — a playlist slot
+  would show a frozen face for its whole duration. So there is a hairline across
+  the clock's width with a bar growing along it, tracking the fraction of the
+  current second, or of the current minute when `show_seconds` is off. It moves
+  every frame at dot resolution: about every 12 frames at 200×50 and every 23 at
+  80×24, both inside the 30-frame limit. The cost of clean digit edges was
+  halving that rate (200×50 fitted scale 5 before the even-scale rule), which is
+  the right trade — ragged digits are visible every frame, and a rule that does
+  not move is visible on one frame in sixty.
+
+  **`show_seconds` buys a bigger clock only where the width budget spans a whole
+  even step.** `HH:MM` is 25 source cells against `HH:MM:SS`'s 39, so 120×40 goes
+  from scale 2 to scale 4 — but 80×24 stays at scale 2, because the seconds
+  clock already uses 78 of its 80 columns. Worth stating because "fewer digits,
+  bigger digits" is the knob's obvious promise and it is sometimes untrue.
+
+  **The only effect with no `seed`, and the first that reads the wall clock.**
+  Reproducibility is *undefined* rather than unimplemented — two runs a
+  microsecond apart legitimately differ, and a seed cannot fix that because
+  there is nothing random to pin. It stays out of `override_seed` and
+  `randomise_seeds`, and is named in a new `WALL_CLOCK` list in
+  `tests/effect_contracts.rs` that both the seed-sensitivity test and the
+  frame-delta test consult. It is also the crate's first effect that
+  deliberately ignores `FrameContext::delta`: deriving a clock's display from a
+  frame delta is the bug, not the feature.
+
+  Local time is the terminal's, via `chrono` with `default-features = false` and
+  only `clock` — the crate's first dependency that is not about rendering,
+  terminal I/O or config. UTC, or a user-maintained offset, would be wrong twice a
+  year, and for the one effect whose entire content is the time that is not a
+  small thing.
+
+  Cost is **11 bytes and 5.4 µs at 80×24**, and 132 bytes at 400×200. The
+  cheapest emitter in the crate by an order of magnitude, and the digits are
+  rasterised only when the time string or the scale changes — re-drawing 39
+  glyphs into 136,000 dots sixty times a second to produce the same picture is
+  the expensive way to write nothing.
+
+  **The first version drew every glyph on top of the one before it**, because
+  the origin was scaled and the offset within the glyph was not:
+  `cell_x * CELL_DOTS + dot_x * scale` rather than
+  `(cell_x * CELL_DOTS + dot_x) * scale`. At scale 1 the two are identical, so
+  80×24 looked right and 200×50 read as one smeared mass; at scale 4 the first
+  digit landed on dots 0–39 and the second started at 12. It is written up here
+  because **the whole suite was green throughout**, and for the same reason the
+  ragged edges above were: every assertion about the layout was about the
+  arithmetic, and the arithmetic was correct — `Layout` knew exactly where each
+  glyph went, and the code that turned that layout into dots was the part that
+  was wrong. A test cannot catch this by recomputing what it already computes.
+
+  The two tests that do catch it read the **drawn grid** and count ink runs: one
+  run per glyph, with the separator as its own. `no_two_glyphs_touch` was
+  written first and failed as intended; `the_gap_between_glyphs_is_the_width_it_
+  should_be` did *not*, because it iterated `runs.windows(2)` and one run means
+  no pairs — so it passed vacuously on exactly the bug it was written for, which
+  is the seventh instance of that in this project's history and the reason it now
+  re-asserts the run count before checking any gap.
+
 - **`newton`** — Newton's method on the complex plane, coloured by *which root*
   each sample converges to. Iterate `z <- z - p(z)/p'(z)` from every cell; the
   plane divides into basins and the fractal boundary between them is the picture.

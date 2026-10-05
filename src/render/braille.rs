@@ -239,20 +239,80 @@ impl BrailleGrid {
 
     /// Which bit a dot occupies within its cell.
     ///
-    /// The dot numbering follows the Unicode braille block, which runs
-    /// left-to-right across each row of four: bits 0 and 1 are the top row, 2
-    /// and 3 the next, and so on. Getting this wrong produces a pattern that
-    /// is the right density but the wrong shape.
+    /// The Unicode braille block is **not** row-major. Its dots are numbered in
+    /// two columns of three and then a detached bottom row:
+    ///
+    /// ```text
+    /// bit 0  bit 3      1 4
+    /// bit 1  bit 4      2 5
+    /// bit 2  bit 5      3 6
+    /// bit 6  bit 7      7 8
+    /// ```
+    ///
+    /// Bits 0-2 walk *down* the left column, 3-5 walk down the right, and 6-7
+    /// are the bottom row. Reading it as `row * 2 + col` puts four of the eight
+    /// dots on the wrong bit, which produces a pattern of the right density and
+    /// the wrong shape: a horizontal run of two dots renders as a vertical pair,
+    /// and the two halves of every cell are drawn from different source rows.
+    ///
+    /// This was wrong for the whole life of the module and no test could see it,
+    /// because every test round-tripped through [`BrailleGrid::dot_position`],
+    /// which was wrong in exactly the matching way. A round trip through a
+    /// permutation only proves the permutation is an involution on its own
+    /// image; it says nothing about where the image belongs. The tests below pin
+    /// the *physical* layout instead -- a named codepoint for a named dot column
+    /// -- and they are written out rather than looped, because the expectation
+    /// has to be external to this function for the assertion to mean anything.
     #[inline]
     fn dot_index(dot_x: usize, dot_y: usize) -> usize {
-        (dot_y % DOTS_Y) * DOTS_X + (dot_x % DOTS_X)
+        let (dx, dy) = (dot_x % DOTS_X, dot_y % DOTS_Y);
+        // Three rows carry the two columns (bits 0-2 and 3-5); the fourth is the
+        // detached bottom row (bits 6-7). Both counts fall out of DOTS_Y - 1, and
+        // getting either wrong silently misplaces dots rather than failing.
+        let main_rows = DOTS_Y - 1;
+        if dy == main_rows {
+            DOTS_X * main_rows + dx
+        } else {
+            dy + main_rows * dx
+        }
     }
 
     /// The inverse of [`BrailleGrid::dot_index`].
     #[inline]
     fn dot_position(index: usize) -> (usize, usize) {
-        (index % DOTS_X, index / DOTS_X)
+        let main_rows = DOTS_Y - 1;
+        if index < DOTS_X * main_rows {
+            (index / main_rows, index % main_rows)
+        } else {
+            (index - DOTS_X * main_rows, main_rows)
+        }
     }
+}
+
+/// The bit a dot occupies within its cell's pattern, as `1 << index`.
+///
+/// The block's layout is `1 4 / 2 5 / 3 6 / 7 8`, so it is **not** row-major;
+/// see [`BrailleGrid`] for why that is easy to get wrong and hard to notice.
+///
+/// A caller assembling a cell's own glyph from its own geometry wants this, and
+/// should call it rather than restate the mapping. Three places in the crate did
+/// restate it, and they disagreed with the grid they were checking against -- so
+/// the tests using them reported the *effects* as broken instead of noticing
+/// that the expectation and the implementation were two different functions.
+#[inline]
+pub fn braille_bit(dot_x: usize, dot_y: usize) -> u8 {
+    1u8 << BrailleGrid::dot_index(dot_x, dot_y)
+}
+
+/// The `(dot_x, dot_y)` a bit index names -- the inverse of [`braille_bit`].
+///
+/// Exposed for the same reason as [`braille_bit`]: a caller that reads a cell's
+/// pattern back out as a set of dots needs the layout in the other direction,
+/// and one test in this crate carried a hand-written copy of it with the bottom
+/// two dots transposed.
+#[inline]
+pub fn braille_dot_position(index: usize) -> (usize, usize) {
+    BrailleGrid::dot_position(index)
 }
 
 /// The colour a braille grid is written in when nothing else is specified.
@@ -290,9 +350,10 @@ mod tests {
         assert_eq!(grid.cell_char(0, 0), '\u{2801}');
 
         // U+2880 is dot 8 alone: the bottom-right, which is bit 7 rather than
-        // bit 3. The bit index is `row * 2 + column`, so the last dot of a
-        // four-row cell lands high in the byte, not next to U+2801. (U+2888 is
-        // dots 4 and 8 together, which is an easy thing to reach for by mistake.)
+        // bit 3. The block numbers down a column before moving right, so the
+        // last dot of a cell lands high in the byte, not next to U+2801.
+        // (U+2888 is dots 4 and 8 together, which is an easy thing to reach for
+        // by mistake.)
         let mut grid = BrailleGrid::new(1, 1);
         grid.raise_dot(1, 3);
         assert_eq!(grid.cell_char(0, 0), '\u{2880}');
@@ -302,6 +363,11 @@ mod tests {
     fn every_dot_maps_to_its_own_unicode_pattern() {
         // The whole point of the bit layout: each of the eight dots alone is a
         // distinct codepoint, U+2801 through U+2808.
+        //
+        // This cannot fail for a permutation error -- it walks the bit indices
+        // through `dot_position` and expects `1 << sub` back, which holds for
+        // any self-consistent pair. `each_dot_is_the_codepoint_the_block_names_
+        // for_it` below is the one that carries the layout.
         for sub in 0..DOTS_PER_CELL {
             let (dx, dy) = BrailleGrid::dot_position(sub);
             let mut grid = BrailleGrid::new(1, 1);
@@ -313,6 +379,121 @@ mod tests {
                 "dot {sub} at ({dx},{dy}) encoded wrongly"
             );
         }
+    }
+
+    /// The layout, pinned to *named* codepoints rather than to
+    /// [`BrailleGrid::dot_position`].
+    ///
+    /// `U+2807` is DOTS-1-2-3, the left-hand column of the top three rows, and
+    /// it is a different glyph from `U+2801 | U+2802 | U+2804` under any reading
+    /// of the block. The left column and the right column of a cell are also
+    /// different glyphs from each other, which is exactly what a row-major
+    /// `dy * 2 + dx` collapses into one.
+    #[test]
+    fn a_dot_column_is_the_codepoint_for_that_column() {
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.raise_dot(0, 0);
+        grid.raise_dot(0, 1);
+        grid.raise_dot(0, 2);
+        assert_eq!(
+            grid.cell_char(0, 0),
+            '\u{2807}',
+            "the left column is not DOTS-123"
+        );
+
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.raise_dot(1, 0);
+        grid.raise_dot(1, 1);
+        grid.raise_dot(1, 2);
+        assert_eq!(
+            grid.cell_char(0, 0),
+            '\u{2838}',
+            "the right column is not DOTS-456"
+        );
+    }
+
+    /// A run of dots across the top of a cell is dots 1 and 4 -- the two dots a
+    /// reader sees as a horizontal stroke -- and the block spells that as bits 0
+    /// and 3. Under `dy * 2 + dx` it came out as bits 0 and 1, which is dots 1
+    /// and 2 and renders as a *vertical* pair, so a horizontal stroke in an
+    /// effect's source art turned into a vertical one on screen.
+    #[test]
+    fn a_horizontal_run_is_the_two_top_dots() {
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.raise_dot(0, 0);
+        grid.raise_dot(1, 0);
+        assert_eq!(
+            grid.cell_char(0, 0),
+            '\u{2809}',
+            "the top row is not DOTS-14"
+        );
+
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.raise_dot(0, 1);
+        grid.raise_dot(1, 1);
+        assert_eq!(
+            grid.cell_char(0, 0),
+            '\u{2812}',
+            "the second row is not DOTS-25"
+        );
+    }
+
+    /// Every single dot, by the codepoint the block names for it.
+    ///
+    /// Dot `n` in the block's own numbering is codepoint `0x2800 + (1 << (n-1))`,
+    /// and the block's numbering is `1 4 / 2 5 / 3 6 / 7 8`. Written out rather
+    /// than looped, because the whole value of this test is that the expectation
+    /// comes from outside this module.
+    #[test]
+    fn each_dot_is_the_codepoint_the_block_names_for_it() {
+        const CASES: [(usize, usize, u32); 8] = [
+            (0, 0, 0x2801), // dot 1  top-left
+            (0, 1, 0x2802), // dot 2  middle-left
+            (0, 2, 0x2804), // dot 3  bottom-left
+            (1, 0, 0x2808), // dot 4  top-right
+            (1, 1, 0x2810), // dot 5  middle-right
+            (1, 2, 0x2820), // dot 6  bottom-right
+            (0, 3, 0x2840), // dot 7  bottom row, left
+            (1, 3, 0x2880), // dot 8  bottom row, right
+        ];
+        for (dx, dy, codepoint) in CASES {
+            let mut grid = BrailleGrid::new(1, 1);
+            grid.raise_dot(dx, dy);
+            assert_eq!(
+                grid.cell_char(0, 0),
+                char::from_u32(codepoint).unwrap(),
+                "dot ({dx},{dy}) is not U+{codepoint:04X}"
+            );
+        }
+    }
+
+    /// The bottom row is detached, which is the part a "two columns of four"
+    /// reading cannot express.
+    ///
+    /// Dots 7 and 8 sit *below* dots 3 and 6 rather than continuing their
+    /// columns, so the cell is 3+3+1+1 in row order and not 2+2+2+2. A layout
+    /// that assumed four even rows would put the bottom two dots in the wrong
+    /// columns, and the glyph would still have the right number of dots raised.
+    #[test]
+    fn the_bottom_row_is_detached_from_the_columns() {
+        // Dots 7 and 8 alone.
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.raise_dot(0, 3);
+        grid.raise_dot(1, 3);
+        assert_eq!(
+            grid.cell_char(0, 0),
+            '\u{28c0}',
+            "the bottom row is not DOTS-78"
+        );
+
+        // Dots 3 and 6 are the bottoms of the two columns; dots 7 and 8 sit
+        // below them. All four is a different glyph from either pair alone.
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.raise_dot(0, 2);
+        grid.raise_dot(1, 2);
+        grid.raise_dot(0, 3);
+        grid.raise_dot(1, 3);
+        assert_eq!(grid.cell_char(0, 0), '\u{28e4}', "dots 3, 6, 7 and 8");
     }
 
     #[test]
@@ -340,10 +521,29 @@ mod tests {
     #[test]
     fn lowering_a_dot_clears_only_that_bit() {
         let mut grid = BrailleGrid::new(1, 1);
-        grid.raise_dot(0, 0);
-        grid.raise_dot(1, 0);
+        grid.raise_dot(0, 0); // dot 1, bit 0
+        grid.raise_dot(1, 0); // dot 4, bit 3
         grid.lower_dot(0, 0);
-        assert_eq!(grid.cell_char(0, 0), '\u{2802}');
+        assert_eq!(grid.cell_char(0, 0), '\u{2808}');
+    }
+
+    /// `raise_dot` and `dot` must agree, because an effect that rasterises into
+    /// a grid and an effect that reads it back are otherwise free to disagree.
+    #[test]
+    fn reading_a_dot_back_matches_writing_it() {
+        for dy in 0..DOTS_Y {
+            for dx in 0..DOTS_X {
+                let mut grid = BrailleGrid::new(1, 1);
+                grid.raise_dot(dx, dy);
+                assert!(grid.dot(dx, dy), "dot ({dx},{dy}) did not read back");
+                // And the dot's own bit is the one the cell carries.
+                assert_eq!(
+                    grid.cell_bits(0, 0),
+                    braille_bit(dx, dy),
+                    "dot ({dx},{dy}) landed on the wrong bit"
+                );
+            }
+        }
     }
 
     #[test]

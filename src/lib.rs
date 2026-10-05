@@ -12,6 +12,7 @@
 //! | `buffer` | Terminal cell buffer for colored output  |
 //! | `canvas` | Double-buffered drawing surface and diff-and-commit |
 //! | `check`  | Terminal event checking (input, resize)  |
+//! | `clock`  | A large clock, with a rule showing the seconds |
 //! | `common` | Shared traits and types (TerminalEffect) |
 //! | `config` | TOML configuration loading and options     |
 //! | `solarsystem` | A 3D orrery: planets on tilted orbits, real periods |
@@ -50,6 +51,7 @@ pub mod boids;
 pub mod buffer;
 pub mod canvas;
 pub mod check;
+pub mod clock;
 pub mod common;
 pub mod config;
 pub mod crab;

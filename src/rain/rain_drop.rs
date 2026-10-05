@@ -122,8 +122,20 @@ impl RainDrop {
         // RNG. Using `rand::random()` here meant a caller seeding `rng` to get a
         // reproducible drop still got a random style.
         let style: RainDropStyle = rng.random();
-        let fx: u16 = rng.random_range(0..screen_size.0);
-        let fy: f32 = rng.random_range(0..screen_size.1 / 4) as f32;
+        let fx: u16 = rng.random_range(0..screen_size.0.max(1));
+        // Three of these ranges are sized off the terminal, and every one of them
+        // collapses below some height a resize can report. `random_range` ASSERTS
+        // on an empty or inverted range rather than returning anything, so each
+        // bound is floored to something drawable before it is used -- the sizes
+        // themselves are still read from `screen_size`, so a tall terminal is
+        // unaffected.
+        //
+        // Which heights broke, before this: `0..h/4` is empty for h < 4, and
+        // `4..=2h/3` is inverted for h < 6 because the exclusive upper end falls
+        // below the inclusive lower one. So a terminal 5 rows tall panicked in
+        // `RainDrop::new` on the first frame.
+        let height = screen_size.1 as usize;
+        let fy: f32 = rng.random_range(0..(height / 4).max(1)) as f32;
         // At most `2h/3`. The bound is load-bearing twice over: a drop that long
         // covers most of a terminal, and it is what keeps a drop inside the
         // colour ramp, which is built at `3h/2` entries (see
@@ -134,8 +146,8 @@ impl RainDrop {
         // from the one the effect was built at -- so growing the terminal could
         // index a drop straight past the end of the ramp. Both sides follow the
         // current height now.
-        let max_length: usize =
-            rng.random_range(4..=(2 * screen_size.1 / 3)) as usize;
+        let max_length_ceiling = (2 * height / 3).max(4);
+        let max_length: usize = rng.random_range(4..=max_length_ceiling);
 
         let speed: u16 =
             rng.random_range(options.get_min_speed()..=options.get_max_speed());
@@ -205,11 +217,17 @@ impl RainDrop {
         self.body.insert(0, *CHARACTERS.choose(rng).unwrap());
         self.style = rng.random();
         self.fy = 0.0;
-        self.fx = rng.random_range(0..screen_size.0);
+        self.fx = rng.random_range(0..screen_size.0.max(1));
         self.speed =
             rng.random_range(options.get_min_speed()..=options.get_max_speed());
-        self.max_length =
-            rng.random_range(screen_size.1 / 4 + 1..=(screen_size.1 / 2)) as usize;
+        // `h/4 + 1 ..= h/2` is inverted at h == 1, where the lower end is 1 and
+        // the upper is 0. Floor the upper end at the lower one rather than
+        // special-casing the height, so the range is drawable at every size.
+        let (lo, hi) = (
+            screen_size.1 / 4 + 1,
+            (screen_size.1 / 2).max(screen_size.1 / 4 + 1),
+        );
+        self.max_length = rng.random_range(lo..=hi) as usize;
     }
 
     /// Grow condition

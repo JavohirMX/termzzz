@@ -569,10 +569,10 @@ impl Donut {
         // recomputed the pre-revolution circle on every one of the ~197k inner
         // iterations, and derived the sine and cosine of the loop counters from
         // scratch each time even though the ranges are fixed.
-        let outer_radius = self.options.outer_radius;
-        let inner_radius = self.options.inner_radius;
-        let distance = self.options.distance;
-        let k1 = self.options.k1;
+        let outer_radius = finite_or(self.options.outer_radius, 2.0);
+        let inner_radius = finite_or(self.options.inner_radius, 1.0);
+        let distance = finite_or(self.options.distance, 5.0);
+        let k1 = finite_or(self.options.k1, 1.0);
         let colors = donut_colors(&self.options.palette);
         let half_width = width as f32 / 2.0;
         let half_height = height as f32 / 2.0;
@@ -642,12 +642,30 @@ impl Donut {
 
                 let luminance_index = shade_index_for(l);
 
-                let x_proj = (half_width + k1 * z_inv * x) as usize;
-                let y_proj = (half_height + k1 * z_inv * y * 0.8) as usize;
+                // Both bounds, and the lower one has to be tested on the FLOAT. `as usize`
+                // saturates, so a sample projecting left of the screen does not
+                // become a rejected value -- it becomes 0, and gets drawn into
+                // column 0. `donut.c`, which this is derived from, checks
+                // `x_proj >= 0` as well and the lower bound was dropped when the
+                // projection was ported.
+                //
+                // It is reachable: `distance` and `k1` are unguarded config, and
+                // `z = distance + ...` passes through zero, so wherever `z` is
+                // small and positive on the left of the torus
+                // `k1 * z_inv * x` is a large negative number. The result is a
+                // stripe of torus glyphs down column 0 and along row 0, redrawn
+                // every frame, competing in `zbuffer` with the legitimately
+                // drawn pixels there.
+                let x_f = half_width + k1 * z_inv * x;
+                let y_f = half_height + k1 * z_inv * y * 0.8;
 
-                if x_proj >= width || y_proj >= height {
+                if !(0.0..width as f32).contains(&x_f)
+                    || !(0.0..height as f32).contains(&y_f)
+                {
                     continue;
                 }
+                let x_proj = x_f as usize;
+                let y_proj = y_f as usize;
 
                 let idx = y_proj * width + x_proj;
                 if z_inv > zbuffer[idx] {
@@ -707,6 +725,70 @@ mod tests {
             }
             _ => 1.0,
         }
+    }
+
+    /// A sample that projects off the left of the screen is not drawn into column 0.
+    ///
+    /// `as usize` saturates rather than trapping, so casting a negative
+    /// projection gave 0 and the sample was drawn -- correctly typed, in the
+    /// wrong place. `donut.c`, which this projection is derived from, tests
+    /// `x_proj >= 0` as well; the lower bound was dropped in the port.
+    ///
+    /// Reachable from config: `distance` and `k1` are unguarded, and
+    /// `z = distance + circle_y * sin_a + cos_a * circle_x * sin_phi` passes
+    /// through zero as the torus rotates, so `k1 * z_inv * x` is large and
+    /// negative wherever `z` is small, positive, and `x < 0`. The symptom is a
+    /// stripe of torus glyphs down column 0 and along row 0 that redraws every
+    /// frame and competes in the z-buffer with the real pixels there.
+    ///
+    /// So: run at a distance that puts part of the torus through zero, and
+    /// assert the left and top edges hold no ink that the middle does not. The
+    /// check is on the *edges* rather than on a returned coordinate because the
+    /// saturation is invisible in the return type -- `x_proj` is a `usize`, and
+    /// a saturated 0 is indistinguishable from a genuine projection onto the
+    /// first column.
+    #[test]
+    fn a_sample_projected_off_screen_is_not_drawn_into_the_first_row_or_column() {
+        let mut offenders = Vec::new();
+        for distance in [1.5f32, 2.0, 2.5, 0.8, 3.0] {
+            for seed in 1..=3u64 {
+                let mut donut = Donut::new(
+                    DonutOptions {
+                        distance,
+                        seed,
+                        ..DonutOptions::default()
+                    },
+                    (60, 20),
+                );
+                for _ in 0..40 {
+                    donut.advance(1.0 / 60.0);
+                }
+                let frame = donut.get_diff();
+
+                // Which cells the projection *claims*, versus which the diff
+                // carries. Every emitted cell must be inside, which is the
+                // general contract, and specifically the edges must not be full
+                // of ink while the middle is not.
+                let edge_inked =
+                    frame.iter().filter(|(x, y, _)| *x == 0 || *y == 0).count();
+                let middle_inked = frame
+                    .iter()
+                    .filter(|(x, y, _)| *x > 5 && *x < 54 && *y > 2 && *y < 17)
+                    .count();
+
+                if edge_inked > middle_inked / 4 {
+                    offenders.push(format!(
+                        "distance {distance} seed {seed}: {edge_inked} cells on \
+                         the first row/column against {middle_inked} in the middle"
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the torus is being drawn into row 0 and column 0 from samples that \
+             projected off screen, which is what a saturating cast does: {offenders:?}"
+        );
     }
 
     /// A torus from a seed, at the size most of the tests here use.

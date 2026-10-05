@@ -3,6 +3,7 @@ use crate::aquarium::Aquarium;
 use crate::blank::Blank;
 use crate::boids::Boids;
 use crate::buffer::Cell;
+use crate::clock::Clock;
 use crate::common::TerminalEffect;
 use crate::config::Config;
 use crate::crab::Crab;
@@ -54,6 +55,11 @@ pub enum EffectId {
     Ripple,
     Newton,
     Aquarium,
+    /// Last, because the catalogue is ordered by when an effect arrived and
+    /// `n`/`p` walk it. Inserting anywhere else moves `Life`'s neighbour and
+    /// breaks `pressing_next_advances_and_wraps` for a reason that has nothing to
+    /// do with wrapping -- see the note on `KNOWN_IDS`.
+    Clock,
 }
 
 /// Everything the CLI needs to know about an effect, in one place.
@@ -339,9 +345,9 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         // thing on screen, and "fish" names what is *in* the scene rather than the
         // scene itself -- and the scene is the part that makes it read. The
         // description carries the two cues that do the work, because neither is
-        // guessable from a fish sprite: the depth shading and the light from above.
+        // guessable from a braille dot grid: the depth shading and the lit backs.
         name: "aquarium",
-        description: "A fish tank: shoaling fish, depth shading, light from above",
+        description: "A freshwater tank: seven species, shoaling, shaded by depth",
         default_duration: 30.0,
         // Drops a flake of food where you click and the shoal goes for it. Same
         // reason as `boids` and `ink`: capture is enabled from the *playlist's* own
@@ -352,6 +358,27 @@ pub static EFFECT_SPECS: &[EffectSpec] = &[
         // It owns three colours -- surface, deep and gravel -- rather than naming a
         // preset, and they have to move together to keep the gradient monotonic, so
         // there is nothing here for shuffle mode to draw from.
+        shuffle_palettes: &[],
+    },
+    EffectSpec {
+        id: EffectId::Clock,
+        // "A large clock", and the description carries the part that is not
+        // guessable from the name: the rule is what makes it a *screensaver*
+        // rather than a clock, because a clock that only redraws on the second
+        // is a still picture for fifty-nine frames out of every sixty and a
+        // playlist slot would show a frozen face for its whole duration.
+        name: "clock",
+        description: "A large clock, with a rule showing the seconds",
+        // Long, and on purpose against `blank`'s 2.0. This is the other thing a
+        // playlist uses as a rest -- a quiet frame with something in it -- and
+        // the whole point of a rest is that it outlasts the urge to skip it.
+        default_duration: 20.0,
+        needs_mouse: false,
+        config_section: "clock",
+        // No palette, and deliberately: there is a `color` and an `accent` rather
+        // than a ramp, because a clock's two colours mark two *kinds* of thing --
+        // digits and furniture -- and a ramp over a five-glyph face would be
+        // shading one of them.
         shuffle_palettes: &[],
     },
 ];
@@ -454,6 +481,7 @@ pub enum AnyEffect {
     Ripple(Ripple),
     Newton(Newton),
     Aquarium(Aquarium),
+    Clock(Clock),
 }
 
 impl AnyEffect {
@@ -481,6 +509,7 @@ impl AnyEffect {
             Self::Ripple(_) => EffectId::Ripple,
             Self::Newton(_) => EffectId::Newton,
             Self::Aquarium(_) => EffectId::Aquarium,
+            Self::Clock(_) => EffectId::Clock,
         }
     }
 
@@ -564,6 +593,9 @@ impl AnyEffect {
                 config.get_aquarium_options(),
                 screen_size,
             )),
+            EffectId::Clock => {
+                Self::Clock(Clock::new(config.get_clock_options(), screen_size))
+            }
         }
     }
 }
@@ -651,6 +683,7 @@ impl_terminal_effect_for_any!(
     Ripple,
     Newton,
     Aquarium,
+    Clock,
 );
 
 #[cfg(test)]
@@ -686,6 +719,7 @@ mod tests {
         EffectId::Ripple,
         EffectId::Newton,
         EffectId::Aquarium,
+        EffectId::Clock,
     ];
 
     #[test]

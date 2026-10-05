@@ -52,6 +52,18 @@ const DEFAULT_LEVELS: usize = 16;
 /// land on the same entry.
 const INV_TWO_PI: f32 = 1.0 / TWO_PI;
 
+/// How far one source's phase rate may differ from another's, as a fraction of
+/// [`RippleOptions::speed`].
+///
+/// This is a *de-synchronisation* constant, not a speed: it exists so the
+/// sources never fall back into step, which is why it varies per source. Its
+/// magnitude is what keeps it from also being a speed -- at any value near 1 it
+/// cancels most of `time`'s advance and the rings stop travelling outwards.
+/// 0.05 keeps every source within 5% of the documented speed while still
+/// separating them, and both ends of that are asserted rather than assumed
+/// (`every_source_ring_travels_outwards_at_the_documented_speed`).
+const RATE_SPREAD_FRACTION: f32 = 0.05;
+
 /// Samples the table.
 ///
 /// The reduction is `fractional part`, not a cast and not `%`. Both of the cheaper
@@ -97,6 +109,20 @@ struct Source {
     vy: f32,
     /// Extra phase per second. Sources on different rates never re-synchronise,
     /// so a playlist entry does not visibly loop.
+    ///
+    /// A *small* fraction of [`RippleOptions::speed`], and that is
+    /// load-bearing. The wave is `sin(k*r - time + phase)`, so a ring sits where
+    /// `k*r - time + phase` is constant and travels at
+    /// `(d time/dt - d phase/dt) / k`. `time` already advances at `speed`, so
+    /// this is the *difference* between them that sets how fast the rings move.
+    ///
+    /// It used to be `speed * (0.8 + 0.3 * spread)` -- the same order as `speed`
+    /// itself, not a fraction of it -- which at the shipped three sources made
+    /// the rings travel at 20%, 10% and **exactly 0%** of the documented speed.
+    /// The third source was not drifting slowly, it was frozen, which is the
+    /// opposite of the "never re-synchronise" this field is for, and it
+    /// contributed a static pattern to every frame. See
+    /// [`Ripple::source_ring_speed`].
     rate: f32,
 }
 
@@ -325,7 +351,7 @@ impl Ripple {
                     phase: spread * TWO_PI + self.rng.random_range(0.0..0.5),
                     vx: (0.06 + 0.05 * spread) * drift,
                     vy: (0.04 + 0.07 * (1.0 - spread)) * drift,
-                    rate: self.options.speed * (0.8 + 0.3 * spread),
+                    rate: self.options.speed * RATE_SPREAD_FRACTION * spread,
                 }
             })
             .collect();
@@ -338,6 +364,29 @@ impl Ripple {
         if self.row.len() != width {
             self.row = vec![0.0; width];
         }
+    }
+
+    /// How fast one source's rings travel outwards, in field rows per second.
+    ///
+    /// The wave is `sin(k*r - time + phase)`, so a ring is where
+    /// `k*r - time + phase` is constant, and `dr/dt = (d time/dt - d phase/dt) / k`.
+    /// Both terms are per second: `time` advances at [`RippleOptions::speed`] and
+    /// each source's `phase` advances at its own [`Source::rate`].
+    ///
+    /// Negative means the rings travel *inwards*, and zero means they are frozen --
+    /// which is the failure this exists to make visible. Naming the derivation is
+    /// the point: `speed` is documented as "the speed of the rings travelling
+    /// outwards", and with `rate` on the same order as `speed` the two cancelled and
+    /// the documented speed was never what came out.
+    ///
+    /// Test-only, and deliberately so: nothing on the frame path needs the
+    /// number, but the invariant it states is the one `time` and `Source::rate`
+    /// have to agree on, and it can only be checked if the arithmetic is written
+    /// down once instead of restated in the test.
+    #[cfg(test)]
+    fn source_ring_speed(&self, index: usize) -> f32 {
+        let k = self.options.wave_number;
+        (self.options.speed - self.sources[index].rate) / k
     }
 
     fn advance(&mut self, delta: f32) {
@@ -464,6 +513,59 @@ mod tests {
             sources,
             seed,
             ..RippleOptions::default()
+        }
+    }
+
+    /// Every source's rings travel outwards, at the speed the option documents.
+    ///
+    /// `speed` is documented as "the speed of the rings travelling outwards", and
+    /// that is a claim about `dr/dt`, not about either term that feeds it. A ring is
+    /// where `k*r - time + phase` is constant, so the rate is
+    /// `(speed - rate) / wave_number`. `rate` used to be `speed * (0.8 + 0.3 *
+    /// spread)`, the same order as `speed`, and at the shipped three sources the
+    /// three rings came out at 20%, 10% and **exactly 0%** of the documented speed.
+    ///
+    /// The zero is the part worth catching: a frozen source is not a slowly drifting
+    /// one, and it puts a static pattern into every frame while the field it exists
+    /// to de-synchronise is documented as never repeating. No existing test could
+    /// see it -- the behavioural fixtures build sources with `rate: 0.0`, which is
+    /// the *correct* value, and the render tests compare two paths that both read
+    /// the same `phase`.
+    #[test]
+    fn every_source_ring_travels_outwards_at_the_documented_speed() {
+        for count in [2u16, 3, 4, 6] {
+            let ripple = Ripple::new(options(count, 1), (80, 24));
+            let k = ripple.options.wave_number;
+            let documented = ripple.options.speed / k;
+
+            let speeds: Vec<f32> = (0..count as usize)
+                .map(|i| ripple.source_ring_speed(i))
+                .collect();
+
+            for (i, got) in speeds.iter().enumerate() {
+                assert!(
+                    *got > 0.0,
+                    "source {i} of {count} travels at {got} rows/s: its rings are \
+                 stationary or running inwards, and the third of three did \
+                 exactly this. Rate drift must be a fraction of `speed`, not a \
+                 multiple of it."
+                );
+                assert!(
+                    (*got - documented).abs() < documented * 0.1,
+                    "source {i} of {count} travels at {got} rows/s against a \
+                 documented {documented}; the de-synchronisation drift is large \
+                 enough to be changing the speed rather than de-synchronising it."
+                );
+            }
+
+            // And they must actually differ, or nothing is being de-synchronised.
+            let lo = speeds.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = speeds.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                hi - lo > documented * 0.01,
+                "every one of the {count} sources travels at the same speed, so the \
+             rates are not de-synchronising anything"
+            );
         }
     }
 

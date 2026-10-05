@@ -315,7 +315,11 @@ impl Fire {
         while x < width {
             let i1 = 1 + x * 4;
             let i2 = 4 * width + 1 - x * 4;
-            let min_val = i1.min(i2).min(self.height_counter as usize);
+            // `height_counter` is 0 before the first step, and `min_val` is the
+            // exclusive upper end of a range, so it cannot be 0. A terminal one
+            // row tall also makes `base_row` 1, which is why the rows above are
+            // taken with `saturating_sub` rather than a bare `- 2`.
+            let min_val = i1.min(i2).min(self.height_counter as usize).max(1);
             let last1 = rng.random_range(0..min_val) as u8;
 
             let count = rng.random_range(0..6);
@@ -332,14 +336,14 @@ impl Fire {
                 }
 
                 // Set pixel one row up with slightly varied intensity
-                let one_up = (base_row - 1) * width + x + i;
+                let one_up = base_row.saturating_sub(1) * width + x + i;
                 if one_up < self.fire_bitmap.len() {
                     let intensity = last1 as i16 + rng.random_range(-2..4) as i16;
                     self.fire_bitmap[one_up] = intensity.clamp(0, 255) as u8;
                 }
 
                 // Set pixel two rows up with more varied intensity
-                let two_up = (base_row - 2) * width + x + i;
+                let two_up = base_row.saturating_sub(2) * width + x + i;
                 if two_up < self.fire_bitmap.len() {
                     let intensity = last1 as i16 + rng.random_range(-2..4) as i16;
                     self.fire_bitmap[two_up] = intensity.clamp(0, 255) as u8;

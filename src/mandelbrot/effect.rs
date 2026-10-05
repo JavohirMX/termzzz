@@ -87,6 +87,16 @@ const EDGE_BISECTIONS: u32 = 20;
 /// disc, so most attempts are rejected.
 const SAMPLE_ATTEMPTS: usize = 512;
 
+/// How many rejection draws one sample may take before the attempt is abandoned.
+///
+/// Bounds the *inner* rejection loop in `sample_boundary_point`, which
+/// `SAMPLE_ATTEMPTS` does not reach: that one bounds the outer loop over
+/// attempts, and this one bounds the rejection sampling within a single attempt.
+/// Generous, because giving up early just falls back to the interior sample and
+/// the effect keeps running -- which is the point. An unbounded loop here is a
+/// hang on the frame thread, not a slow frame.
+const REJECTION_DRAWS_PER_SAMPLE: usize = 256;
+
 /// Bounds on `color_bands`.
 ///
 /// One band is not a palette, it is a two-colour threshold map, which is a
@@ -577,19 +587,41 @@ impl Mandelbrot {
             None => EDGE_SEARCH_LIMIT,
         };
         let mut found = None;
-        for _ in 0..SAMPLE_ATTEMPTS {
+        // `loop` rather than `for` so an attempt can be abandoned from the
+        // rejection loop nested three levels below it.
+        let mut attempts = 0usize;
+        while attempts < SAMPLE_ATTEMPTS {
+            attempts += 1;
+            let mut draws = 0usize;
             // Rejection sampling in the disc of radius 2, which is where the set
             // lives; a square would waste most of its samples on empty corners.
             // `near` restricts the search to a disc around the current centre, so
             // the next view is somewhere the camera has just been looking. Falls
             // back to the whole set of radius 2 on every failed attempt, because
             // the neighbourhood is not guaranteed to contain any of the set.
-            let (x, y) = loop {
+            // `Option`, so the rejection loop can give up: `None` means this attempt
+            // found nothing and the outer loop should try again.
+            let drawn = 'draw: loop {
                 let (x, y) = match near {
-                    Some(((cx, cy), radius)) => (
-                        cx + self.rng.random_range(-radius..radius),
-                        cy + self.rng.random_range(-radius..radius),
-                    ),
+                    Some(((cx, cy), radius)) => {
+                        // The radius comes from the camera's current zoom and
+                        // reaches this function from config, and
+                        // `random_range(-radius..radius)` asserts on an empty
+                        // range -- so a radius of 0, or a NaN, panicked in
+                        // `advance`, on the frame thread, with no way out. A
+                        // floor of one ulp of the complex plane keeps the draw
+                        // meaningful (it is the whole disc, effectively) while
+                        // guaranteeing a drawable range.
+                        let radius = if radius.is_finite() && radius > 0.0 {
+                            radius
+                        } else {
+                            f64::MIN_POSITIVE
+                        };
+                        (
+                            cx + self.rng.random_range(-radius..radius),
+                            cy + self.rng.random_range(-radius..radius),
+                        )
+                    }
                     None => (
                         self.rng.random_range(-2.0f64..2.0),
                         self.rng.random_range(-2.0f64..2.0),
@@ -601,10 +633,34 @@ impl Mandelbrot {
                     dx * dx + dy * dy <= radius * radius
                 });
                 if in_disc && in_neighbourhood {
-                    break (x, y);
+                    break 'draw Some((x, y));
+                }
+
+                // Bounded, because this loop is rejection sampling and the
+                // `SAMPLE_ATTEMPTS` above bounds the *outer* one only. Nothing
+                // else bounds this: if the neighbourhood ever stops containing a
+                // point of the set -- which is a property of `walk_limit`, of
+                // `depth_limit` and of the terminal's aspect ratio, all of them
+                // config-reachable -- this spins inside `advance`, on the frame
+                // thread, with no timeout and no recovery. A permanent freeze
+                // rather than a slow frame.
+                //
+                // The condition is not hypothetical arithmetic: the loop
+                // terminates today by an *identity* rather than a margin,
+                // because the next call's neighbourhood radius is at least the
+                // walk limit that bounded this call's centre. Exactly tangent.
+                // Anything that widens a terminal, or changes `radius_exponent`,
+                // tips it.
+                draws += 1;
+                if draws >= REJECTION_DRAWS_PER_SAMPLE {
+                    // Out of this attempt. The outer loop tries again, and
+                    // `found` is still `None`, so it eventually falls back to
+                    // the interior sample below rather than hanging.
+                    break 'draw None;
                 }
             };
 
+            let Some((x, y)) = drawn else { continue };
             if escape_time(x as f32, y as f32, probe).escaped {
                 continue;
             }
