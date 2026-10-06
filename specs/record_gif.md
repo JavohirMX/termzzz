@@ -67,6 +67,30 @@ starts a playlist when `--playlist` or `--shuffle` is given, and passing
 the defaults, and the run is a single effect if neither flag is passed. **For a
 montage with per-effect timing, drive the loop in the shell as above.**
 
+**`agg` does not clear the screen when the alternate screen is entered.** Running
+each effect as its own process gives a clean terminal, but the *replay* keeps
+whatever the previous effect painted, because `?1049h` is not treated as a clear.
+`ripple` paints the whole screen `rgb(0,70,143)` and the clock paints nothing at
+all, so the clock arrives on ripple's blue — which reads as a missing clear and
+looks like a bug in `termzzz`. It is not one; a real terminal clears on `?1049h`.
+Insert the clear the terminal would have done:
+
+```python
+import json
+lines = [l for l in open('cast') if l.strip()]
+hdr, ev = lines[0], [json.loads(l) for l in lines[1:]]
+for e in ev:
+    if e[1] == 'o' and '\x1b[?1049h' in e[2]:
+        e[2] = e[2].replace('\x1b[?1049h', '\x1b[?1049h\x1b[2J\x1b[0m')
+with open('cast_clear', 'w') as f:
+    f.write(hdr)
+    for e in ev: f.write(json.dumps(e) + '\n')
+```
+
+To find out *which* effect owns a colour rather than guessing, split the stream on
+`\x1b[?1049h` and count background SGR codes per segment. That is how the blue was
+attributed to `ripple` rather than to the effect that appeared to be showing it.
+
 ## Rendering
 
 ```bash
