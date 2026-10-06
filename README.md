@@ -1,121 +1,91 @@
 # termzzz
 
-Terminal screensavers and generative visual effects written in Rust.
+![matrix, dvd, solarsystem, ink, ripple, aquarium and clock](assets/montage.gif)
 
-`termzzz` is a collection of memory-safe terminal effects: a set of classic screensavers plus a new interactive ink field, playlist mode, and global speed control.
+Terminal screensavers and generative visual effects, written in Rust.
+
+`termzzz` is a catalogue of 23 effects that draw themselves in the terminal, from
+the classics to generative pieces a line-drawing terminal can draw properly. It
+runs one effect, plays a playlist, or walks the whole catalogue behind a wipe.
+
+Everything is reproducible. Every effect that uses randomness is seeded, so any
+run can be shared or replayed exactly.
+
+## Install
+
+```bash
+cargo install termzzz
+```
+
+Or from a checkout:
+
+```bash
+cargo install --path .
+```
+
+macOS and Linux are the supported targets. The test suite also runs on Windows
+in CI, but Windows is not a supported platform yet.
 
 ## Effects
 
-- Matrix rain
-- Conway's Game of Life
-- Mandelbrot set (`mandelbrot`)
-- Maze generation
-- Boids flocking
-- 3D cube
-- ASCII crab animation
-- Rotating donut
-- Pipes
-- Plasma
-- Fire
-- 3D solar system (`solarsystem`)
-- Terrain
-- Bouncing DVD logo (`dvd`)
-- Blank screen
-- Interactive generative field you pour ink into (`ink`)
-- Several Langton's ants sharing one board (`ants`)
-- First-person flight over a fractal height field (`flyover`)
-- Slime-mould agents building a transport network (`physarum`)
-- Interfering waves from a few point sources (`ripple`)
-- Newton's method basins, coloured by which root each sample finds (`newton`)
-- A fish tank: shoaling fish, depth shading, light from above (`aquarium`)
-- A large clock, with a rule showing the seconds (`clock`)
+| Effect | What you see |
+|---|---|
+| `matrix` | Digit rain, each drop fading through its own tail |
+| `life` | Conway's Game of Life. The glyph is the cell's age, so generations are visible |
+| `mandelbrot` | The escape-time Mandelbrot set, zooming and panning |
+| `maze` | Maze generation, held when it finishes |
+| `boids` | A flock. Click to scatter it; drag to leave a trail |
+| `cube` | A rotating 3D cube, filled and shaded by depth |
+| `crab` | Crabs scuttling along a sloping seabed |
+| `donut` | A rotating 3D donut |
+| `dvd` | The DVD wordmark, bouncing, in braille |
+| `pipes` | Pipe maze growth |
+| `plasma` | Interfering waves. The glyph is the value |
+| `fire` | Fire, rising and cooling |
+| `solarsystem` | An orrery with tilted orbits and real orbital periods |
+| `ink` | A generative field you pour ink into. Interactive |
+| `terrain` | A side-view landscape: two ridges, parallax, sky |
+| `ants` | Several Langton's ants sharing one board |
+| `flyover` | First-person flight over a fractal height field |
+| `physarum` | Slime-mould agents building a transport network |
+| `ripple` | Waves from a few point sources, interfering |
+| `newton` | Newton's method on the complex plane, coloured by which root each cell reaches |
+| `aquarium` | A fish tank. Seven species, two rendering media, shaded by depth |
+| `clock` | A large clock, with a rule showing the seconds |
+| `blank` | A blank screen. What a playlist rests on |
 
-## Usage
+Some effects draw with braille cells (8 dots each) or half blocks (two colours
+per cell), so the same terminal shows more detail than a character grid can.
+
+## Run one
 
 ```bash
 termzzz matrix
-termzzz life
-termzzz mandelbrot
-termzzz maze
-termzzz boids
-termzzz cube
-termzzz crab
-termzzz donut
-termzzz dvd
-termzzz pipes
-termzzz fire
-termzzz plasma
-termzzz solarsystem
-termzzz terrain
-termzzz ants
-termzzz flyover
-termzzz physarum
-termzzz ripple
-termzzz newton
 termzzz aquarium
-termzzz clock
-termzzz blank
-termzzz ink
+termzzz flyover
 ```
 
-Every effect that uses randomness is seeded, so a run can be reproduced or shared:
+`q`, `Esc`, or `Ctrl+C` exits. `+` and `-` change the global animation speed in
+every effect. `n` and `p` move to the next and previous effect behind a diagonal
+wipe, so you can walk the whole catalogue without restarting.
 
-```bash
-termzzz matrix --seed 1234
-termzzz --playlist matrix,dvd,plasma --seed 1234
-```
+## Play a playlist
 
-Leave `--seed` off and every effect draws a fresh seed at startup, so no two runs
-look the same. Pin one with `--seed` to reproduce a particular run, or per effect in
-the config file, for example `[matrix] seed = 7`.
-
-Press `q`, `Esc`, or `Ctrl+C` to exit. `+` and `-` change the global animation speed
-in every effect. `n` and `p` move to the next and previous effect, behind the same
-diagonal wipe the playlist uses, so you can walk the whole catalogue without
-restarting.
-
-Click in boids mode to scatter the flock. A click drops a shockwave that travels
-outward and pushes the boids it passes away from where you clicked; the ring is
-drawn, so you can see where the wave is and how far it reaches. Drag to leave a
-trail of them. Just moving the mouse does nothing — the flock only reacts to a
-button press. The flock closes up again afterwards, since the rules that hold it
-together are still running.
-
-In ink mode:
-
-- `r` reseeds the field
-- `Space` pauses and resumes the animation
-- `[` and `]` cycle glyph palettes
-- The mouse wheel resizes the pointer brush
-- Pointer movement temporarily brightens the field, then fades out
-
-Mouse capture is enabled for the whole session whenever the running effect (or any
-effect in the playlist) is one of the two that read it, so `n` can reach an
-interactive effect at any moment without the terminal having to be reconfigured
-mid-run.
-
-### Speed
-
-`--speed` scales every effect, on top of calmer per-effect defaults:
-
-```bash
-termzzz plasma --speed 0.5
-```
-
-### Playlist
-
-Play effects back to back, wiping to blank between each one. `--playlist` takes a
-comma-separated list, and `--shuffle` plays the configured playlist in a random
-order (every effect runs once per round):
+Play effects back to back, wiping to blank between each one:
 
 ```bash
 termzzz --playlist matrix,dvd,plasma
-termzzz --shuffle
 termzzz --playlist matrix,dvd --transition 1.5
 ```
 
-With no `--playlist` list, `--shuffle` runs every registered effect. Playlists can
-also be defined in the config file:
+`--shuffle` plays every registered effect in a random order, each once per
+round:
+
+```bash
+termzzz --shuffle
+```
+
+Set per-effect durations in the config file:
 
 ```toml
 [playlist]
@@ -133,36 +103,49 @@ effect = "dvd"
 `duration` is optional and defaults per effect. Leaving `effects` empty plays
 every effect.
 
-## Installation
+## Reproducible runs
 
-For a local checkout, install it with:
-
-```bash
-cargo install --path .
-```
-
-It is also on crates.io, so `cargo install termzzz` works once the first release
-is published.
-
-macOS and Linux are the supported targets. The test suite also runs on Windows
-in CI, but Windows is not a supported platform yet.
-
-## Development
+Leave `--seed` off and every effect draws a fresh seed at startup, so no two runs
+look the same. Pin one to reproduce a particular run:
 
 ```bash
-cargo build --release
-cargo test
-cargo fmt --check
-cargo clippy
+termzzz matrix --seed 1234
+termzzz --playlist matrix,dvd --seed 1234
 ```
 
-Configuration is optional. Generate a default TOML file with:
+You can also set the seed per effect in the config file, for example
+`[matrix] seed = 7`.
+
+## Mouse
+
+Click in `boids` mode to scatter the flock. A click drops a shockwave that
+travels outward and pushes the boids it passes away from where you clicked. The
+ring is drawn, so you can see how far it reaches. Drag to leave a trail. Just
+moving the mouse does nothing; the flock reacts to a button press and then
+closes up again, because the rules that hold it together keep running.
+
+In `ink` mode:
+
+- `r` reseeds the field
+- `Space` pauses and resumes
+- `[` and `]` cycle glyph palettes
+- the mouse wheel resizes the pointer brush
+- pointer movement brightens the field, then the brightness fades
+
+Mouse capture is enabled for the whole session whenever the running effect, or
+any effect in the playlist, reads it. That way `n` can reach an interactive
+effect at any moment without the terminal being reconfigured mid-run.
+
+## Configuration
+
+Configuration is optional. Generate a default file with:
 
 ```bash
 termzzz --print-config > ~/.config/termzzz.toml
 ```
 
-Global speed is set with `[global] speed`, and the DVD logo is configurable:
+Global speed is `[global] speed`. The DVD logo is configurable, and `\n` inside
+`logo` gives you multiple lines:
 
 ```toml
 [global]
@@ -174,12 +157,25 @@ speed = 9.0
 corner_color_change = true
 ```
 
-Use `\n` inside `logo` for multi-line logos.
+When the terminal does not have focus, effects throttle to `[global] idle_fps`
+and freeze rather than slow down, so nothing jumps when you come back.
+
+## Development
+
+```bash
+cargo build --release
+cargo test
+cargo fmt --all -- --check
+cargo clippy --all-features --workspace --all-targets -- -D warnings
+cargo run --release --bin frame_times   # frame cost and ANSI volume per effect
+```
 
 ## Attribution
 
-Built on MIT-licensed code from an earlier terminal screensaver project; the original copyright notice remains in `LICENSE`.
+Built on MIT-licensed code from [oiwn/tarts](https://github.com/oiwn/tarts), an
+earlier terminal screensaver project. The original copyright notice remains in
+`LICENSE`.
 
 ## License
 
-MIT. See `LICENSE` for the original copyright and permission notice.
+MIT. See `LICENSE`.

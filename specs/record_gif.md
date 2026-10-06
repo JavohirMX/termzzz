@@ -1,68 +1,105 @@
 # Recording termzzz Effects as GIFs
 
-## TODO NOTE:
+## The pipeline that works
 
-There is new crate "https://github.com/joshka/betamax":
+`asciinema` captures, `agg` renders. Both are in Homebrew:
 
-```
-Betamax is a Rust-first terminal capture tool in the spirit of VHS. It reads tape files, runs commands in a PTY, feeds terminal output through libghostty-vt, rasterizes frames in process with cosmic-text and swash, and writes screenshots or animations.  
-```
-
-Need to consider integration of this.
-
-## Goal
-Create clean, isolated recordings of termzzz effects using Docker+Nix to prevent
-leaking sensitive information.
-
-## Prerequisites
-- Docker installed
-- Host directory for recordings somewhere: `mkdir -p recordings`
-
-## Docker+Nix Recording Workflow
-
-### Step 1: Start Nix Container
 ```bash
-cd some_temp_dir
-docker run -it --rm -v $(pwd)/recordings:/recordings nixos/nix
+brew install asciinema agg
 ```
 
-### Step 2: Install Dependencies in Container
+The font matters more than anything else here. The crate draws braille
+(U+2800-28FF) and the block elements (U+2580-259F), and **most monospace fonts
+carry only one of the two**. Measured across 555 installed fonts: Menlo, Andale
+Mono, DejaVu Sans Mono, Fira Code and JetBrains Mono all have the block elements
+and **no braille at all**. DejaVu Sans has all 256 braille patterns and is
+proportional, which destroys the grid. Iosevka Term has both and is monospace:
+
 ```bash
-# Install only recording tools
-nix-shell -p termzzz asciinema
+# Iosevka is the font to use. Verify before recording, not after.
+curl -sL -o iosevka.zip \
+  https://github.com/be5invis/Iosevka/releases/download/v34.9.0/PkgTTC-Iosevka-34.9.0.zip
+unzip -q iosevka.zip -d iose && cp iose/Iosevka-Regular.ttc ~/Library/Fonts/
 ```
 
-### Step 3: Set Terminal Size
-**Resize terminal window to smaller size before starting container**
+Verify coverage with `fontTools`, checking the cmap rather than trusting the
+font's reputation:
+
+```python
+from fontTools.ttLib import TTFont
+cmap = set(TTFont('Iosevka-Regular.ttc', fontNumber=0).getBestCmap())
+assert all(c in cmap for c in range(0x2800, 0x2900))   # braille
+assert all(c in cmap for c in range(0x2581, 0x2589))   # lower blocks
+```
+
+## Two things that will cost you an hour
+
+**A backgrounded effect has no controlling terminal, and crossterm needs one.**
+`termzzz` fails immediately with `Failed to initialize input reader` if it cannot
+open the tty. `crossterm::tty_fd()` uses stdin when stdin is a tty and otherwise
+opens `/dev/tty`, so the effect must run in the **foreground** of a session that
+has a controlling terminal. Signaling it means sending `SIGINT` from a separate
+background process, not `&`-ing the effect itself:
+
 ```bash
-# On macOS host: resize your terminal to 80x24 characters
-# Then start container
-docker run -it --rm -v $(pwd)/recordings:/recordings nixos/nix
+#!/bin/bash
+TZ=/path/to/target/release/termzzz
+for spec in matrix:2.5 blank:0.35 dvd:4.0; do
+  name="${spec%%:*}"; secs="${spec##*:}"
+  ( sleep "$secs"; pkill -INT -f "release/termzzz $name" ) &
+  "$TZ" "$name" --seed 1234
+  wait
+done
 ```
 
-### Step 3: Record Matrix Effect
+Run that under `script` so the session has a pty:
+
 ```bash
-cd /recordings
-asciinema rec matrix.cast --title "termzzz matrix screensaver"
-# In the recording session:
-termzzz matrix
-# Let it run 8 seconds, then Ctrl+C
-# Exit recording: Ctrl+D or exit
+asciinema rec --overwrite --window-size 120x30 \
+  --command "script -q /dev/null bash /tmp/cap/run.sh" out.cast
 ```
 
-### Step 4: Convert to GIF (on host)
+**`--playlist` on the command line discards config durations.** `main.rs` only
+starts a playlist when `--playlist` or `--shuffle` is given, and passing
+`--playlist` replaces `PlaylistOptions::effects` with names that carry their own
+`default_duration` — 15s for `matrix`, 30s for `aquarium`. A playlist defined in
+`~/.config/termzzz.toml` with explicit `duration` values is ignored in favour of
+the defaults, and the run is a single effect if neither flag is passed. **For a
+montage with per-effect timing, drive the loop in the shell as above.**
+
+## Rendering
+
 ```bash
-# Exit container first, then on macOS host:
-agg recordings/matrix.cast assets/matrix.gif
-
-# Optimize GIF size (reduce from ~5.7MB to ~3MB)
-gifsicle -O3 --lossy=80 --colors=32 assets/matrix.gif -o assets/matrix.gif
+agg --font-family "Iosevka Term" --font-size 16 \
+    --font-dir ~/Library/Fonts --fps-cap 9 out.cast assets/montage.gif
 ```
 
-Can edit GIFs using GIMP editor.
+`agg` takes the output path as a positional argument. There is no `-o`. The
+`--fps-cap` is the main size lever: 120x30 at 9 fps over 24 seconds is about
+2.8 MB.
 
-## Security Benefits
-- ✅ Clean environment (no host access)
-- ✅ No shell history or suggestions
-- ✅ Reproducible recordings
+## Choosing what goes in
 
+**Check that every effect actually appears before you ship the file.** Render a
+contact sheet and look at it:
+
+```bash
+ffmpeg -i montage.gif \
+  -vf "select='eq(n\,10)+eq(n\,32)+eq(n\,60)+eq(n\,85)',scale=400:-1,tile=2x2" \
+  -frames:v 1 sheet.png
+```
+
+Frame numbers are not time, so guess the sample points from the first pass and
+adjust. Two effects were cut from the montage on the evidence:
+
+- `physarum` needs about 2,500 steps to grow its network, which is roughly 40
+  seconds at 60 fps. Any short slot shows only the five seed blobs, so it reads
+  as an unfinished picture rather than a transport network.
+- `dvd` and `solarsystem` move slowly — `dvd` crosses a wall every 5.7 to 8.3
+  seconds at 80x24 — so they need about 4 seconds each or they look frozen.
+
+## `vhs` is not usable here
+
+`vhs` requires both terminal dimensions to be at least 120 **cells**, so a
+realistic 120x30 capture is impossible. 120 rows is also not an honest size for
+these effects, which are tuned for 24 to 50 rows.
