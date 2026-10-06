@@ -72,12 +72,16 @@ distribution metadata (crates.io publication, Homebrew, Nix).
 
 Open engineering work, in priority order:
 
-1. **`mandelbrot` render cost at large sizes.** 11.9 ms per frame at 400x200,
+1. **`mandelbrot` render cost at large sizes.** **29 ms** per frame at 400x200,
    which is over half a 60 Hz budget spent before a single byte is written. The
    cost is very close to linear in `max_iterations`, because nearly every interior
    pixel spends the whole budget discovering it never escapes. Lowering the
    default is the first thing to try; a region-marking rewrite is where the real
-   win is, and that is a rewrite rather than a tweak. `life` is over the 2 ms
+   win is, and that is a rewrite rather than a tweak.
+
+   **This number was 11.9 ms here for weeks, and that was wrong.** See
+   "A median of five does not beat a bimodal machine" below — it was never a
+   regression, and it is not reproducible. `life` is over the 2 ms
    budget on its `update x4` worst case only, and only because
    `step_generation` scans a `HashMap`.
    `plasma` is at **2.01 ms — straddling the 2 ms line**, and the two halves of it
@@ -173,8 +177,8 @@ Open engineering work, in priority order:
    the crate had none — hence `oklab_hue` and `perceptual_distance` in
    `palette.rs`, and `INKED` in `glyph_ramp.rs`.
 
-   **The cost is 3.45 ms at 400x200 — over the 2 ms line, and a third of the
-   mandelbrot's 11.50 ms.** That is one more red row, and it is on the list
+   **The cost is 3.73 ms at 400x200 — over the 2 ms line, and an eighth of the
+   mandelbrot's 29 ms.** That is one more red row, and it is on the list
    deliberately: the picture is a categorical one the crate could not draw before,
    at a terminal eight times heavier than the budget assumes. At 200x50 it is
    0.43 ms and at 80x24 it is 0.08 ms, so the ordinary sizes are free.
@@ -1116,6 +1120,54 @@ Prefer a test that fails without the fix over a test that only passes with it. T
 bug found most cheaply in this project was a `Buffer::diff` coordinate bug, and the
 reason it was found cheaply is that `tests/effect_contracts.rs` was written before
 the fixes rather than after them.
+
+### A median of five does not beat a bimodal machine
+
+`mandelbrot` was recorded here at 11.9 ms per frame at 400x200 for weeks. It
+measures **29 ms**, and that is not a regression — it never was. Both numbers came
+from the same tree.
+
+Building `631b17f~1` alongside the current tree and interleaving the two binaries
+on a quiet machine:
+
+```text
+new (22f807f)   13.95ms  28.99ms  28.53ms     median 28.99
+old (4a59273)   29.34ms  33.23ms  43.91ms     median 30.5
+```
+
+The distributions overlap completely and the *old* median is marginally higher.
+Byte counts are identical at 383,487, so both render the same picture. There is
+nothing in `src/mandelbrot/effect.rs` between those commits that could have done
+it: the diff bounds a rejection loop in `advance` and floors a NaN radius, and it
+does not touch `render`, `escape_time`, `max_iterations` or `color_bands`.
+`src/render/halfblock.rs`, which is what mandelbrot draws through, is untouched,
+and the only `src/render/` change in the commit is a braille re-export line.
+
+**Each build produces one sample near 13 ms and the rest near 29 ms.** That is
+bimodal at roughly 2x, and it is the machine: macOS schedules the process across
+P-cores and E-cores on Apple Silicon. `frame_times` reports the median of
+`TRIALS = 5`, and a median of five does not suppress a bimodal distribution — it
+sits wherever the mode is, which is the *slow* mode, and the single fast sample is
+discarded as an outlier.
+
+So the documented 11.9 ms was one lucky sample, and every run since has reported
+the slow mode. Two consequences worth keeping:
+
+- **The number in the table is a property of the machine, not only of the effect.**
+  Every other row was checked against its documented figure on the same run and
+  matched within 3-8%: `aquarium` 221 us against 215, `terrain` 399 against 373,
+  `plasma` 1.52 ms against 1.48. One row at 2.4x its documented value is not a
+  machine that got slower. It is a row where the two modes happen to be
+  distinguishable.
+- **Reporting the minimum instead of the median is the standard fix and was not
+  applied.** It changes the meaning of every number in the frame table, so it is a
+  decision rather than a tweak. The honest cheaper option is to note the machine
+  beside the table.
+
+The general rule is the same one this file keeps rediscovering from the other
+direction: **a measurement whose spread is wider than the effect it is trying to
+detect cannot detect anything.** 2x of noise against a suspected 8% regression is
+not a measurement.
 
 ### A mirrored ramp is not a brightness ramp
 
