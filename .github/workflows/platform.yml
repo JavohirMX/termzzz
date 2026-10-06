@@ -1,0 +1,49 @@
+name: Platform
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-platform:
+    name: Cross-platform tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        run: cargo test --workspace --no-default-features
+
+# There was a second job here that generated `lcov.info` and uploaded it to
+# Codecov. It is gone, and the reason is worth keeping.
+#
+# The step was inherited verbatim from oiwn/tarts, where
+# `secrets.CODECOV_TOKEN` exists. It has never existed here, so the upload failed
+# on every single run since the repository was created -- it was not a
+# regression, it had never once succeeded. It went red for a dead uploader (v3
+# was sunset), then for a missing token (v5), then for a missing
+# `id-token: write` permission (v5 with OIDC). Three unrelated causes, each of
+# which looked like the previous fix had not landed.
+#
+# With the upload gone the job was measuring coverage and discarding it, which
+# costs a full instrumented test run per commit to produce a file nobody reads.
+#
+# Coverage is still one command away and needs no service:
+#
+#     cargo llvm-cov --workspace --html --open
