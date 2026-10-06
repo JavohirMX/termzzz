@@ -209,7 +209,7 @@ cargo build --release
 cargo test
 cargo fmt --all -- --check
 cargo clippy --all-features --workspace --all-targets -- -D warnings
-cargo run --release --bin frame_times   # frame cost and ANSI volume per effect
+cargo run --release --example frame_times   # frame cost and ANSI volume per effect
 ```
 
 Architecture notes are in [`specs/overview.md`](specs/overview.md); the release

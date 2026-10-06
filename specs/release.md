@@ -13,6 +13,10 @@ Release `termzzz` as a public GitHub project with reproducible macOS/Linux artif
 - [ ] Canonical GitHub owner and release settings are configured
 - [ ] Upstream MIT notice and attribution remain intact
 
+Two checks are run in CI but were missing from this list, and both have caught
+real problems: `cargo doc` with `RUSTDOCFLAGS="-D warnings"`, and `nix fmt --
+--fail-on-change` plus `nix build`.
+
 ## Release Process
 
 ### 1. Choose the canonical repository
@@ -46,9 +50,27 @@ Run representative effects manually in a real terminal:
 
 ### 4. Publish the GitHub release
 
-The release workflow is manual until the canonical repository is configured. It validates that the supplied tag matches the `Cargo.toml` version, then builds macOS and Linux assets and attaches checksums. Publishing to crates.io remains a separate explicit decision because the new crate namespace and credentials must be configured first.
+Dispatch **Release Assets** with the tag name. It validates that the supplied tag
+matches the `Cargo.toml` version *and* points at the current `main` SHA, then
+builds aarch64 and x86_64 macOS and x86_64 Linux archives with a `.sha256` beside
+each. It must be dispatched from `main`, because the build job is gated on
+`github.ref == 'refs/heads/main'`.
 
-### 5. Package-manager distribution
+```bash
+gh workflow run release.yml --ref main -f tag_name=v0.0.1
+```
+
+### 5. Publish to crates.io
+
+**Only after the release assets are up**, so `cargo install termzzz` never
+resolves to a version whose release page is empty. Publish locally first: a bad
+token or a metadata problem is much easier to diagnose outside CI. Set the
+`CRATES_IO_TOKEN` secret afterwards and let `publish.yml` handle later versions.
+
+crates.io does not allow a version to be republished, so anything found after a
+publish needs a new number.
+
+### 6. Package-manager distribution
 
 Create a `termzzz` Homebrew formula only after the canonical repository and release asset URL are known. A formula should install the `termzzz` binary and test `termzzz --version`; it must be written from scratch rather than copied from an upstream formula, with its own source, checksum, class, and test command.
 
@@ -70,9 +92,17 @@ Create a `termzzz` Homebrew formula only after the canonical repository and rele
 - `termzzz` is a clean break from earlier package and command names.
 ```
 
+## Settled Decisions
+
+- **Canonical repository** — `github.com/JavohirMX/termzzz`. The repository
+  variable `TERMZZZ_CANONICAL_REPOSITORY` is set to that exact value, and every
+  release and publish workflow refuses to run without it matching
+  `github.repository`.
+- **Crates.io publication** — done at 0.0.1; the name was unclaimed.
+- **Repository description** — "23 terminal screensavers and generative visual
+  effects, in Rust".
+
 ## Deferred Decisions
 
-- Canonical GitHub owner and repository URL
-- Crates.io publication
 - Homebrew tap ownership and formula location
 - New project tagline

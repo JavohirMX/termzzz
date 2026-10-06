@@ -45,7 +45,7 @@ cargo test        # Run tests
 cargo bench       # Run benchmarks (criterion)
 
 # Frame costs per effect, with ANSI volume and a budget check
-cargo run --release --bin frame_times
+cargo run --release --example frame_times
 
 # Code Quality
 cargo fmt --check  # Check formatting
@@ -55,8 +55,9 @@ cargo clippy       # Run linter
 
 ### Installation
 - **Local checkout**: `cargo install --path .`
-- **Crates.io**: `cargo install termzzz` after publication is enabled
-- **GitHub**: canonical repository and release links are pending selection
+- **Crates.io**: `cargo install termzzz` — published since 0.0.1
+- **GitHub**: <https://github.com/JavohirMX/termzzz> — releases carry the macOS and
+  Linux archives
 
 ## Project Status
 - **Version**: 0.0.1
@@ -1113,7 +1114,7 @@ already cost one session about a dozen fixes.
 `cargo test`, `cargo fmt --all -- --check`, and
 `cargo clippy --all-features --workspace --all-targets -- -D warnings` all have to
 pass before a change is done. For anything touching an effect's simulation, also
-run `cargo run --release --bin frame_times` and compare against the previous
+run `cargo run --release --example frame_times` and compare against the previous
 table.
 
 Prefer a test that fails without the fix over a test that only passes with it. The

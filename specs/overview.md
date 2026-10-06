@@ -306,7 +306,7 @@ lift into a scratch crate and revert, which is how the seven were confirmed.
 ## Development Workflow
 
 - **Testing**: `cargo test`
-- **Frame costs**: `cargo run --release --bin frame_times` — prints update,
+- **Frame costs**: `cargo run --release --example frame_times` — prints update,
   worst-case update at high `--speed`, render, output-encoding cost, and ANSI
   volume per frame, at three terminal sizes. Exits non-zero if an effect exceeds
   its frame budget, so it works as a CI gate. `--size WxH` narrows it to one size.
