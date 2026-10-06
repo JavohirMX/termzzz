@@ -14,6 +14,15 @@ assets, no configuration, no runtime dependencies on the terminal beyond ANSI.
 
 ## Install
 
+With Homebrew:
+
+```bash
+brew tap JavohirMX/termzzz
+brew install JavohirMX/termzzz/termzzz
+```
+
+Or with cargo:
+
 ```bash
 cargo install termzzz
 ```
@@ -23,6 +32,8 @@ Or from a checkout:
 ```bash
 cargo install --path .
 ```
+
+Every route installs the same `termzzz` binary.
 
 ## What it does
 

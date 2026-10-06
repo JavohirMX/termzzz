@@ -72,7 +72,32 @@ publish needs a new number.
 
 ### 6. Package-manager distribution
 
-Create a `termzzz` Homebrew formula only after the canonical repository and release asset URL are known. A formula should install the `termzzz` binary and test `termzzz --version`; it must be written from scratch rather than copied from an upstream formula, with its own source, checksum, class, and test command.
+The Homebrew tap lives at **`github.com/JavohirMX/homebrew-termzzz`**, so the tap
+name is `JavohirMX/termzzz`:
+
+```bash
+brew tap JavohirMX/termzzz
+brew install JavohirMX/termzzz/termzzz
+```
+
+It is a **binary formula**, not a source build: it installs the archive the
+release workflow already publishes and verifies it against the SHA-256 published
+beside it. That keeps the formula from having to track the dependency tree, and
+it means the checksums in the formula must be updated on every release.
+
+**The top-level `url` must be the Linux one**, with `on_macos` overriding it. The
+reverse does not work — `on_linux` may not carry a `url` or a `sha256` — and
+`brew style` says so on the first attempt:
+
+```
+FormulaAudit/ComponentsOrder: on_linux cannot include url
+```
+
+Run `brew style Formula/termzzz.rb` before pushing. It reorders the component
+block and catches the trailing-newline offence too.
+
+The formula is written from scratch, with its own source, checksums, class and
+test command, and is not copied from any upstream formula.
 
 ## Release Notes Template
 
@@ -99,10 +124,12 @@ Create a `termzzz` Homebrew formula only after the canonical repository and rele
   release and publish workflow refuses to run without it matching
   `github.repository`.
 - **Crates.io publication** — done at 0.0.1; the name was unclaimed.
+- **Homebrew** — the tap is `JavohirMX/homebrew-termzzz`, so users run
+  `brew tap JavohirMX/termzzz` then `brew install JavohirMX/termzzz/termzzz`.
+  Binary formula, checksums taken from the release assets.
 - **Repository description** — "23 terminal screensavers and generative visual
   effects, in Rust".
 
 ## Deferred Decisions
 
-- Homebrew tap ownership and formula location
 - New project tagline
