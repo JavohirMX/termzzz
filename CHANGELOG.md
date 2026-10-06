@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.2] - 2026-10-06
+
+### Fixed
+- **`cargo install` no longer installs the benchmark harness.** Every install put
+  two binaries on the PATH, `termzzz` and `frame_times`. `frame_times` was in
+  `src/bin/`, so it shipped; it is now an example, which is runnable with
+  `cargo run --release --example frame_times` and is not installed.
+
+### Changed
+- Documentation that described a project which did not exist yet: the crates.io
+  and GitHub links in `AGENTS.md`, and the settled items still listed as
+  *Deferred Decisions* in `specs/release.md`.
+- `specs/release.md` now records the two steps the first release needed and the
+  document did not mention: dispatch from `main`, and publish to crates.io only
+  after the release assets are up.
+
 ## [0.0.1] - 2026-10-05
 
 Everything below is in three groups: what a session of watching the effects
