@@ -55,11 +55,11 @@ jobs:
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info --ignore-filename-regex "src/bin/.*|src/tui/*.rs"
         
       - name: Upload coverage to Codecov
-        # v3's uploader was sunset, so every upload 404s. With
-        # `fail_ci_if_error` that turned a dead upload service into a red
-        # build on an otherwise passing commit.
+        # Tokenless upload via OIDC. No CODECOV_TOKEN secret exists on this
+        # repo, which is why v3 404'd and then why v5 still failed with a
+        # missing token -- both red on an otherwise passing commit.
         uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
+          use_oidc: true
           fail_ci_if_error: true
